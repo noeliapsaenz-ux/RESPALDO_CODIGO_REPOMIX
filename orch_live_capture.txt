@@ -1,0 +1,609 @@
+"""
+==========================================================================
+ORCH_LIVE_CAPTURE - Supervisor inteligente de captura HFT
+==========================================================================
+Ubicación: CARPETA_RAIZ
+Dependencias: paths, settings, common_logger, capture_config
+Responsabilidad: Orquestar, monitorear y recuperar automáticamente los
+                 procesos de captura de ticks para todos los símbolos.
+                 Gestiona el apagado controlado (Graceful Shutdown)
+                 mediante señales físicas en disco (shutdown.signal).
+                 Puede ejecutarse de forma autónoma (sin orch_master_cycle).
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección de ruta del directorio superior (Single Source of Truth)
+raiz_proyecto = Path(__file__).parent.resolve()
+if str(raiz_proyecto) not in sys.path:
+    sys.path.insert(0, str(raiz_proyecto))
+
+import subprocess
+import time
+import os
+import signal
+import json
+from datetime import datetime
+from typing import Dict, List, Tuple
+
+try:
+    import colorama
+    from colorama import Fore, Style
+    colorama.init(autoreset=True)
+except ImportError:
+    class Fore:
+        RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; RESET=''
+    class Style:
+        RESET=''
+
+# Cambiar el directorio de trabajo a la raíz del proyecto
+os.chdir(raiz_proyecto)
+
+# ==============================================================================
+# 🔌 IMPORTACIONES DIRECTAS DE INFRAESTRUCTURA (SIN DEPENDER DE CONFIG.PY)
+# ==============================================================================
+from paths import ACTIVE_DATA_DIR, STATE_DIR, LOGS_UNIFIED_DIR, LOGS_MASTER_DIR, create_directories
+from settings import BROKER_TZ, OPTIMIZACION, USAR_RAMDISK, send_telegram_alert
+from common_logger import get_logger
+
+# Importación del universo de captura local
+from CAPTURE_ENGINE_01.capture_config import SYMBOLS_TO_CAPTURE
+
+def init_logging(component: str = "system", category: str = "00_ORCHESTRATOR"):
+    create_directories()
+    return get_logger(component, category)
+
+# ==============================================================================
+# CONSTANTES OPERATIVAS DE INFRAESTRUCTURA
+# ==============================================================================
+MAX_REINICIOS = 15
+BACKOFF_ESPERA_SEG = 60
+TIEMPO_VIDA_MINIMO_SEG = 30
+DELAY_BETWEEN_STARTS = 2.0
+STABILIZATION_TIMEOUT = 15
+
+if OPTIMIZACION == 'aws':
+    ZOMBIE_TIMEOUT_SEG = 900
+    HEARTBEAT_TIMEOUT_SEG = 600
+else:
+    ZOMBIE_TIMEOUT_SEG = 600
+    HEARTBEAT_TIMEOUT_SEG = 300
+
+SHUTDOWN_GRACEFUL_WAIT = 15.0
+
+def get_session_umbral_normal(session: str) -> int:
+    if session in ["LONDON", "OVERLAP", "NEW_YORK"]:
+        return 60
+    elif session == "ASIA":
+        return 180
+    else:
+        return 600
+
+def get_session_umbral_critico(session: str) -> int:
+    if session in ["LONDON", "OVERLAP", "NEW_YORK"]:
+        return 300
+    elif session == "ASIA":
+        return 600
+    else:
+        return 1800
+
+
+class SmartLauncher:
+    def __init__(self):
+        self.logger = init_logging("launcher", "00_ORCHESTRATOR")
+        self.processes: Dict[str, Dict] = {}
+        self.running = True
+        self.market_open = False
+        self.start_time = datetime.now()
+        self.restart_count = {symbol: 0 for symbol in SYMBOLS_TO_CAPTURE}
+        self.problems_detected: List[str] = []
+        self.pausado_hasta: Dict[str, float] = {}
+        self._capturer_status: Dict[str, str] = {symbol: "UNKNOWN" for symbol in SYMBOLS_TO_CAPTURE}
+        self._current_session: Dict[str, str] = {symbol: "UNKNOWN" for symbol in SYMBOLS_TO_CAPTURE}
+        self.kb_available = os.name == 'nt'
+        
+        try:
+            signal.signal(signal.SIGINT, self.signal_handler)
+            signal.signal(signal.SIGTERM, self.signal_handler)
+        except ValueError:
+            pass
+            
+        self.clear_screen()
+        self.print_header()
+        self._clean_stale_signals()
+        self.logger.info("✅ Launcher inicializado de forma exitosa (Pure Signal Shutdown Active)")
+
+    def _clean_stale_signals(self):
+        try:
+            signal_file = STATE_DIR / "shutdown.signal"
+            if signal_file.exists():
+                signal_file.unlink()
+                self.logger.info("🧹 Eliminada señal de shutdown residual en directorio de estados.")
+            for symbol in SYMBOLS_TO_CAPTURE:
+                ok_file = STATE_DIR / f"{symbol}.shutdown_ok"
+                if ok_file.exists():
+                    ok_file.unlink()
+                symbol_signal_file = STATE_DIR / f"{symbol}.shutdown_signal"
+                if symbol_signal_file.exists():
+                    symbol_signal_file.unlink()
+        except Exception as e:
+            self.logger.error(f"Error limpiando archivos de señal huérfanos al arrancar: {e}")
+
+    def signal_handler(self, signum, frame):
+        self.logger.info(f"Señal nativa del SO [{signum}] interceptada. Orquestando apagado seguro por señal...")
+        self.running = False
+
+    def _get_current_session(self) -> str:
+        ahora = datetime.now(BROKER_TZ)
+        hour = ahora.hour
+        if 6 <= hour < 14:
+            return "LONDON"
+        elif 14 <= hour < 18:
+            return "OVERLAP"
+        elif 18 <= hour < 22:
+            return "NEW_YORK"
+        elif 22 <= hour < 24:
+            return "CLOSED"
+        else:
+            return "ASIA"
+
+    def _update_session_for_symbol(self, symbol: str):
+        self._current_session[symbol] = self._get_current_session()
+
+    def clear_screen(self):
+        try:
+            os.system('cls' if os.name == 'nt' else 'clear')
+        except Exception:
+            pass
+
+    def print_header(self):
+        print(f"{Fore.CYAN}{'='*100}")
+        print(f"{Fore.YELLOW}🚀 SUPERVISOR INTELIGENTE — INFRAESTRUCTURA DE APAGADO SEGURO (SHUTDOWN SIGNAL)")
+        print(f"{Fore.CYAN}{'='*100}")
+        broker_time = datetime.now(BROKER_TZ)
+        local_time = datetime.now()
+        session = self._get_current_session()
+        session_colors = {"LONDON": Fore.GREEN, "OVERLAP": Fore.CYAN, "NEW_YORK": Fore.BLUE, "ASIA": Fore.YELLOW, "CLOSED": Fore.RED}
+        print(f"{Fore.WHITE}📅 Hora Broker: {broker_time.strftime('%Y-%m-%d %H:%M:%S %Z')} | {session_colors.get(session, Fore.WHITE)}Sesión: {session}")
+        print(f"{Fore.WHITE}📍 Hora PC     : {local_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{Fore.WHITE}🎯 Símbolos    : {len(SYMBOLS_TO_CAPTURE)}")
+        print(f"{Fore.WHITE}💾 Entorno     : {'PC' if not USAR_RAMDISK else 'PC+RAMDISK'}")
+        print(f"{Fore.CYAN}{'='*100}")
+
+    def is_market_open(self) -> bool:
+        ahora = datetime.now(BROKER_TZ)
+        dia_semana = ahora.weekday()
+        hora_actual = ahora.hour
+
+        if dia_semana == 5:
+            return False
+        if dia_semana == 6:
+            return False
+        if dia_semana == 4:
+            return hora_actual < 24
+        return True
+
+    def check_market_before_start(self):
+        print(f"\n{Fore.YELLOW}🔍 VERIFICANDO ESTADO DEL MERCADO...")
+        ahora = datetime.now(BROKER_TZ)
+        dia_nombre = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'][ahora.weekday()]
+        print(f"{Fore.WHITE} Hora broker : {ahora.strftime('%H:%M')} ({dia_nombre})")
+        if self.is_market_open():
+            self.market_open = True
+            print(f"{Fore.GREEN}✅ MERCADO ABIERTO — Iniciando captura")
+        else:
+            self.market_open = False
+            print(f"{Fore.YELLOW}⏸️ MERCADO CERRADO — En espera")
+        print(f"{Fore.CYAN}{'='*100}")
+
+    def check_dead_processes(self) -> List[Tuple[str, int]]:
+        dead_symbols = []
+        for symbol, info in list(self.processes.items()):
+            process = info.get('process')
+            if process and process.poll() is not None:
+                dead_symbols.append((symbol, process.poll()))
+        return dead_symbols
+
+    def check_zombie_processes(self) -> List[Tuple[str, float, Dict]]:
+        zombies = []
+        ahora = time.time()
+        for symbol, info in list(self.processes.items()):
+            process = info.get('process')
+            if not process or process.poll() is not None:
+                continue
+            if not self.is_market_open():
+                continue
+            is_zombie = False
+            zombie_age = 0
+            session = self._current_session.get(symbol, self._get_current_session())
+            umbral_critico = get_session_umbral_critico(session)
+            heartbeat_file = STATE_DIR / f"{symbol}.heartbeat"
+            if heartbeat_file.exists():
+                try:
+                    with open(heartbeat_file, 'r', encoding='utf-8') as f:
+                        content = f.read().strip()
+                        last_beat = float(content.split('\n')[0])
+                        heartbeat_age = ahora - last_beat
+                        if heartbeat_age > umbral_critico:
+                            is_zombie = True
+                            zombie_age = heartbeat_age
+                except Exception:
+                    pass
+            if is_zombie:
+                zombies.append((symbol, zombie_age, info))
+        return zombies
+
+    def start_capturer_smart(self, symbol: str) -> bool:
+        """Lanza un capturador de forma asíncrona y lo mantiene en segundo plano."""
+        print(f"{Fore.WHITE}▶️ Iniciando {symbol}... ", end=' ', flush=True)
+        
+        try:
+            fecha_str = datetime.now(BROKER_TZ).strftime('%Y%m%d')
+            log_dir = LOGS_MASTER_DIR / fecha_str / "01_CAPTURE"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"{symbol}_stderr.log"
+            
+            capturer_path = raiz_proyecto / "CAPTURE_ENGINE_01" / "mt5_tick_engine.py"
+            cmd = [sys.executable, "-u", str(capturer_path), symbol]
+            
+            log_file = open(log_path, "a", encoding='utf-8', buffering=1)
+            
+            # Configurar entorno con PYTHONPATH para que encuentre los módulos de la raíz
+            env_utf8 = os.environ.copy()
+            env_utf8["PYTHONIOENCODING"] = "utf-8"
+            env_utf8["PYTHONPATH"] = str(raiz_proyecto) + os.pathsep + env_utf8.get("PYTHONPATH", "")
+            
+            # Ejecutar en segundo plano (NO timeout)
+            p = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=log_file,
+                cwd=str(raiz_proyecto),
+                env=env_utf8
+            )
+            
+            self.processes[symbol] = {
+                'process': p,
+                'pid': p.pid,
+                'start_time': time.time(),
+                'last_restart': datetime.now(),
+                'restart_count': self.restart_count.get(symbol, 0),
+                'status': 'running',
+                'log_path': str(log_path),
+                'log_file': log_file
+            }
+            self._update_session_for_symbol(symbol)
+            print(f"{Fore.GREEN}✅ PID: {p.pid}")
+            self.logger.info(f"✅ {symbol} iniciado de forma asíncrona en CAPTURE_ENGINE_01 (PID: {p.pid})")
+            return True
+            
+        except Exception as e:
+            print(f"{Fore.RED}❌ Falló: {e}")
+            self.problems_detected.append(f"{symbol}: {str(e)[:50]}")
+            self.logger.error(f"❌ Error iniciando proceso capturador para {symbol}: {e}")
+            return False
+
+    def restart_dead_process(self, symbol: str, exit_code: int) -> bool:
+        if symbol not in self.processes:
+            return False
+        tiempo_vivo = time.time() - self.processes[symbol]['start_time']
+        old_log = self.processes[symbol].get('log_file')
+        if old_log:
+            try:
+                old_log.close()
+            except Exception:
+                pass
+        ahora = time.time()
+        if symbol in self.pausado_hasta and ahora < self.pausado_hasta[symbol]:
+            return False
+        if exit_code == 0 and tiempo_vivo >= TIEMPO_VIDA_MINIMO_SEG:
+            self.restart_count[symbol] = 0
+            print(f"\n{Fore.CYAN}🔄 {symbol} finalizó de forma controlada — Re-iniciando...")
+            return self.start_capturer_smart(symbol)
+        
+        reicios = self.restart_count.get(symbol, 0) + 1
+        self.restart_count[symbol] = reicios
+        if reicios > MAX_REINICIOS:
+            self.pausado_hasta[symbol] = ahora + BACKOFF_ESPERA_SEG
+            self.restart_count[symbol] = 0
+            msg = f"{symbol}: {MAX_REINICIOS} caídas detectadas — Captura pausada por {BACKOFF_ESPERA_SEG}s"
+            print(f"\n{Fore.RED}⛔ {msg}")
+            self.problems_detected.append(msg)
+            send_telegram_alert(f"⛔ <b>{msg}</b>")
+            self.logger.warning(f"⛔ {msg}")
+            return False
+            
+        print(f"\n{Fore.YELLOW}💀 PROCESO CAÍDO: {symbol} (Exit: {exit_code}, Uptime: {tiempo_vivo:.1f}s)")
+        print(f"{Fore.YELLOW} 🔄 Recuperando de forma asíncrona ({reicios}/{MAX_REINICIOS})...")
+        self.logger.warning(f"💀 {symbol} caído en sesión. Re-lanzando de forma controlada...")
+        return self.start_capturer_smart(symbol)
+
+    def _get_state_info(self, symbol: str) -> dict:
+        try:
+            state_file = STATE_DIR / f"{symbol}_system_state.json"
+            if state_file.exists():
+                with open(state_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data.get('metrics', {})
+        except Exception as e:
+            self.logger.debug(f"Error leyendo estado de {symbol}: {e}")
+        return {}
+
+    def print_status(self):
+        try:
+            self.clear_screen()
+            self.print_header()
+            uptime = datetime.now() - self.start_time
+            hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            mercado_str = f"{Fore.GREEN}🟢 ABIERTO" if self.market_open else f"{Fore.YELLOW}🟡 CERRADO"
+            print(f"\n{Fore.WHITE}Mercado: {mercado_str} | Uptime: {hours:02d}:{minutes:02d}:{seconds:02d} | Re-inicios: {sum(self.restart_count.values())}")
+            print(f"\n{Fore.CYAN}{'SÍMBOLO':<10} {'ESTADO SM':<10} {'VEL':<6} {'BUFFER':<14} {'OVERFLOW':<10} {'SLOPE':<8} {'REIN'}")
+            print(f"{Fore.CYAN}{'-'*100}")
+            active_count = 0
+            ahora = time.time()
+            for symbol in SYMBOLS_TO_CAPTURE:
+                info = self.processes.get(symbol, {})
+                process = info.get('process')
+                state_info = self._get_state_info(symbol)
+                if process and process.poll() is None:
+                    active_count += 1
+                    status_icon = f"{Fore.GREEN}✅"
+                    status_text = "ACTIVO"
+                else:
+                    status_icon = f"{Fore.RED}💀"
+                    status_text = "DETENIDO"
+                
+                state = state_info.get('state', 'UNKNOWN')
+                speed = state_info.get('speed', 1.0) * 100
+                buffer_pct = state_info.get('buffer_pct', 0.0)
+                overflow = state_info.get('overflow_rate', 0.0)
+                slope = state_info.get('slope', 0.0)
+                
+                state_col = Fore.GREEN if state == 'GREEN' else (Fore.YELLOW if state in ['YELLOW', 'ORANGE'] else Fore.RED)
+                bar_filled = int(buffer_pct / 10)
+                buffer_bar = '█' * bar_filled + '░' * (10 - bar_filled)
+                buf_col = Fore.GREEN if buffer_pct < 60 else (Fore.YELLOW if buffer_pct < 85 else Fore.RED)
+                restarts = self.restart_count.get(symbol, 0)
+                restart_str = f"{Fore.YELLOW}{restarts}" if restarts > 0 else f"{Fore.WHITE}0"
+                
+                if symbol in self.pausado_hasta and ahora < self.pausado_hasta[symbol]:
+                    pausa_restante = int(self.pausado_hasta[symbol] - ahora)
+                    status_text = f"⏸️ PAUSA {pausa_restante}s"
+                    status_icon = f"{Fore.RED}⏸️"
+                    state_col = Fore.RED
+                
+                print(f"{Fore.WHITE}{symbol:<10} "
+                      f"{status_icon} {status_text:<11} "
+                      f"{state_col}{state:<8} "
+                      f"{Fore.WHITE}{speed:>5.0f}%"
+                      f"{buf_col}{buffer_bar} {buffer_pct:>5.1f}%"
+                      f"{Fore.WHITE}{overflow:>8.2f}/s "
+                      f"{Fore.WHITE}{slope:>7.1f} "
+                      f"{restart_str:<4}")
+            print(f"{Fore.CYAN}{'-'*100}")
+            print(f"{Fore.WHITE}📊 Procesos Activos: {active_count}/{len(SYMBOLS_TO_CAPTURE)}")
+            real_problems = [p for p in self.problems_detected if "lento" not in p.lower()]
+            if real_problems:
+                print(f"\n{Fore.RED}⚠️ ALERTAS OPERATIVAS:")
+                for problem in real_problems[-3:]:
+                    print(f" {Fore.YELLOW}• {problem}")
+            else:
+                print(f"\n{Fore.GREEN}✅ Estado Consistente — Captura de alta frecuencia sin cuellos de botella")
+            print(f"\n{Fore.YELLOW}[Q] Salir de Supervisor | [R] Re-lanzar todo el pipeline | [L] Mostrar ruta de logs")
+            print(f"{Fore.CYAN}{'='*100}")
+        except Exception as e:
+            pass
+
+    def restart_all(self):
+        print(f"\n{Fore.YELLOW}🔄 Forzando apagado y re-inicialización del pipeline...")
+        self.logger.info("🔄 Re-inicialización manual del pipeline de captura.")
+        self.shutdown_all_graceful()
+        time.sleep(3)
+        self.processes.clear()
+        self.restart_count = {symbol: 0 for symbol in SYMBOLS_TO_CAPTURE}
+        self.pausado_hasta.clear()
+        for i, symbol in enumerate(SYMBOLS_TO_CAPTURE):
+            self.start_capturer_smart(symbol)
+            if i < len(SYMBOLS_TO_CAPTURE) - 1:
+                time.sleep(DELAY_BETWEEN_STARTS)
+        print(f"\n{Fore.GREEN}✅ Pipeline completo re-lanzado")
+        self.logger.info("✅ Re-arranque del pipeline completado.")
+
+    def start_all_capturers(self):
+        print(f"\n{Fore.GREEN}🚀 LANZANDO CAPTURADORES INDEPENDIENTES...")
+        for i, symbol in enumerate(SYMBOLS_TO_CAPTURE):
+            self.start_capturer_smart(symbol)
+            if i < len(SYMBOLS_TO_CAPTURE) - 1:
+                time.sleep(DELAY_BETWEEN_STARTS)
+        print(f"\n{Fore.GREEN}✅ {len(SYMBOLS_TO_CAPTURE)} capturadores inicializados.")
+        print(f"{Fore.YELLOW}⏳ Esperando {STABILIZATION_TIMEOUT}s para que los capturadores escriban su primer estado...")
+        time.sleep(STABILIZATION_TIMEOUT)
+        for symbol in SYMBOLS_TO_CAPTURE:
+            self._get_state_info(symbol)
+
+    def _wait_for_market(self) -> bool:
+        print(f"\n{Fore.YELLOW}⏸️ En espera de la apertura del mercado...")
+        while self.running:
+            try:
+                if self.is_market_open():
+                    self.market_open = True
+                    print(f"\n{Fore.GREEN}🔔 ¡MERCADO ABIERTO!")
+                    self.logger.info("🔔 Apertura de mercado detectada. Arrancando procesos de captura.")
+                    return True
+                ahora_broker = datetime.now(BROKER_TZ)
+                print(f"\r{Fore.YELLOW}⏳ {ahora_broker.strftime('%H:%M:%S')} (Hora Broker en espera)", end='', flush=True)
+                time.sleep(15)
+            except KeyboardInterrupt:
+                self.running = False
+                return False
+        return False
+
+    def shutdown_all_graceful(self):
+        print(f"\n{Fore.RED}🔴 ORQUESTANDO APAGADO CONTROLADO (SHUTDOWN SIGNAL)...")
+        self.logger.info("🔴 Iniciando apagado seguro mediante archivo de señal en disco.")
+        signal_file = STATE_DIR / "shutdown.signal"
+        try:
+            with open(signal_file, "w", encoding="utf-8") as f:
+                f.write(f"shutdown_initiated_at={time.time()}\nby_pid={os.getpid()}\n")
+            self.logger.info("✅ Señal de parada física 'shutdown.signal' creada en el disco.")
+        except Exception as e:
+            self.logger.error(f"Fallo crítico escribiendo señal en disco. Forzando detención tradicional: {e}")
+            self._fallback_force_kill()
+            return
+            
+        start_wait = time.time()
+        confirmed_symbols = set()
+        while time.time() - start_wait < SHUTDOWN_GRACEFUL_WAIT:
+            for symbol in SYMBOLS_TO_CAPTURE:
+                if symbol not in confirmed_symbols:
+                    ok_file = STATE_DIR / f"{symbol}.shutdown_ok"
+                    if ok_file.exists():
+                        confirmed_symbols.add(symbol)
+                        print(f"  {Fore.GREEN}✅ {symbol} detuvo sus operaciones y confirmó guardado seguro.")
+                        self.logger.info(f"Confirmación de guardado de datos recibida para {symbol}.")
+            if len(confirmed_symbols) == len(SYMBOLS_TO_CAPTURE):
+                print(f"\n{Fore.GREEN}✅ Todos los capturadores finalizaron y confirmaron la consistencia de su persistencia.")
+                self.logger.info("Todos los capturadores activos confirmaron un apagado limpio.")
+                break
+            time.sleep(0.5)
+            
+        missing_symbols = set(SYMBOLS_TO_CAPTURE) - confirmed_symbols
+        if missing_symbols:
+            self.logger.warning(f"⚠️ {len(missing_symbols)} capturadores no confirmaron dentro de {SHUTDOWN_GRACEFUL_WAIT}s: {missing_symbols}")
+            for symbol in missing_symbols:
+                info = self.processes.get(symbol, {})
+                proc = info.get("process")
+                if proc and proc.poll() is None:
+                    try:
+                        print(f"  {Fore.RED}⚡ Forzando terminación de {symbol} (PID: {proc.pid})...")
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        
+        self._clean_stale_signals()
+        self.processes.clear()
+        print(f"\n{Fore.GREEN}✅ Cierre de pipeline de captura completado.")
+
+    def _fallback_force_kill(self):
+        for symbol, info in self.processes.items():
+            proc = info.get("process")
+            if proc and proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def _capture_loop(self):
+        last_health_check = time.time()
+        last_visual_refresh = 0.0
+        refresh_interval = 2.0
+        while self.running:
+            try:
+                ahora = time.time()
+                if ahora - last_visual_refresh >= refresh_interval:
+                    self.print_status()
+                    last_visual_refresh = ahora
+                
+                if not self.is_market_open():
+                    self.market_open = False
+                    print(f"\n{Fore.YELLOW}🔴 Mercado cerrado — Deteniendo pipeline de forma controlada...")
+                    self.logger.info("🔴 Cierre de mercado. Deteniendo capturadores de forma controlada.")
+                    self.shutdown_all_graceful()
+                    return
+                    
+                dead_processes = self.check_dead_processes()
+                for symbol, exit_code in dead_processes:
+                    self.restart_dead_process(symbol, exit_code)
+                    
+                if ahora - last_health_check > 120:
+                    zombies = self.check_zombie_processes()
+                    for symbol, edad, info in zombies:
+                        session = self._current_session.get(symbol, self._get_current_session())
+                        umbral_critico = get_session_umbral_critico(session)
+                        if edad > umbral_critico * 1.5:
+                            msg = f"Zombie detectado: {symbol} inactivo por {edad/60:.1f} minutos en sesión activa. Intentando apagado ordenado..."
+                            self.logger.warning(msg)
+                            send_telegram_alert(f"🚨 <b>{msg}</b>")
+                            symbol_signal_file = STATE_DIR / f"{symbol}.shutdown_signal"
+                            try:
+                                with open(symbol_signal_file, "w", encoding="utf-8") as f:
+                                    f.write(f"zombie_shutdown_initiated_at={time.time()}\n")
+                            except Exception as e:
+                                self.logger.error(f"Fallo al escribir señal individual para {symbol}: {e}")
+                                
+                            confirmed = False
+                            start_wait = time.time()
+                            ok_file = STATE_DIR / f"{symbol}.shutdown_ok"
+                            while time.time() - start_wait < 5.0:
+                                if ok_file.exists():
+                                    confirmed = True
+                                    break
+                                time.sleep(0.1)
+                                
+                            if not confirmed:
+                                self.logger.warning(f"⚠️ Zombie {symbol} no respondió a la señal en disco. Aplicando fuerza de detención...")
+                                if info.get('process'):
+                                    info['process'].terminate()
+                                    try:
+                                        info['process'].wait(timeout=3)
+                                    except subprocess.TimeoutExpired:
+                                        info['process'].kill()
+                                        
+                            if symbol_signal_file.exists():
+                                try:
+                                    symbol_signal_file.unlink()
+                                except Exception:
+                                    pass
+                            if ok_file.exists():
+                                try:
+                                    ok_file.unlink()
+                                except Exception:
+                                    pass
+                            self.start_capturer_smart(symbol)
+                    last_health_check = ahora
+                    
+                if self.kb_available:
+                    import msvcrt
+                    if msvcrt.kbhit():
+                        key = msvcrt.getch().decode('utf-8', errors='ignore').upper()
+                        if key == 'Q':
+                            self.running = False
+                            break
+                        elif key == 'R':
+                            self.restart_all()
+                            time.sleep(3)
+                        elif key == 'L':
+                            print(f"\n{Fore.CYAN}📂 Directorio centralizado de logs: {LOGS_UNIFIED_DIR}{Fore.RESET}")
+                            time.sleep(2)
+            except KeyboardInterrupt:
+                self.running = False
+                break
+            except Exception as e:
+                self.logger.error(f"Error en bucle de supervisión general: {e}", exc_info=True)
+                time.sleep(5)
+
+    def run(self):
+        broker_time = datetime.now(BROKER_TZ)
+        self.logger.info(f"🚀 Launcher iniciado de forma integrada a las {broker_time.strftime('%H:%M:%S')}")
+        self.check_market_before_start()
+        while self.running:
+            if not self.market_open:
+                if not self._wait_for_market():
+                    break
+            if self.running and self.market_open:
+                self.start_all_capturers()
+                self._capture_loop()
+                self.shutdown_all_graceful()
+                
+        self.logger.info("💀 Supervisor finalizado de forma limpia.")
+
+
+def main():
+    launcher = SmartLauncher()
+    launcher.run()
+
+if __name__ == "__main__":
+    main()

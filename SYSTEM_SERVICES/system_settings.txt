@@ -1,0 +1,155 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+SYSTEM_SERVICES - SYSTEM_SETTINGS
+==========================================================================
+Ubicación: SYSTEM_SERVICES/system_settings.py
+Responsabilidad: Cargar y validar las credenciales de ejecución del bot,
+                 APIs de IA, y despachar notificaciones de Telegram.
+                 - Lee del archivo .env ubicado estrictamente en CODE_DIR.
+                 - Centraliza la función de alerta asíncrona para no bloquear
+                   el hilo caliente de ejecución.
+==========================================================================
+"""
+import os
+import urllib.request
+import urllib.parse
+import threading
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+# Importamos la ruta del código fuente para localizar el archivo .env
+from SYSTEM_SERVICES.system_paths import CODE_DIR
+
+# --- Lector manual y robusto de archivos .env (sin dependencias externas) ---
+def load_env_file(env_path: Path) -> None:
+    """
+    Lee un archivo .env de forma manual y carga las variables en os.environ.
+    """
+    if not env_path.exists():
+        print(f"[SYSTEM_SETTINGS] ⚠️ Archivo de configuración .env no localizado en: {env_path}")
+        return
+    
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            # Ignorar líneas vacías o comentarios
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, val = line.split("=", 1)
+                # Limpiar espacios y comillas
+                key_clean = key.strip()
+                val_clean = val.strip().strip('"').strip("'")
+                os.environ[key_clean] = val_clean
+
+
+# Cargar variables al importar el módulo
+ENV_FILE_PATH = CODE_DIR / ".env"
+load_env_file(ENV_FILE_PATH)
+
+# --- CARGA Y CONFIGURACIÓN DE PARÁMETROS OPERATIVOS ---
+
+# 1. Modo operativo (Por defecto en SHADOW por razones de seguridad de cuenta)
+OPERATIONAL_MODE: str = os.getenv("OPERATIONAL_MODE", "SHADOW").upper()
+
+# 2. Credenciales del Broker MT5
+MT5_LOGIN: int = int(os.getenv("MT5_LOGIN", "0"))
+MT5_PASSWORD: str = os.getenv("MT5_PASSWORD", "")
+MT5_SERVER: str = os.getenv("MT5_SERVER", "")
+
+# 3. Credenciales de Telegram (Soporta TELEGRAM_BOT_TOKEN y TELEGRAM_TOKEN)
+TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", ""))
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# 4. Proveedores de Inteligencia Artificial (LLM)
+DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+
+
+def validate_settings() -> bool:
+    """
+    Valida la integridad de la configuración crítica al inicio del ciclo.
+    Si faltan credenciales esenciales, retorna False.
+    """
+    errors = []
+    
+    # Validar MT5
+    if MT5_LOGIN == 0 or not MT5_PASSWORD or not MT5_SERVER:
+        errors.append("Faltan credenciales críticas de MT5 (LOGIN, PASSWORD o SERVER).")
+        
+    # Validar Telegram
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        errors.append("Faltan credenciales de Telegram (TELEGRAM_BOT_TOKEN / TELEGRAM_TOKEN o TELEGRAM_CHAT_ID).")
+        
+    # Validar que al menos un proveedor de IA esté configurado si no estamos en local simple
+    if not DEEPSEEK_API_KEY and not OPENAI_API_KEY:
+        print("[SYSTEM_SETTINGS] ⚠️ Advertencia: No se han detectado API Keys para LLMs. AI_ENGINE_00 operará limitado.")
+
+    if errors:
+        print("\n❌ ERRORES DE CONFIGURACIÓN DETECTADOS:")
+        for err in errors:
+            print(f"   - {err}")
+        return False
+        
+    print(f"\n[SYSTEM_SETTINGS] ✅ Configuración cargada correctamente.")
+    print(f"                  Modo de Operación: {OPERATIONAL_MODE}")
+    return True
+
+
+# ==========================================================================
+# ENVÍO ASÍNCRONO DE NOTIFICACIONES DE TELEGRAM
+# ==========================================================================
+def _send_telegram_http_request(message: str) -> None:
+    """
+    Realiza la petición HTTP síncrona a la API de Telegram.
+    Es una función auxiliar interna para ejecutarse en hilos secundarios.
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    # Limitar longitud para evitar errores de la API de Telegram (máx 4096 caracteres)
+    if len(message) > 4000:
+        message = message[:4000] + "\n\n[Mensaje truncado por longitud]"
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(url, data=data, method="POST")
+        # Timeout de 8 segundos para evitar hilos huérfanos por mala conexión
+        with urllib.request.urlopen(req, timeout=8) as response:
+            response.read()
+    except Exception as e:
+        print(f"[SYSTEM_SETTINGS] Error al enviar notificación de Telegram: {e}")
+
+
+def send_telegram_alert(message: str) -> None:
+    """
+    Envía una alerta de Telegram de manera asíncrona (en un hilo secundario).
+    Previene retrasos o latencias en el hilo de ejecución principal.
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+        
+    # Creación de hilo para envío en segundo plano
+    thread = threading.Thread(target=_send_telegram_http_request, args=(message,), daemon=True)
+    thread.start()
+
+
+if __name__ == "__main__":
+    print("=" * 80)
+    print("SOPORTE DE INFRAESTRUCTURA - VERIFICACIÓN DE AJUSTES Y CONFIGURACIÓN")
+    print("=" * 80)
+    print(f"Buscando archivo .env en: {ENV_FILE_PATH}")
+    
+    if validate_settings():
+        print("\nEnviando mensaje de prueba asíncrono a Telegram...")
+        send_telegram_alert(f"🧪 *SYSTEM_SETTINGS* — Verificación de credenciales completada.\nModo de ejecución: `{OPERATIONAL_MODE}`")
+        print("Mensaje de prueba enviado al hilo de red. Revise su canal de Telegram.")
+    print("=" * 80)

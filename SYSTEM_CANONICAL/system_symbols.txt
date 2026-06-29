@@ -1,0 +1,153 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+SYSTEM_CANONICAL - SYSTEM_SYMBOLS (AUTORIDAD DE SÍMBOLOS DEFINITIVA)
+==========================================================================
+Ubicación: SYSTEM_CANONICAL/system_symbols.py
+Responsabilidad: Catálogo oficial e inmutable de los 10 pares Forex autorizados.
+                 - No se permite ningún par adicional.
+                 - Libre de dependencias externas.
+
+POLÍTICA DE ERRORES (DECISIÓN DE DISEÑO):
+   - Se implementa el principio de "Fail-Fast" (Fallo Inmediato).
+   - Consultar o validar un activo que no pertenezca a la tupla oficial
+     lanzará un KeyError de inmediato.
+   - Esto evita degradaciones silenciosas que podrían corromper los cálculos
+     del motor cuantitativo o de toma de decisiones en producción.
+==========================================================================
+"""
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+
+@dataclass(frozen=True)
+class SymbolSpecification:
+    """
+    Especificación técnica e inmutable de un activo financiero.
+    """
+    symbol: str              # Nombre oficial del símbolo (ej. "EURUSD")
+    digits: int              # Decimales (5 para Forex estándar, 3 para JPY)
+    spread_limit: float      # Límite de spread permitido en puntos enteros del broker
+    buffer_size: int         # Tamaño del búfer en memoria RAM
+    min_buffer_ready: int    # Ticks mínimos requeridos para habilitar análisis
+    is_risk_asset: bool      # Clasificación de activo de riesgo (F3 / Quant)
+    is_safe_haven: bool      # Clasificación de activo de refugio seguro (F3 / Quant)
+
+
+# ==========================================================================
+# REGLA ESTRUCTURAL: TUPLA INMUTABLE DE LOS 10 PARES EN PRODUCCIÓN
+# ==========================================================================
+SYMBOLS: Tuple[str, ...] = (
+    'EURUSD',
+    'GBPUSD',
+    'USDJPY',
+    'USDCAD',
+    'AUDUSD',
+    'NZDUSD',
+    'GBPJPY',
+    'EURJPY',
+    'CHFJPY',
+    'CADJPY'
+)
+
+# ==========================================================================
+# CATÁLOGO DE ESPECIFICACIONES TÉCNICAS (ESTRICTAMENTE 10 PARES)
+# ==========================================================================
+_CANONICAL_CATALOG: Dict[str, SymbolSpecification] = {
+    "EURUSD": SymbolSpecification(
+        symbol="EURUSD", digits=5, spread_limit=20.0, buffer_size=5000,
+        min_buffer_ready=500, is_risk_asset=False, is_safe_haven=False
+    ),
+    "GBPUSD": SymbolSpecification(
+        symbol="GBPUSD", digits=5, spread_limit=25.0, buffer_size=5000,
+        min_buffer_ready=500, is_risk_asset=True, is_safe_haven=False
+    ),
+    "USDJPY": SymbolSpecification(
+        symbol="USDJPY", digits=3, spread_limit=20.0, buffer_size=5000,
+        min_buffer_ready=500, is_risk_asset=False, is_safe_haven=True
+    ),
+    "USDCAD": SymbolSpecification(
+        symbol="USDCAD", digits=5, spread_limit=25.0, buffer_size=2000,
+        min_buffer_ready=200, is_risk_asset=False, is_safe_haven=False
+    ),
+    "AUDUSD": SymbolSpecification(
+        symbol="AUDUSD", digits=5, spread_limit=25.0, buffer_size=2000,
+        min_buffer_ready=200, is_risk_asset=True, is_safe_haven=False
+    ),
+    "NZDUSD": SymbolSpecification(
+        symbol="NZDUSD", digits=5, spread_limit=30.0, buffer_size=1500,
+        min_buffer_ready=150, is_risk_asset=True, is_safe_haven=False
+    ),
+    "GBPJPY": SymbolSpecification(
+        symbol="GBPJPY", digits=3, spread_limit=35.0, buffer_size=4000,
+        min_buffer_ready=400, is_risk_asset=True, is_safe_haven=False
+    ),
+    "EURJPY": SymbolSpecification(
+        symbol="EURJPY", digits=3, spread_limit=25.0, buffer_size=3000,
+        min_buffer_ready=300, is_risk_asset=True, is_safe_haven=False
+    ),
+    "CHFJPY": SymbolSpecification(
+        symbol="CHFJPY", digits=3, spread_limit=30.0, buffer_size=1500,
+        min_buffer_ready=150, is_risk_asset=False, is_safe_haven=False
+    ),
+    "CADJPY": SymbolSpecification(
+        symbol="CADJPY", digits=3, spread_limit=30.0, buffer_size=1500,
+        min_buffer_ready=150, is_risk_asset=False, is_safe_haven=False
+    )
+}
+
+
+# ==========================================================================
+# INTERFAZ DE CONSULTA DE LA CAPA CANÓNICA
+# ==========================================================================
+
+def get_symbols() -> Tuple[str, ...]:
+    """
+    Retorna la tupla inmutable con los 10 pares autorizados en producción.
+    """
+    return SYMBOLS
+
+
+def is_symbol_valid(symbol: str) -> bool:
+    """
+    Verifica si un símbolo pertenece al conjunto autorizado de 10 pares.
+    """
+    return symbol.upper() in SYMBOLS
+
+
+def get_symbol_specification(symbol: str) -> SymbolSpecification:
+    """
+    Retorna las especificaciones técnicas e inmutables del activo.
+
+    POLÍTICA DE ERRORES:
+       - Si el símbolo consultado no existe en el catálogo, se lanza un KeyError
+         de forma inmediata para advertir al desarrollador del fallo.
+    """
+    sym_upper = symbol.upper()
+    if sym_upper not in _CANONICAL_CATALOG:
+        raise KeyError(
+            f"[SYSTEM_SYMBOLS] ❌ Error de violación canónica: El activo '{symbol}' "
+            f"no está registrado en el catálogo de producción de {len(SYMBOLS)} símbolos."
+        )
+    return _CANONICAL_CATALOG[sym_upper]
+
+
+if __name__ == "__main__":
+    print("=" * 80)
+    print("CAPA DE CONOCIMIENTO - CONSOLIDACIÓN INMUTABLE Y POLÍTICA FAIL-FAST")
+    print("=" * 80)
+    print(f"Tupla de Símbolos Autorizados: {get_symbols()}\n")
+    
+    # 1. Prueba de consulta de un activo válido
+    specs = get_symbol_specification("EURUSD")
+    print(f"Activo válido verificado: {specs.symbol} | Búfer: {specs.buffer_size}")
+    
+    # 2. Prueba del comportamiento Fail-Fast ante un activo inválido
+    print("\nEjecutando prueba de control de errores (Fail-Fast)...")
+    try:
+        get_symbol_specification("USDCHF")
+    except KeyError as e:
+        print(f"✅ Excepción capturada correctamente ante símbolo inexistente:\n   {e}")
+        
+    print("\n✅ Verificación de estructura e inmutabilidad finalizada.")
+    print("=" * 80)

@@ -1,0 +1,150 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+SYSTEM_SERVICES - SYSTEM_PATHS (REORGANIZADO CON CORRECCIÓN DE WORKSPACES)
+==========================================================================
+Ubicación: SYSTEM_SERVICES/system_paths.py
+Responsabilidad: Gestión estricta de rutas de almacenamiento de datos.
+                 - Código aislado: C:\\Users\\Noelia\\Desktop\\PYTHON_MT5
+                 - Ticks RAM (M:\\): M:\\TICK_DATA
+                 - Datos/Estados (C:\\): C:\\MT5_DATA
+==========================================================================
+"""
+from pathlib import Path
+from typing import List
+
+# --- REGLA 1: Código Fuente (Lectura exclusiva, aislado de I/O) ---
+CODE_DIR = Path(r"C:\Users\Noelia\Desktop\PYTHON_MT5")
+
+# --- REGLA 2: Escritura Primaria de Ticks en RAM/Unidad M:\ ---
+PRIMARY_TICK_DIR = Path(r"M:\TICK_DATA")
+
+# --- REGLA 3: Unidad de Datos y Almacenamiento MT5_DATA ---
+MT5_DATA_DIR = Path(r"C:\MT5_DATA")
+
+# ==========================================================================
+# 02. Evidencia SSD (Doble escritura / Escritura paralela en espejo)
+# ==========================================================================
+SSD_EVIDENCE_DIR = MT5_DATA_DIR / "02_SSD_EVIDENCE"
+
+# ==========================================================================
+# 03. Archivo Maestro de Daemon (Comprimidos y Cuarentena)
+# ==========================================================================
+MASTER_ARCHIVE_DIR = MT5_DATA_DIR / "03_MASTER_ARCHIVE"
+QUARANTINE_DIR = MASTER_ARCHIVE_DIR / "QUARANTINE"
+SAFE_DIR = MASTER_ARCHIVE_DIR / "SAFE"
+
+# ==========================================================================
+# 04. Entorno de Auditoría (Audit Workspace)
+# ==========================================================================
+AUDIT_WORKSPACE = MT5_DATA_DIR / "04_AUDIT_WORKSPACE"
+# Subcarpetas exclusivas de Auditoría (Captura 1)
+AUDIT_FLOW = AUDIT_WORKSPACE / "FLOW"
+AUDIT_GOLD = AUDIT_WORKSPACE / "GOLD"
+AUDIT_LINEAGE = AUDIT_WORKSPACE / "LINEAGE"
+AUDIT_MAESTROS = AUDIT_WORKSPACE / "MAESTROS"
+AUDIT_RECOVERY = AUDIT_WORKSPACE / "RECOVERY"
+AUDIT_REPORTS = AUDIT_WORKSPACE / "REPORTS"
+AUDIT_STATE = AUDIT_WORKSPACE / "STATE"
+
+# ==========================================================================
+# 05. Entorno de Análisis Cuantitativo (Quant Workspace)
+# ==========================================================================
+QUANT_WORKSPACE = MT5_DATA_DIR / "05_QUANT_WORKSPACE"
+# Carpetas de administración del Quant Workspace
+QUANT_CONFIGURACION = QUANT_WORKSPACE / "CONFIGURACION"
+QUANT_FEEDBACK = QUANT_WORKSPACE / "FEEDBACK"
+QUANT_OUTPUTS = QUANT_WORKSPACE / "OUTPUTS"  # Contiene reportes e informes de F3
+# Carpeta de procesamiento e histórico (Captura 3)
+QUANT_PROCESSED_DATA = QUANT_WORKSPACE / "PROCESSED_DATA"
+QUANT_ANOMALIES = QUANT_PROCESSED_DATA / "ANOMALIES"
+QUANT_BARS = QUANT_PROCESSED_DATA / "BARS"
+QUANT_HISTORY = QUANT_PROCESSED_DATA / "HISTORY"
+QUANT_READINESS = QUANT_PROCESSED_DATA / "READINESS"
+
+# ==========================================================================
+# 06. Entorno de Toma de Decisiones (Decision Workspace)
+# ==========================================================================
+DECISION_WORKSPACE = MT5_DATA_DIR / "06_DECISION_WORKSPACE"
+# Subcarpetas de Decisiones (Captura 4)
+DECISION_CONFIDENCE_SCORES = DECISION_WORKSPACE / "CONFIDENCE_SCORES"
+DECISION_CONTRACTS = DECISION_WORKSPACE / "CONTRACTS"
+DECISION_EDGE_SCORES = DECISION_WORKSPACE / "EDGE_SCORES"
+DECISION_FEATURE_VECTORS = DECISION_WORKSPACE / "FEATURE_VECTORS"
+
+# ==========================================================================
+# Logs del Sistema (Ubicados de forma centralizada en C:\MT5_DATA)
+# ==========================================================================
+LOGS_DIR = MT5_DATA_DIR / "LOGS"
+LOGS_MASTER_DIR = LOGS_DIR / "00_ORCHESTRATOR"
+LOGS_CAPTURE_DIR = LOGS_DIR / "01_CAPTURE"
+LOGS_AUDIT_DIR = LOGS_DIR / "02_AUDIT"
+LOGS_QUANT_DIR = LOGS_DIR / "03_QUANT"
+LOGS_DECISION_DIR = LOGS_DIR / "04_DECISION"
+
+# ==========================================================================
+# Lista de carpetas de escritura crítica para inicialización automática
+# ==========================================================================
+CRITICAL_WRITING_DIRECTORIES: List[Path] = [
+    PRIMARY_TICK_DIR,
+    SSD_EVIDENCE_DIR,
+    MASTER_ARCHIVE_DIR,
+    QUARANTINE_DIR,
+    SAFE_DIR,
+    AUDIT_WORKSPACE,
+    AUDIT_FLOW,
+    AUDIT_GOLD,
+    AUDIT_LINEAGE,
+    AUDIT_MAESTROS,
+    AUDIT_RECOVERY,
+    AUDIT_REPORTS,
+    AUDIT_STATE,
+    QUANT_WORKSPACE,
+    QUANT_CONFIGURACION,
+    QUANT_FEEDBACK,
+    QUANT_OUTPUTS,
+    QUANT_PROCESSED_DATA,
+    QUANT_ANOMALIES,
+    QUANT_BARS,
+    QUANT_HISTORY,
+    QUANT_READINESS,
+    DECISION_WORKSPACE,
+    DECISION_CONFIDENCE_SCORES,
+    DECISION_CONTRACTS,
+    DECISION_EDGE_SCORES,
+    DECISION_FEATURE_VECTORS,
+    LOGS_DIR,
+    LOGS_MASTER_DIR,
+    LOGS_CAPTURE_DIR,
+    LOGS_AUDIT_DIR,
+    LOGS_QUANT_DIR,
+    LOGS_DECISION_DIR
+]
+
+
+def ensure_directories_exist() -> None:
+    """
+    Verifica y crea toda la jerarquía de carpetas en M:\\ y C:\\MT5_DATA.
+    Las carpetas se crean estrictamente en MAYÚSCULAS y en su workspace respectivo.
+    """
+    for folder in CRITICAL_WRITING_DIRECTORIES:
+        if not folder.exists():
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+                print(f"[SYSTEM_PATHS] Carpeta creada/verificada: {folder}")
+            except Exception as e:
+                print(f"[SYSTEM_PATHS] ❌ Error crítico creando carpeta {folder}: {e}")
+                raise e
+
+
+if __name__ == "__main__":
+    print("=" * 80)
+    print("SOPORTE DE INFRAESTRUCTURA - RUTAS DE TRABAJO CORREGIDAS Y SINCRONIZADAS")
+    print("=" * 80)
+    print(f"Directorio de Códigos (Lectura): {CODE_DIR}")
+    print(f"Unidad de RAM de Ticks (M:\\):     {PRIMARY_TICK_DIR}")
+    print(f"Workspace Principal (C:\\):         {MT5_DATA_DIR}")
+    print("\nInicializando directorios estrictamente en MAYÚSCULAS...")
+    ensure_directories_exist()
+    print("\n✅ Sincronización exitosa. Los workspaces coinciden con las directrices.")
+    print("=" * 80)

@@ -1,0 +1,117 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+WEEKLY SSD COMPRESSOR V1.0 - SCRIPT DE MANTENIMIENTO ASÍNCRONO
+==========================================================================
+Responsabilidad: Comprimir de forma masiva y semanal las carpetas de datos
+                 crudos de la SSD en archivos ZIP optimizados para la nube,
+                 liberando espacio local tras certificar la compresión.
+==========================================================================
+"""
+import os
+import sys
+import zipfile
+import shutil
+from pathlib import Path
+from datetime import datetime
+
+# Inyeccion de ruta para config.py
+raiz_proyecto = Path(__file__).resolve().parent
+if str(raiz_proyecto) not in sys.path:
+    sys.path.insert(0, str(raiz_proyecto))
+
+from config import SSD_EVIDENCE_DIR, MASTER_ARCHIVE_DIR, init_logging
+
+logger = init_logging("weekly_compressor", "00_ORCHESTRATOR")
+
+# Carpeta de salida para los ZIPs listos para subir a la nube
+OUTPUT_ZIPS_DIR = MASTER_ARCHIVE_DIR / "WEEKLY_ZIPS"
+
+def comprimir_carpeta_a_zip(carpeta_origen: Path, zip_destino_path: Path) -> bool:
+    """Comprime de forma recursiva una carpeta usando algoritmo DEFLATE de alta compresión."""
+    try:
+        with zipfile.ZipFile(zip_destino_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zipf:
+            for root, _, files in os.walk(carpeta_origen):
+                for file in files:
+                    file_path = Path(root) / file
+                    # Guardar con ruta relativa dentro del zip
+                    arcname = file_path.relative_to(carpeta_origen)
+                    zipf.write(file_path, arcname)
+        return True
+    except Exception as e:
+        logger.error(f"Fallo durante la compresión zip de {carpeta_origen.name}: {e}")
+        return False
+
+def ejecutar_mantenimiento_semanal():
+    logger.info("=" * 80)
+    logger.info("🧹 INICIANDO SCRIPT DE COMPRESIÓN Y MANTENIMIENTO SEMANAL DE SSD")
+    logger.info(f"   SSD de origen: {SSD_EVIDENCE_DIR}")
+    logger.info(f"   Destino ZIPs : {OUTPUT_ZIPS_DIR}")
+    logger.info("=" * 80)
+    
+    OUTPUT_ZIPS_DIR.mkdir(parents=True, exist_ok=True)
+    
+    if not SSD_EVIDENCE_DIR.exists():
+        logger.warning("⚠️ El directorio de evidencia SSD no existe. Nada que procesar.")
+        return
+
+    bytes_liberados = 0
+    archivos_procesados = 0
+
+    # Escanear Símbolos (Primer Nivel)
+    for sym_dir in SSD_EVIDENCE_DIR.iterdir():
+        if not sym_dir.is_dir():
+            continue
+            
+        symbol = sym_dir.name.upper()
+        
+        # Escanear Fechas (Segundo Nivel: ej. 20260625)
+        for date_dir in sym_dir.iterdir():
+            if not date_dir.is_dir() or len(date_dir.name) != 8 or not date_dir.name.isdigit():
+                continue
+                
+            fecha_str = date_dir.name
+            zip_filename = f"{symbol}_{fecha_str}.zip"
+            zip_output_path = OUTPUT_ZIPS_DIR / zip_filename
+            
+            if zip_output_path.exists():
+                logger.info(f"⏩ OMITIDO: {zip_filename} ya fue comprimido anteriormente.")
+                continue
+                
+            # Calcular tamaño de la carpeta antes de borrar
+            total_size_bytes = sum(f.stat().st_size for f in date_dir.rglob('*') if f.is_file())
+            
+            logger.info(f"📦 Comprimiendo {symbol} del {fecha_str} ({total_size_bytes / (1024*1024):.2f} MB)...")
+            
+            # Ejecutar Compresión
+            if comprimir_carpeta_a_zip(date_dir, zip_output_path):
+                # Validar la existencia física y legibilidad del ZIP recién creado
+                if zip_output_path.exists() and zip_output_path.stat().st_size > 0:
+                    logger.info(f"   ✅ ZIP creado: {zip_filename} ({zip_output_path.stat().st_size / (1024*1024):.2f} MB)")
+                    
+                    # Eliminar la carpeta original para liberar la SSD de forma segura
+                    try:
+                        shutil.rmtree(date_dir)
+                        bytes_liberados += total_size_bytes
+                        archivos_procesados += 1
+                        logger.info(f"   🧹 SSD Liberada: Carpeta original de {symbol} removida con éxito.")
+                    except Exception as e:
+                        logger.error(f"   ❌ No se pudo eliminar la carpeta SSD de {symbol}: {e}")
+                else:
+                    logger.error(f"   ❌ El archivo ZIP generado para {symbol} está corrupto o vacío. Evidencia SSD preservada.")
+            else:
+                logger.error(f"   ❌ Falló la compresión para {symbol}. No se liberó espacio en SSD.")
+
+    logger.info("=" * 80)
+    logger.info("📊 RESUMEN DE MANTENIMIENTO COMPLETADO")
+    logger.info("=" * 80)
+    logger.info(f"  Carpetas de fecha procesadas : {archivos_procesados}")
+    logger.info(f"  Espacio SSD total liberado   : {bytes_liberados / (1024*1024 * 1024):.2f} GB")
+    logger.info(f"  ZIPs listos para la nube en  : {OUTPUT_ZIPS_DIR.relative_to(MASTER_ARCHIVE_DIR.parent)}")
+    logger.info("=" * 80)
+
+if __name__ == "__main__":
+    try:
+        ejecutar_mantenimiento_semanal()
+    except KeyboardInterrupt:
+        print("\n🛑 Proceso de mantenimiento cancelado por el usuario.")

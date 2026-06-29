@@ -1,0 +1,251 @@
+"""
+==========================================================================
+ORCH_AUDIT - ORQUESTADOR DE AUDITORÍA FORENSE (FASE 2)
+==========================================================================
+Ubicación: CARPETA_RAIZ (PYTHON_MT5)
+Dependencias: audit_config (paths, logging, contracts, settings)
+Responsabilidad: Ejecutar secuencialmente y bajo un aislamiento de fallos
+                 los módulos de auditoría forense y de reportes.
+                 Coordina la ejecución de todos los scripts de la Fase 2.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección de la raíz del proyecto para resolver dependencias
+raiz_proyecto = Path(__file__).parent.resolve()
+if str(raiz_proyecto) not in sys.path:
+    sys.path.insert(0, str(raiz_proyecto))
+
+import subprocess
+import time
+import json
+import os
+import argparse
+from datetime import datetime, timezone
+
+# Importación desde audit_config (módulo de auditoría)
+from AUDIT_ENGINE_02.audit_config import (
+    AUDIT_STATE_DIR,
+    AUDIT_REPORTES_DIR,
+    get_fecha_broker_str,
+    init_audit_logging,
+    send_telegram_alert,
+    save_contract_atomic,
+    create_audit_contract_template
+)
+
+# Importación desde paths para SSD_EVIDENCE_DIR
+from paths import SSD_EVIDENCE_DIR
+
+# Inicializar logger con categoría de orquestador
+logger = init_audit_logging("orch_audit", "00_ORCHESTRATOR")
+
+
+# =============================================================================
+# CADENA DE EJECUCIÓN - FASE 2
+# =============================================================================
+SCRIPTS_FASE_2 = [
+    {"folder": "AUDIT_ENGINE_02", "name": "fci_evidence_calculator.py", "desc": "Reconciliación de Evidencia Física (FCI)"},
+    {"folder": "AUDIT_ENGINE_02", "name": "recovery_forensics.py", "desc": "Auditoría Forense de Recuperación (SEQ)"},
+    {"folder": "AUDIT_ENGINE_02", "name": "ram_ingestion_auditor.py", "desc": "Auditoría de Procesos de Ingesta (RAM)"},
+    {"folder": "AUDIT_ENGINE_02", "name": "market_etl.py", "desc": "ETL de Parquets Maestros (Desde SAFE)"},
+    {"folder": "AUDIT_ENGINE_02", "name": "market_descriptive_stats.py", "desc": "Perfilado de Microestructura de Mercado"},
+    {"folder": "AUDIT_ENGINE_02", "name": "crypto_lineage_auditor.py", "desc": "Trazabilidad Criptográfica (JSONL -> Gold)"},
+    {"folder": "AUDIT_ENGINE_02", "name": "trust_score_consolidator.py", "desc": "Consolidador Unificado de Calidad (Trust Score)"},
+    {"folder": "AUDIT_ENGINE_02", "name": "historical_persistence.py", "desc": "Persistencia Histórica y Bitácora Forense"},
+    {"folder": "REPORT_ENGINE_04", "name": "audit_report_engine.py", "desc": "Generador de Reporte Ejecutivo Word"}
+]
+
+
+def get_adaptive_timeout(fecha: str) -> int:
+    """
+    Calcula dinámicamente el timeout basado en el volumen físico en disco (H-10).
+
+    Args:
+        fecha: Fecha en formato YYYYMMDD
+
+    Returns:
+        int: Timeout calculado en segundos
+    """
+    base_timeout = 600
+    try:
+        total_bytes = 0
+        if SSD_EVIDENCE_DIR.exists():
+            for p in SSD_EVIDENCE_DIR.rglob(f"*{fecha}*"):
+                if p.is_file():
+                    total_bytes += p.stat().st_size
+
+        # 1 MB = 1048576 bytes. Agrega 30s adicionales por cada MB de ticks capturados.
+        size_mb = total_bytes / (1024 * 1024)
+        adaptive_bonus = int(size_mb * 30)
+
+        total_timeout = base_timeout + adaptive_bonus
+        logger.info(f"⏱️ Tamaño de ticks para {fecha}: {size_mb:.2f} MB. Timeout adaptativo calibrado en {total_timeout}s.")
+        return total_timeout
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo calcular el timeout adaptativo ({e}). Se asignará valor base de {base_timeout}s.")
+        return base_timeout
+
+
+def run_phase_script(folder: str, script_name: str, fecha: str, timeout: int) -> bool:
+    """
+    Ejecuta un script de la fase 2 con manejo de timeout y captura de salida.
+
+    Args:
+        folder: Carpeta donde se encuentra el script
+        script_name: Nombre del script
+        fecha: Fecha en formato YYYYMMDD
+        timeout: Timeout en segundos
+
+    Returns:
+        bool: True si el script se ejecutó correctamente
+    """
+    script_path = raiz_proyecto / folder / script_name
+    if not script_path.exists():
+        logger.error(f"❌ Script no encontrado: {script_path}")
+        return False
+
+    env_utf8 = os.environ.copy()
+    env_utf8["PYTHONIOENCODING"] = "utf-8"
+    env_utf8["PYTHONPATH"] = str(raiz_proyecto) + os.pathsep + env_utf8.get("PYTHONPATH", "")
+
+    cmd = [sys.executable, "-u", str(script_path), "--date", fecha]
+    logger.info(f"🔄 Ejecutando: {script_name} para fecha {fecha} (Timeout: {timeout}s)...")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=timeout,
+            cwd=str(raiz_proyecto / folder),
+            env=env_utf8
+        )
+        if result.returncode == 0:
+            logger.info(f"✅ {script_name} completado con éxito.")
+            return True
+        else:
+            logger.error(f"❌ {script_name} falló con código {result.returncode}:\n{result.stderr[-500:]}")
+            return False
+    except subprocess.TimeoutExpired:
+        logger.error(f"❌ TIMEOUT EXCEDIDO: {script_name} abortado después de {timeout}s.")
+        return False
+    except Exception as e:
+        logger.error(f"❌ Excepción ejecutando {script_name}: {e}")
+        return False
+
+
+def generate_execution_contract(fecha: str):
+    """
+    Genera el contrato de ejecución para la Fase 3, con esquema versionado.
+
+    Args:
+        fecha: Fecha en formato YYYYMMDD
+    """
+    summary_path = AUDIT_REPORTES_DIR / f"audit_report_{fecha}.json"
+    contract_path = AUDIT_STATE_DIR / "audit_execution_contract.json"
+
+    if not summary_path.exists():
+        logger.warning(f"⚠️ No se encontró audit_summary para generar contrato de auditoría.")
+        return
+
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary_data = json.load(f)
+
+        contracts = {}
+        for item in summary_data.get("resultados_auditoria", []):
+            sym = item.get("symbol")
+            status = item.get("status_operativo", "NO_CONFIABLE")
+            conf = item.get("confidence", 0)
+            contracts[sym] = {"status": status, "confidence": conf}
+
+        # Usar funciones desde audit_config
+        contract_data = create_audit_contract_template(fecha, contracts)
+        save_contract_atomic(contract_data, contract_path)
+
+        rejected = sum(1 for v in contracts.values() if v["status"] == "NO_CONFIABLE")
+        logger.info(f"📋 Contrato de Auditoría F2 generado. {rejected} símbolos rechazados.")
+
+    except Exception as e:
+        logger.error(f"❌ Error generando contrato de auditoría: {e}")
+
+
+def send_audit_summary_telegram(fecha: str, results: dict, elapsed: float):
+    """
+    Envía un resumen ejecutivo de la Fase 2 por Telegram.
+
+    Args:
+        fecha: Fecha en formato YYYYMMDD
+        results: Diccionario con resultados de cada script
+        elapsed: Tiempo total transcurrido
+    """
+    passed = sum(1 for v in results.values() if v)
+    total = len(SCRIPTS_FASE_2)
+    status_icon = "✅" if passed == total else "⚠️"
+
+    msg_lines = [
+        f"{status_icon} *FASE 2 — AUDITORÍA COMPLETADA*",
+        f"📅 Fecha: `{fecha}`",
+        f"📊 *Resumen de ejecución:*",
+        f"   • Módulos completados: {passed}/{total}",
+        f"   • Tiempo total: {elapsed:.1f}s",
+    ]
+    send_telegram_alert("\n".join(msg_lines))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Orch Audit - Pipeline Orchestrator Fase 2")
+    parser.add_argument("--date", type=str, default="latest",
+                       help="Fecha en formato YYYYMMDD o 'latest' para la última auditar")
+    parser.add_argument("--send-telegram", action='store_true',
+                       help="Enviar resumen a Telegram al finalizar")
+    args = parser.parse_args()
+
+    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
+
+    logger.info("=" * 70)
+    logger.info(f"⚖️ INICIANDO PIPELINE DE AUDITORÍA (FASE 2) PARA: {fecha}")
+    logger.info("=" * 70)
+
+    start_time = time.time()
+    results = {}
+
+    # Calibrar timeout adaptativo
+    timeout = get_adaptive_timeout(fecha)
+
+    for script_info in SCRIPTS_FASE_2:
+        folder, name = script_info["folder"], script_info["name"]
+        results[name] = run_phase_script(folder, name, fecha, timeout)
+
+        # Puntos de control críticos
+        if not results[name] and name in ["fci_evidence_calculator.py", "market_etl.py", "trust_score_consolidator.py"]:
+            logger.critical(f"❌ FALLO CRÍTICO en {name}. Abortando pipeline de auditoría.")
+            break
+
+    generate_execution_contract(fecha)
+
+    try:
+        sync_file = AUDIT_STATE_DIR / "last_audited_date.txt"
+        sync_file.write_text(fecha, encoding="utf-8")
+        logger.info(f"💾 Fecha {fecha} registrada para ejecuciones standalone.")
+    except Exception as e:
+        logger.error(f"❌ No se pudo guardar la fecha de sincronización: {e}")
+
+    elapsed = time.time() - start_time
+    passed = sum(1 for v in results.values() if v)
+    total = len(results)
+
+    logger.info("=" * 70)
+    logger.info(f"📋 PIPELINE FASE 2 FINALIZADO en {elapsed:.1f}s. Éxito: {passed}/{total}")
+    logger.info("=" * 70)
+
+    if args.send_telegram:
+        send_audit_summary_telegram(fecha, results, elapsed)
+
+
+if __name__ == "__main__":
+    main()

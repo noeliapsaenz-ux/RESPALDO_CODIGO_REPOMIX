@@ -1,0 +1,105 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+SYSTEM_CANONICAL - SYSTEM_STATES (ENUMERADORES DE ESTADO)
+==========================================================================
+Ubicación: SYSTEM_CANONICAL/system_states.py
+Responsabilidad: Centralizar los enumeradores de estado para todos los
+                 motores del bot, garantizando consistencia de tipos de datos.
+                 - No realiza operaciones de entrada/salida (I/O).
+                 - Libre de dependencias externas.
+==========================================================================
+"""
+from enum import Enum
+
+
+class SymbolCaptureStatus(str, Enum):
+    """Estados del proceso de captura en caliente para un símbolo."""
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+    STOPPED = "STOPPED"
+    ERROR = "ERROR"
+
+
+class DatasetQuality(str, Enum):
+    """Clasificación de la calidad e integridad de un archivo o lote de ticks."""
+    MAESTRO = "MAESTRO"          # Datos crudos validados y ordenados
+    GOLD = "GOLD"                # Datos curados de máxima calidad para modelado
+    QUARANTINE = "QUARANTINE"    # Datos con anomalías de secuencia o reloj
+    CORRUPTED = "CORRUPTED"      # Datos ilegibles o dañados estructuralmente
+
+
+class AuditSeverityLevel(str, Enum):
+    """Niveles de gravedad utilizados en las bitácoras y contratos de auditoría."""
+    INFO = "INFO"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+    FATAL = "FATAL"
+
+
+class MarketRegime(str, Enum):
+    """Regímenes de mercado basados en los umbrales de volatilidad."""
+    QUIET = "QUIET"              # Mercado calmado / baja volatilidad
+    NORMAL = "NORMAL"            # Comportamiento estándar
+    ACTIVE = "ACTIVE"            # Volatilidad elevada
+    EXPLOSIVE = "EXPLOSIVE"      # Volatilidad extrema (noticias, rollover)
+
+
+class MarketActivityState(str, Enum):
+    """Estados de actividad comercial generales del broker."""
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    HOLIDAY = "HOLIDAY"
+
+
+class MarketReadinessStatus(str, Enum):
+    """Evaluación de aptitud de un par para ser operado por el motor de quant."""
+    OPERABLE = "OPERABLE"        # Cumple con requisitos de FCI y spread
+    VETOED = "VETOED"            # Vetado operacionalmente por baja confianza
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"  # No hay suficientes ticks para análisis
+
+
+class DecisionStatus(str, Enum):
+    """Estado de resolución de una propuesta de ejecución en Fase 4."""
+    EXECUTE = "EXECUTE"          # Orden autorizada para transmisión al broker (Modo Live)
+    SHADOW_LOG = "SHADOW_LOG"    # Orden simulada y registrada en bitácora (Modo Shadow)
+    PASS = "PASS"                # Señal descartada / sin operación
+    PENDING_REVIEW = "PENDING_REVIEW" # Requiere revisión humana
+
+
+class ContractType(str, Enum):
+    """Tipos de contratos estructurados que se guardan en el sistema."""
+    AUDIT = "audit_execution_contract"
+    PORTFOLIO = "portfolio_execution_contract"
+    EXECUTION = "decision_contract"
+    LEARNING = "learning_contract"
+
+if __name__ == "__main__":
+    import json
+
+    print("=" * 80)
+    print("CAPA DE CONOCIMIENTO - VERIFICACIÓN DE ENUMERADORES DE ESTADO")
+    print("=" * 80)
+    
+    # Prueba de serialización directa a JSON sin encoders especiales
+    test_contract = {
+        "symbol": "EURUSD",
+        "integrity": DatasetQuality.GOLD,
+        "readiness": MarketReadinessStatus.OPERABLE,
+        "regime": MarketRegime.NORMAL,
+        "decision": DecisionStatus.SHADOW_LOG
+    }
+    
+    print("Objeto de prueba en Python:")
+    for k, v in test_contract.items():
+        print(f"   • {k}: {v} (Tipo: {type(v).__name__})")
+        
+    print("\nSerializando directamente a JSON de forma nativa...")
+    try:
+        json_str = json.dumps(test_contract, indent=4)
+        print(json_str)
+        print("\n✅ Serialización nativa completada con éxito (herencia de str verificada).")
+    except TypeError as e:
+        print(f"\n❌ Error de serialización: {e}")
+        
+    print("=" * 80)

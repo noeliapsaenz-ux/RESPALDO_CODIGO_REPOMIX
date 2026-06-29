@@ -1,0 +1,119 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+REPORT_ENGINE_04 - AI_GATEWAY (COMPONENTE DE INTELIGENCIA UNIFICADO)
+==========================================================================
+Ubicación: REPORT_ENGINE_04/ai_gateway.py
+Responsabilidad: Servir de canal de consulta de red simplificado para LLMs.
+                 - Soporta de forma directa OpenAI y DeepSeek.
+                 - Utiliza la librería nativa urllib de Python (sin dependencias).
+==========================================================================
+"""
+import json
+import urllib.request
+import urllib.parse
+from typing import Dict, Any, Optional
+
+# Importamos la configuración de credenciales del sistema de forma segura
+from SYSTEM_SERVICES.system_settings import (
+    DEEPSEEK_API_KEY,
+    OPENAI_API_KEY,
+    OPERATIONAL_MODE
+)
+
+# ==========================================================================
+# CONFIGURACIÓN DE ENDPOINTS ESTÁNDAR
+# ==========================================================================
+_PROVIDERS_CONFIG: Dict[str, Dict[str, str]] = {
+    "DEEPSEEK": {
+        "url": "https://api.deepseek.com/chat/completions",
+        "model": "deepseek-chat"
+    },
+    "OPENAI": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "model": "gpt-4o-mini"  # Modelo rápido y económico de OpenAI
+    }
+}
+
+
+def call_llm(prompt: str, system_instruction: str = "Eres un analista experto en trading algorítmico.") -> str:
+    """
+    Realiza una consulta a la API de Inteligencia Artificial utilizando urllib.
+    Selecciona de forma automática el proveedor configurado (DeepSeek u OpenAI).
+
+    Args:
+        prompt: El contenido del análisis/datos que se enviarán al modelo.
+        system_instruction: Instrucciones de rol de comportamiento del modelo.
+
+    Returns:
+        str: Respuesta cualitativa del modelo de lenguaje en formato Markdown o texto.
+    """
+    # 1. Determinar el proveedor activo según las API Keys presentes
+    # Se prioriza DeepSeek si su clave está presente; de lo contrario se cae en OpenAI
+    provider_name = "DEEPSEEK" if DEEPSEEK_API_KEY else ("OPENAI" if OPENAI_API_KEY else None)
+
+    if not provider_name:
+        return (
+            "⚠️ [AI_GATEWAY] No se pudo realizar el análisis cualitativo. "
+            "No se detectaron las credenciales de API (DEEPSEEK_API_KEY o OPENAI_API_KEY) "
+            "en su archivo de configuración .env."
+        )
+
+    config = _PROVIDERS_CONFIG[provider_name]
+    api_key = DEEPSEEK_API_KEY if provider_name == "DEEPSEEK" else OPENAI_API_KEY
+    
+    # 2. Construir el payload de acuerdo al formato estándar OpenAI
+    payload = {
+        "model": config["model"],
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2  # Temperatura baja para mantener un análisis determinista y técnico
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    # 3. Ejecutar la petición HTTP de forma segura
+    try:
+        data_bytes = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(config["url"], data=data_bytes, headers=headers, method="POST")
+        
+        # Timeout de 30 segundos debido a que las respuestas cualitativas pueden demorar
+        with urllib.request.urlopen(req, timeout=30) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            
+        # Extraer la respuesta del texto de la respuesta estándar
+        return res_data["choices"][0]["message"]["content"]
+        
+    except Exception as e:
+        return f"⚠️ [AI_GATEWAY] Fallo en la llamada HTTP de red al proveedor {provider_name}: {e}"
+
+
+if __name__ == "__main__":
+    print("=" * 80)
+    print("SOPORTE DE REPORTES - VERIFICACIÓN DE LLM GATEWAY (INTEGRIDAD DE RED)")
+    print("=" * 80)
+    
+    # Simulación de datos simples de prueba
+    prompt_prueba = (
+        "Analiza el siguiente resumen operativo diario:\n"
+        "   • Tasa de ticks perdidos (FCI): 99.8%\n"
+        "   • Activos operables: EURUSD, USDJPY\n"
+        "   • Activos vetados: Ninguno\n"
+        "Redacta una breve conclusión ejecutiva de un párrafo en formato Markdown."
+    )
+    
+    instruccion_sistema = "Eres un analista de soporte técnico experto en MT5."
+    
+    print("Enviando consulta a la IA (Esto puede demorar unos segundos)...")
+    respuesta = call_llm(prompt_prueba, instruccion_sistema)
+    
+    print("\nRespuesta cualitativa recibida:")
+    print("-" * 80)
+    print(respuesta)
+    print("-" * 80)
+    print("=" * 80)
