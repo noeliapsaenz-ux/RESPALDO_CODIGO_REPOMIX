@@ -1,0 +1,259 @@
+"""
+==========================================================================
+ARCHIVE_DAEMON - Compresión y archivado de datos HFT
+==========================================================================
+Ubicación: CAPTURE_ENGINE_01
+Dependencias: common_logger, paths, settings, capture_config
+Responsabilidad: Monitorear archivos JSONL inactivos en RAMDisk/SSD,
+                 comprimirlos a GZIP, verificar integridad con SHA256,
+                 y moverlos al archivo seguro (SAFE) o cuarentena.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección de ruta del directorio superior (Single Source of Truth)
+raiz_proyecto = Path(__file__).parent.parent.resolve()
+if str(raiz_proyecto) not in sys.path:
+    sys.path.insert(0, str(raiz_proyecto))
+
+import argparse
+import asyncio
+import gzip
+import hashlib
+import json
+import os
+import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import Dict, List, Optional
+
+# Importaciones desacopladas directas
+from common_logger import get_logger as init_logging
+from paths import (
+    HOT_RAM_DIR, SSD_EVIDENCE_DIR, ARCHIVE_SAFE_DIR, 
+    ARCHIVE_QUARANTINE_DIR, STATE_DIR
+)
+from settings import USAR_RAMDISK, BROKER_TZ, send_telegram_alert
+from capture_config import VERIFY_RAMDISK_SSD_MATCH, QUARANTINE_SUFFIX
+
+class ArchiveDaemon:
+    def __init__(self, check_interval: float = 60.0, max_concurrent_compressions: int = 2):
+        self.logger = init_logging("archive_daemon", "01_CAPTURE_ENGINE")
+        ARCHIVE_SAFE_DIR.mkdir(parents=True, exist_ok=True)
+        ARCHIVE_QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+        self.check_interval = check_interval
+        self.running = True
+        self.executor = ThreadPoolExecutor(max_workers=max_concurrent_compressions)
+        self.inactive_threshold_seconds = 120
+        self.compress_level = 3
+        self.stats = {
+            "files_archived": 0, "bytes_archived": 0, "bytes_freed": 0,
+            "compression_ratio_avg": 0.0, "total_compression_time": 0.0,
+            "errors": 0, "quarantined_files": 0, "last_archive_time": None
+        }
+        self.logger.info("=" * 70)
+        self.logger.info("🛡️ ARCHIVE DAEMON V2 INICIALIZADO")
+        self.logger.info("=" * 70)
+
+    # ... [El resto de los métodos _get_ramdisk_usage, _get_ntp_drift, etc. permanecen sin cambios] ...
+    # ... (Se omite por brevedad, el código interno de compresión es el mismo) ...
+    def _get_ramdisk_usage(self) -> dict:
+        if not USAR_RAMDISK: return {"space_free_pct": 100.0, "status": "NOT_USED"}
+        try:
+            usage = shutil.disk_usage(HOT_RAM_DIR)
+            free_pct = (usage.free / usage.total) * 100.0
+            return {"space_free_pct": round(free_pct, 2), "free_bytes": usage.free, "status": "CRITICAL" if free_pct < 15.0 else ("WARNING" if free_pct < 30.0 else "OK")}
+        except Exception: return {"space_free_pct": 100.0, "status": "ERROR"}
+
+    def _get_ntp_drift(self) -> float:
+        import socket, struct
+        try:
+            client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            client.settimeout(2.0)
+            msg = b'\x1b' + 47 * b'\0'
+            start_local = time.time()
+            client.sendto(msg, ('pool.ntp.org', 123))
+            data, _ = client.recvfrom(1024)
+            end_local = time.time()
+            unpacked = struct.unpack('!12I', data)
+            t_transmit = unpacked[10] + unpacked[11] / 2**32
+            t_local = (start_local + end_local) / 2.0
+            offset_ms = (t_transmit - t_local - 2208988800) * 1000.0
+            return round(offset_ms, 2)
+        except Exception: return 0.0
+
+    def _get_inactive_files(self) -> List[Path]:
+        ahora = time.time()
+        inactive_files = []
+        if not HOT_RAM_DIR.exists(): return inactive_files
+        for symbol_dir in HOT_RAM_DIR.iterdir():
+            if not symbol_dir.is_dir(): continue
+            for date_dir in symbol_dir.iterdir():
+                if not date_dir.is_dir(): continue
+                for jsonl_file in date_dir.glob("*.jsonl"):
+                    try:
+                        mtime = jsonl_file.stat().st_mtime
+                        if (ahora - mtime) >= self.inactive_threshold_seconds: inactive_files.append(jsonl_file)
+                    except Exception: pass
+        return inactive_files
+
+    def _calculate_checksum(self, file_path: Path) -> str:
+        sha = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(65536): sha.update(chunk)
+        return sha.hexdigest()
+
+    def _validate_gzip_integrity(self, gzip_path: Path, expected_sha256: str) -> bool:
+        sha = hashlib.sha256()
+        try:
+            with gzip.open(gzip_path, "rb") as f:
+                while chunk := f.read(65536): sha.update(chunk)
+            return sha.hexdigest() == expected_sha256
+        except Exception: return False
+
+    def _safe_unlink_with_retry(self, file_path: Path, max_retries: int = 3, delay: float = 0.5):
+        for i in range(max_retries):
+            try:
+                if file_path.exists(): file_path.unlink()
+                return
+            except PermissionError: time.sleep(delay)
+            except Exception: break
+
+    def _move_to_quarantine(self, ram_file: Path, ssd_file: Optional[Path], reason: str):
+        self.stats["quarantined_files"] += 1
+        timestamp_str = datetime.now(BROKER_TZ).strftime('%H%M%S')
+        q_ram_name = f"{ram_file.name}{QUARANTINE_SUFFIX}_{timestamp_str}"
+        q_ram_path = ARCHIVE_QUARANTINE_DIR / q_ram_name
+        try: shutil.move(str(ram_file), str(q_ram_path))
+        except Exception: pass
+        if ssd_file and ssd_file.exists():
+            q_ssd_name = f"{ssd_file.name}{QUARANTINE_SUFFIX}_{timestamp_str}"
+            q_ssd_path = ARCHIVE_QUARANTINE_DIR / q_ssd_name
+            try: shutil.move(str(ssd_file), str(q_ssd_path))
+            except Exception: pass
+        alert_msg = f"🚨 COMPUERTA FORENSE: Mismatch en {ram_file.name}. Motivo: {reason}."
+        try: send_telegram_alert(alert_msg)
+        except Exception: pass
+
+    def _compress_worker(self, jsonl_file: Path) -> Optional[Dict]:
+        lock_file = jsonl_file.parent / f"{jsonl_file.name}.lock"
+        if lock_file.exists(): return None
+        try:
+            lock_file.write_text(str(os.getpid()))
+            symbol, date_dir = jsonl_file.parent.parent.name, jsonl_file.parent.name
+            file_size_original = jsonl_file.stat().st_size
+            expected_hash = self._calculate_checksum(jsonl_file)
+            ssd_file = SSD_EVIDENCE_DIR / symbol / date_dir / jsonl_file.name
+            if USAR_RAMDISK and VERIFY_RAMDISK_SSD_MATCH:
+                if not ssd_file.exists():
+                    self._move_to_quarantine(jsonl_file, None, "SSD_BACKUP_MISSING")
+                    return None
+                if expected_hash != self._calculate_checksum(ssd_file):
+                    self._move_to_quarantine(jsonl_file, ssd_file, "MISMATCH_SHA256")
+                    return None
+            dest_dir = ARCHIVE_SAFE_DIR / symbol / date_dir
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_file, temp_gzip = dest_dir / (jsonl_file.name + ".gz"), dest_dir / (jsonl_file.name + ".tmp.gz")
+            start_time = time.time()
+            with open(jsonl_file, "rb") as f_in, gzip.open(temp_gzip, "wb", compresslevel=self.compress_level) as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            with open(temp_gzip, "r+b") as f_temp: os.fsync(f_temp.fileno())
+            if not self._validate_gzip_integrity(temp_gzip, expected_hash): raise RuntimeError("Fallo de validación GZIP")
+            temp_gzip.replace(dest_file)
+            compression_time = time.time() - start_time
+            file_size_compressed = dest_file.stat().st_size
+            compression_ratio = (1 - (file_size_compressed / file_size_original)) * 100 if file_size_original > 0 else 0
+            self._safe_unlink_with_retry(jsonl_file)
+            return {"file": jsonl_file.name, "symbol": symbol, "original_size": file_size_original, "compressed_size": file_size_compressed, "compression_ratio": compression_ratio, "compression_time": compression_time, "bytes_freed": file_size_original}
+        except Exception as e:
+            self.logger.error(f"Error crítico en archivado de {jsonl_file.name}: {e}")
+            return None
+        finally:
+            if lock_file.exists(): self._safe_unlink_with_retry(lock_file)
+
+    async def _move_and_compress(self, jsonl_file: Path) -> Optional[Dict]:
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(self.executor, self._compress_worker, jsonl_file)
+        except Exception: return None
+
+    async def _scan_and_archive(self):
+        files_to_archive = self._get_inactive_files()
+        if not files_to_archive: return
+        archive_tasks = [self._move_and_compress(f) for f in files_to_archive[:20]]
+        results = await asyncio.gather(*archive_tasks, return_exceptions=True)
+        total_ratio, valid_results = 0, 0
+        for result in results:
+            if isinstance(result, dict) and result is not None:
+                self.stats["files_archived"] += 1
+                self.stats["bytes_archived"] += result["original_size"]
+                self.stats["bytes_freed"] += result.get("bytes_freed", 0)
+                self.stats["total_compression_time"] += result.get("compression_time", 0)
+                self.stats["last_archive_time"] = time.time()
+                total_ratio += result["compression_ratio"]
+                valid_results += 1
+            elif isinstance(result, Exception): self.stats["errors"] += 1
+        if valid_results > 0: self.stats["compression_ratio_avg"] = total_ratio / valid_results
+
+    async def run(self, single_pass: bool = False):
+        if single_pass:
+            self.logger.info("📡 Demonio de archivado en modo --single-pass...")
+            await self._scan_and_archive()
+            self._save_daemon_state()
+            self.executor.shutdown(wait=True)
+            self.logger.info("✅ Tarea de archivado único completada.")
+            return
+
+        self.logger.info("📡 Demonio de archivado en ejecución persistente...")
+        last_stats_log = time.time()
+        try:
+            while self.running:
+                cycle_start = time.time()
+                await self._scan_and_archive()
+                if time.time() - last_stats_log >= 3600:
+                    last_stats_log = time.time()
+                    self._save_daemon_state()
+                elapsed = time.time() - cycle_start
+                await asyncio.sleep(max(0.5, self.check_interval - elapsed))
+        except asyncio.CancelledError: pass
+        finally:
+            self._save_daemon_state()
+            self.executor.shutdown(wait=True)
+
+    def _save_daemon_state(self):
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            state_file = STATE_DIR / "archive_daemon_state.json"
+            ram_health = self._get_ramdisk_usage()
+            now = time.time()
+            if not hasattr(self, "_last_ntp_check") or (now - self._last_ntp_check >= 3600):
+                self._cached_drift = self._get_ntp_drift()
+                self._last_ntp_check = now
+            elif not hasattr(self, "_cached_drift"): self._cached_drift = 0.0
+            serializable_stats = {**self.stats, "windows_telemetry": {"ramdisk_health": ram_health, "ntp_drift_ms": getattr(self, "_cached_drift", 0.0)}, "updated_at": datetime.now(BROKER_TZ).isoformat(), "pid": os.getpid()}
+            temp_file = state_file.with_suffix(".tmp")
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(serializable_stats, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            temp_file.replace(state_file)
+        except Exception as e: self.logger.error(f"Error guardando telemetría del daemon: {e}")
+
+    def stop(self):
+        self.running = False
+
+async def main():
+    parser = argparse.ArgumentParser(description="Archive Daemon V2")
+    parser.add_argument("--single-pass", action='store_true', help="Ejecutar un único ciclo de archivado y salir.")
+    args = parser.parse_args()
+
+    daemon = ArchiveDaemon(check_interval=60.0, max_concurrent_compressions=2)
+    await daemon.run(single_pass=args.single_pass)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Archive Daemon detenido.")

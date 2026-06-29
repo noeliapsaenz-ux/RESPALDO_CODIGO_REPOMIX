@@ -1,0 +1,182 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+REGIME SEQUENCE TRACKER - ENRIQUECIMIENTO SECUENCIAL DEL RÉGIMEN
+==========================================================================
+Ubicación: QUANT_ENGINE_03
+Dependencias: quant_config (paths, logging, symbols, settings)
+Responsabilidad: Enriquecer el market_state.parquet dentro de bars con
+                 métricas secuenciales que describen la evolución.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+import argparse
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+from quant_config import (
+    QUANT_BARS_DIR,
+    SPREAD_LIMITS,
+    BROKER_TZ,
+    SYMBOLS_TO_QUANT,
+    init_quant_logging
+)
+
+logger = init_quant_logging("regime_sequence_tracker", "03_QUANT")
+
+ANOMALY_VOL_THRESHOLD = 0.08
+SPREAD_EXTREME_MULTIPLIER = 1.5
+LIQUIDITY_CHANGE_THRESHOLD = 0.50
+
+def calculate_regime_duration(df: pd.DataFrame) -> pd.Series:
+    if df.empty or 'minute_state' not in df.columns:
+        return pd.Series([1] * len(df), index=df.index)
+    duration = []
+    current_count = 1
+    for i in range(len(df)):
+        if i == 0: duration.append(1)
+        else:
+            if df['minute_state'].iloc[i] == df['minute_state'].iloc[i-1]:
+                current_count += 1
+            else:
+                current_count = 1
+            duration.append(current_count)
+    return pd.Series(duration, index=df.index, name='regime_duration_bars')
+
+def calculate_regime_age(df: pd.DataFrame) -> pd.Series:
+    if df.empty or 'minute_state' not in df.columns or 'timestamp' not in df.columns:
+        return pd.Series([0] * len(df), index=df.index)
+    age_minutes = []
+    last_transition_ts = df['timestamp'].iloc[0]
+    for i in range(len(df)):
+        current_ts = df['timestamp'].iloc[i]
+        if i > 0 and df['minute_state'].iloc[i] != df['minute_state'].iloc[i-1]:
+            last_transition_ts = current_ts
+        diff_minutes = int((current_ts - last_transition_ts) / 60)
+        age_minutes.append(diff_minutes)
+    return pd.Series(age_minutes, index=df.index, name='regime_age_minutes')
+
+def calculate_minutes_since_anomalous(df: pd.DataFrame, symbol: str) -> pd.Series:
+    if df.empty: return pd.Series([9999] * len(df), index=df.index)
+    limit = SPREAD_LIMITS.get(symbol, SPREAD_LIMITS.get('DEFAULT', 30.0))
+    is_anomalous = pd.Series([False] * len(df), index=df.index)
+    if 'minute_state' in df.columns:
+        is_anomalous |= (df['minute_state'] == 'NEWS_LIKE')
+        is_anomalous |= (df['minute_state'] == 'VOLATILE')
+    if 'realized_volatility' in df.columns:
+        is_anomalous |= (df['realized_volatility'] > ANOMALY_VOL_THRESHOLD)
+    if 'spread_mean' in df.columns:
+        is_anomalous |= (df['spread_mean'] > limit * SPREAD_EXTREME_MULTIPLIER)
+    
+    minutes_since = []
+    last_anomaly_idx = -1
+    for i in range(len(df)):
+        if is_anomalous.iloc[i]:
+            last_anomaly_idx = i
+            minutes_since.append(0)
+        elif last_anomaly_idx == -1:
+            minutes_since.append(9999)
+        else:
+            if 'timestamp' in df.columns:
+                diff_minutes = int((df['timestamp'].iloc[i] - df['timestamp'].iloc[last_anomaly_idx]) / 60)
+                minutes_since.append(diff_minutes)
+            else:
+                minutes_since.append(i - last_anomaly_idx)
+    return pd.Series(minutes_since, index=df.index, name='minutes_since_last_anomalous_minute')
+
+def calculate_minutes_since_extreme_spread(df: pd.DataFrame) -> pd.Series:
+    if df.empty or 'minute_state' not in df.columns:
+        return pd.Series([9999] * len(df), index=df.index)
+    is_wide = (df['minute_state'] == 'WIDE_SPREAD')
+    minutes_since = []
+    last_wide_idx = -1
+    for i in range(len(df)):
+        if is_wide.iloc[i]:
+            last_wide_idx = i
+            minutes_since.append(0)
+        elif last_wide_idx == -1:
+            minutes_since.append(9999)
+        else:
+            if 'timestamp' in df.columns:
+                diff_minutes = int((df['timestamp'].iloc[i] - df['timestamp'].iloc[last_wide_idx]) / 60)
+                minutes_since.append(diff_minutes)
+            else:
+                minutes_since.append(i - last_wide_idx)
+    return pd.Series(minutes_since, index=df.index, name='minutes_since_extreme_spread')
+
+def calculate_regime_transitions(df: pd.DataFrame) -> pd.Series:
+    if df.empty or 'minute_state' not in df.columns:
+        return pd.Series([0] * len(df), index=df.index)
+    transitions = []
+    count = 0
+    for i in range(len(df)):
+        if i == 0: transitions.append(0)
+        else:
+            if df['minute_state'].iloc[i] != df['minute_state'].iloc[i-1]:
+                count += 1
+            transitions.append(count)
+    return pd.Series(transitions, index=df.index, name='regime_transitions_count')
+
+def calculate_liquidity_changes(df: pd.DataFrame) -> pd.Series:
+    if df.empty or 'tps_abs' not in df.columns:
+        return pd.Series([0] * len(df), index=df.index)
+    changes = []
+    count = 0
+    for i in range(len(df)):
+        if i == 0: changes.append(0)
+        else:
+            tps_prev = df['tps_abs'].iloc[i-1]
+            tps_curr = df['tps_abs'].iloc[i]
+            if tps_prev > 0:
+                variation = abs(tps_curr - tps_prev) / tps_prev
+                if variation > LIQUIDITY_CHANGE_THRESHOLD:
+                    count += 1
+            changes.append(count)
+    return pd.Series(changes, index=df.index, name='liquidity_changes_count')
+
+def enrich_market_state(symbol: str, fecha: str) -> bool:
+    symbol = symbol.upper()
+    state_file = QUANT_BARS_DIR / symbol / f"{symbol}_{fecha}_market_state.parquet"
+    
+    if not state_file.exists():
+        logger.warning(f"⚠️ {symbol}: Parquet de estado ausente para {fecha}.")
+        return False
+    
+    try:
+        df = pd.read_parquet(state_file)
+        if df.empty: return False
+        
+        df['regime_duration_bars'] = calculate_regime_duration(df)
+        df['regime_age_minutes'] = calculate_regime_age(df)
+        df['minutes_since_last_anomalous_minute'] = calculate_minutes_since_anomalous(df, symbol)
+        df['minutes_since_extreme_spread'] = calculate_minutes_since_extreme_spread(df)
+        df['regime_transitions_count'] = calculate_regime_transitions(df)
+        df['liquidity_changes_count'] = calculate_liquidity_changes(df)
+        
+        temp_file = state_file.with_suffix(".tmp.parquet")
+        df.to_parquet(temp_file, index=False)
+        temp_file.replace(state_file)
+        logger.info(f"✅ {symbol}: Enriquecimiento secuencial completado en bars.")
+        return True
+    except Exception as e:
+        logger.error(f"❌ {symbol}: Error enriqueciendo bars: {e}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description="Regime Sequence Tracker V1.0")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    logger.info(f"🚀 Iniciando enriquecimiento secuencial de bars - FECHA: {fecha}")
+    enriched = sum(1 for s in SYMBOLS_TO_QUANT if enrich_market_state(s, fecha))
+    logger.info(f"📋 Enriquecidos: {enriched}/{len(SYMBOLS_TO_QUANT)} snapshots en bars.")
+
+if __name__ == "__main__":
+    main()

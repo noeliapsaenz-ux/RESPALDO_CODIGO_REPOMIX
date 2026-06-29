@@ -1,0 +1,271 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+MASTER STATE CONSOLIDATOR - REGIMEN GLOBAL & DECISIÓN DE GOBIERNO
+==========================================================================
+Ubicación: QUANT_ENGINE_03
+Dependencias: quant_config (system_canonical, paths, settings, logging, contracts)
+Responsabilidad: Unificar los snapshots de los pares de bars/, calcular las
+                 dimensiones sistémicas y emitir los permisos de ejecución global.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección dinámica de la carpeta raíz del proyecto
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+import os
+import json
+import argparse
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Tuple
+
+# Importación desde quant_config
+from quant_config import (
+    QUANT_BARS_DIR,
+    QUANT_HISTORY_DIR,
+    AUDIT_STATE_DIR,
+    AUDIT_REPORTES_DIR,
+    SPREAD_LIMITS,
+    BROKER_TZ,
+    SYMBOLS_TO_QUANT,
+    RISK_ASSETS,
+    SAFE_HAVENS,
+    init_quant_logging,
+    send_telegram_alert,
+    save_contract_atomic,
+    load_contract_safe,
+    SymbolCaptureStatus,
+    MarketRegime,
+    MarketActivityState,
+    ContractType,
+    MetadataEnvelope,
+    SCHEMA_VERSION_QUANT,
+    PRODUCER_QUANT,
+    is_market_open,
+    get_fecha_broker_str,
+    OI_OUTPUT_DIR
+)
+
+# Importación desde quant_contracts
+from quant_contracts import (
+    create_quant_symbol_entry,
+    create_canonical_quant_certificate,
+    validate_quant_certificate
+)
+
+# Inicializar logger
+logger = init_quant_logging("master_state_consolidator", "03_QUANT")
+
+def cargar_historial_volatilidad(history_file: Path) -> Dict[str, float]:
+    default_vol = {sym: 0.0015 for sym in SYMBOLS_TO_QUANT}
+    if not history_file.exists(): return default_vol
+    try:
+        df = pd.read_parquet(history_file)
+        if df.empty: return default_vol
+        stats = df.groupby("symbol")["realized_vol_mean"].mean().to_dict()
+        return {sym.upper(): float(val) for sym, val in stats.items()}
+    except Exception as e:
+        logger.debug(f"Error cargando base histórica de volatilidad: {e}")
+        return default_vol
+
+def sincronizar_e_intersecar_estados(fecha: str) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+    series_map = {}
+    closes_map = {}
+    
+    for symbol in SYMBOLS_TO_QUANT:
+        symbol = symbol.upper()
+        state_file = QUANT_BARS_DIR / symbol / f"{symbol}_{fecha}_market_state.parquet"
+        
+        if state_file.exists():
+            try:
+                df = pd.read_parquet(state_file)
+                if not df.empty:
+                    df_cleaned = df.drop_duplicates(subset=["timestamp"], keep="first").copy()
+                    df_valid = df_cleaned.set_index("timestamp").sort_index()
+                    series_map[symbol] = df_valid
+                    closes_map[symbol] = df_valid["close"]
+            except Exception as e:
+                logger.error(f"❌ {symbol}: Error de alineación temporal: {e}")
+
+    if not series_map: return pd.DataFrame(), {}
+    df_closes = pd.DataFrame(closes_map).ffill().bfill()
+    df_returns = np.log(df_closes / df_closes.shift(1)).fillna(0.0)
+    return df_returns, series_map
+
+def calcular_volatilidad_sistémica(series_map: Dict[str, pd.DataFrame], vol_hist: Dict[str, float]) -> Dict[str, Any]:
+    vol_ratios = []
+    for symbol, df in series_map.items():
+        if "realized_volatility" in df.columns:
+            last_vol = float(df["realized_volatility"].iloc[-1])
+            ref_vol = vol_hist.get(symbol, 0.0015)
+            vol_ratios.append(last_vol / (ref_vol + 1e-9))
+            
+    if not vol_ratios: return {"score": 50.0, "regime": "NORMAL", "confidence": 0.0}
+    svi = float(np.mean(vol_ratios)) * 100.0
+    svi = float(np.clip(svi, 10.0, 300.0))
+    regime = "QUIET" if svi < 70.0 else ("NORMAL" if svi < 130.0 else ("ACTIVE" if svi < 200.0 else "STRESSED"))
+    return {"score": round(svi, 1), "regime": regime, "confidence": 100.0}
+
+def calcular_liquidez_sistémica(series_map: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    spread_ratios = []
+    for symbol, df in series_map.items():
+        if "spread_mean" in df.columns:
+            last_spread = float(df["spread_mean"].iloc[-1])
+            limit = SPREAD_LIMITS.get(symbol, SPREAD_LIMITS.get('DEFAULT', 30.0))
+            spread_ratios.append(last_spread / (limit + 1e-9))
+            
+    if not spread_ratios: return {"score": 50.0, "regime": "NORMAL", "confidence": 0.0}
+    mean_ratio = float(np.mean(spread_ratios))
+    gli = float(np.clip(100.0 - (mean_ratio - 0.5) * 100.0, 0.0, 100.0))
+    regime = "OPTIMAL" if gli >= 85.0 else ("NORMAL" if gli >= 60.0 else "CRITICAL")
+    return {"score": round(gli, 1), "regime": regime, "confidence": 100.0}
+
+def calcular_cohesion_sistémica(df_returns: pd.DataFrame) -> Dict[str, Any]:
+    if len(df_returns) < 15:
+        return {"score": 50.0, "mean_absolute_correlation": 0.0, "regime": "UNKNOWN", "confidence": 0.0}
+    try:
+        corr_pearson = df_returns.corr(method="pearson")
+        corr_spearman = df_returns.corr(method="spearman")
+        corr_hybrid = (corr_pearson + corr_spearman) / 2.0
+        abs_corr = np.abs(corr_hybrid.values)
+        np.fill_diagonal(abs_corr, np.nan)
+        sc_mean = float(np.nanmean(abs_corr))
+        score = sc_mean * 100.0
+        regime = "IDIOSYNCRATIC" if sc_mean < 0.40 else ("ROTATION" if sc_mean < 0.70 else "COHESIVE / SYSTEMIC")
+        return {"score": round(score, 1), "mean_absolute_correlation": round(sc_mean, 4), "regime": regime, "confidence": 100.0}
+    except Exception as e:
+        logger.warning(f"Error procesando cohesión híbrida: {e}")
+        return {"score": 50.0, "mean_absolute_correlation": 0.0, "regime": "UNKNOWN", "confidence": 0.0}
+
+def evaluar_sentimiento_riesgo(df_returns: pd.DataFrame) -> Dict[str, Any]:
+    if df_returns.empty: return {"score": 0.0, "regime": "NEUTRAL", "confidence": 0.0}
+    accum_returns = df_returns.sum().to_dict()
+    risk_vals = [accum_returns[sym] for sym in RISK_ASSETS if sym in accum_returns]
+    safe_vals = [accum_returns[sym] for sym in SAFE_HAVENS if sym in accum_returns]
+    if not risk_vals or not safe_vals: return {"score": 0.0, "regime": "NEUTRAL", "confidence": 0.0}
+    grai = (float(np.mean(risk_vals)) - float(np.mean(safe_vals))) * 100.0
+    regime = "RISK_ON" if grai > 0.5 else ("RISK_OFF" if grai < -0.5 else "NEUTRAL")
+    return {"score": round(grai, 3), "regime": regime, "confidence": 100.0}
+
+def evaluar_actividad_global(series_map: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    total_tps = 0.0
+    for symbol, df in series_map.items():
+        if "tps_abs" in df.columns:
+            total_tps += float(df["tps_abs"].iloc[-1])
+    if total_tps == 0: return {"cumulative_tps": 0.0, "regime": "QUIET", "confidence": 0.0}
+    regime = "QUIET" if total_tps < 3.0 else ("NORMAL" if total_tps < 15.0 else "ACTIVE")
+    return {"cumulative_tps": round(total_tps, 2), "regime": regime, "confidence": 100.0}
+
+def map_regime_to_canonical(regime_str: str) -> str:
+    mapping = {
+        "QUIET": MarketRegime.MEAN_REVERTING_LOW_VOL.value,
+        "NORMAL": MarketRegime.MEAN_REVERTING_LOW_VOL.value,
+        "ACTIVE": MarketRegime.TRENDING_UP.value,
+        "STRESSED": MarketRegime.MEAN_REVERTING_HIGH_VOL.value,
+        "TRENDING_UP": MarketRegime.TRENDING_UP.value,
+        "TRENDING_DOWN": MarketRegime.TRENDING_DOWN.value,
+        "ILLIQUID_STATIC": MarketRegime.ILLIQUID_STATIC.value,
+    }
+    return mapping.get(regime_str, MarketRegime.ILLIQUID_STATIC.value)
+
+def load_audit_certificate(fecha: str) -> Dict[str, str]:
+    cert_path = AUDIT_REPORTES_DIR / f"audit_certificate_{fecha}.json"
+    cert = load_contract_safe(cert_path)
+    status_map = {}
+    if cert and cert.get("certificados_por_simbolo"):
+        for entry in cert["certificados_por_simbolo"]:
+            status_map[entry.get("symbol", "").upper()] = entry.get("symbol_capture_status", SymbolCaptureStatus.NO_CONFIABLE.value)
+    else:
+        logger.critical(f"🛑 Fail-Closed: audit_certificate ausente. Marcando símbolos como NO_CONFIABLE.")
+        for s in SYMBOLS_TO_QUANT: status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
+    return status_map
+
+def determine_market_activity_state(symbol: str, capture_status: str, has_data: bool, is_market_hours: bool) -> str:
+    if capture_status == SymbolCaptureStatus.NO_CONFIABLE.value:
+        return MarketActivityState.HALTED.value if is_market_hours else MarketActivityState.INACTIVE_CLOSED_MARKET.value
+    return MarketActivityState.ACTIVE.value if has_data else MarketActivityState.INACTIVE_CLOSED_MARKET.value
+
+def generar_contrato_estado_global(fecha: str) -> bool:
+    history_file = QUANT_HISTORY_DIR / "daily_history_30d.parquet"
+    output_file = OI_OUTPUT_DIR / f"global_regime_{fecha}.json"
+
+    logger.info(f"🔄 Iniciando consolidación de mercado unificada...")
+    df_returns, series_map = sincronizar_e_intersecar_estados(fecha)
+    
+    if not series_map:
+        logger.warning(f"⚠️ No hay snapshots individuales para construir el Master State.")
+        return False
+
+    vol_hist = cargar_historial_volatilidad(history_file)
+    vol_sys = calcular_volatilidad_sistémica(series_map, vol_hist)
+    liq_sys = calcular_liquidez_sistémica(series_map)
+    coh_sys = calcular_cohesion_sistémica(df_returns)
+    risk_sys = evaluar_sentimiento_riesgo(df_returns)
+    act_sys = evaluar_actividad_global(series_map)
+
+    vol_reg, liq_reg, coh_reg = vol_sys["regime"], liq_sys["regime"], coh_sys["regime"]
+    allow_scalping = bool(vol_reg != "STRESSED" and liq_reg != "CRITICAL")
+    allow_swing = bool(vol_reg != "QUIET" and coh_reg != "COHESIVE / SYSTEMIC")
+    allow_portfolio = bool(liq_reg != "CRITICAL")
+    leverage_mode = "DEFENSIVE (50%)" if (vol_reg == "STRESSED" or coh_reg == "COHESIVE / SYSTEMIC" or liq_reg == "CRITICAL") else ("REDUCED (75%)" if (vol_reg == "ACTIVE" or coh_reg == "COHESIVE / SYSTEMIC") else "STANDARD (100%)")
+
+    payload = {
+        "fecha": fecha, "timestamp_generacion": datetime.now(timezone.utc).isoformat(),
+        "global_market_regime": {"systemic_volatility": vol_sys, "systemic_liquidity": liq_sys, "systemic_cohesion": coh_sys, "risk_appetite": risk_sys, "systemic_activity": act_sys},
+        "global_operational_permits": {"allow_scalping": allow_scalping, "allow_swing": allow_swing, "allow_portfolio": allow_portfolio, "leverage_execution_mode": leverage_mode}
+    }
+
+    temp_file = output_file.with_suffix(".tmp.json")
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=4)
+            f.flush(); os.fsync(f.fileno())
+        temp_file.replace(output_file)
+        
+        audit_status_map = load_audit_certificate(fecha)
+        canonical_symbols = []
+        for symbol in SYMBOLS_TO_QUANT:
+            sym_upper = symbol.upper()
+            capture_status = audit_status_map.get(sym_upper, SymbolCaptureStatus.NO_CONFIABLE.value)
+            
+            if capture_status == SymbolCaptureStatus.CONFIABLE.value:
+                sym_data = series_map.get(sym_upper)
+                has_data = sym_data is not None and not sym_data.empty
+                raw_regime = "NORMAL"
+                if has_data and "realized_volatility" in sym_data.columns:
+                    ratio = float(sym_data["realized_volatility"].iloc[-1]) / (vol_hist.get(sym_upper, 0.0015) + 1e-9)
+                    raw_regime = "QUIET" if ratio < 0.7 else ("NORMAL" if ratio < 1.3 else ("ACTIVE" if ratio < 2.0 else "STRESSED"))
+                canonical_regime = map_regime_to_canonical(raw_regime)
+                liq_score = max(0.0, min(1.0, 1.0 - (float(sym_data["spread_mean"].iloc[-1]) / (SPREAD_LIMITS.get(sym_upper, 30.0) * 2.0)))) if (has_data and "spread_mean" in sym_data.columns) else 0.5
+                activity_state = determine_market_activity_state(sym_upper, capture_status, has_data, is_market_open())
+            else:
+                canonical_regime, liq_score, activity_state = MarketRegime.ILLIQUID_STATIC.value, 0.0, MarketActivityState.HALTED.value
+            
+            canonical_symbols.append(create_quant_symbol_entry(sym_upper, canonical_regime, liq_score, activity_state))
+        
+        quant_cert = create_canonical_quant_certificate(fecha, canonical_symbols, payload["global_market_regime"])
+        assert validate_quant_certificate(quant_cert), "Quant Certificate inválido"
+        
+        save_contract_atomic(quant_cert, OI_OUTPUT_DIR / f"quant_certificate_{fecha}.json")
+        logger.info(f"✅ QUANT CERTIFICATE CANÓNICO EMITIDO.")
+        return True
+    except Exception as e:
+        if temp_file.exists(): temp_file.unlink()
+        logger.error(f"❌ Error fatal escribiendo Master State: {e}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description="Master State Consolidator V2.1")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    generar_contrato_estado_global(fecha)
+
+if __name__ == "__main__":
+    main()

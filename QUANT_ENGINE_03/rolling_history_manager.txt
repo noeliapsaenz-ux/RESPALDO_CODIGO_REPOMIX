@@ -1,0 +1,109 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+ROLLING HISTORY MANAGER - ADMINISTRADOR DE PERSISTENCIA HISTÓRICA
+==========================================================================
+Ubicación: QUANT_ENGINE_03
+Dependencias: quant_config (paths, logging, symbols, settings)
+Responsabilidad: Tomar las barras de 1 minuto generadas diariamente en bars,
+                 agruparlas en un registro diario (D1), añadirlo al historial
+                 acumulativo de 30 días, deduplicar y truncar de forma atómica.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+import argparse
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+from quant_config import (
+    QUANT_BARS_DIR,
+    QUANT_HISTORY_DIR,
+    SYMBOLS_TO_QUANT,
+    BROKER_TZ,
+    LOOKBACK_DAYS,
+    init_quant_logging
+)
+
+logger = init_quant_logging("rolling_history_manager", "03_QUANT")
+
+def agregar_dia_al_historial(symbol: str, fecha: str) -> bool:
+    symbol = symbol.upper()
+    bars_file = QUANT_BARS_DIR / symbol / f"{symbol}_{fecha}_market_state.parquet"
+
+    if not bars_file.exists():
+        logger.warning(f"⚠️ {symbol}: No se encontraron las barras en bars/ para {fecha}.")
+        return False
+
+    try:
+        df_bars = pd.read_parquet(bars_file)
+    except Exception as e:
+        logger.error(f"❌ Error leyendo barras para {symbol}: {e}")
+        return False
+
+    if df_bars.empty: return False
+
+    daily_record = {
+        "fecha": str(fecha),
+        "symbol": symbol,
+        "open": float(df_bars["open"].iloc[0]),
+        "high": float(df_bars["high"].max()),
+        "low": float(df_bars["low"].min()),
+        "close": float(df_bars["close"].iloc[-1]),
+        "daily_return": 0.0,
+        "spread_mean": round(float(df_bars["spread_mean"].mean()), 2),
+        "spread_p95": round(float(df_bars["spread_p95"].quantile(0.95)), 2),
+        "realized_vol_mean": round(float(df_bars["realized_volatility"].mean()), 6),
+        "tick_count": int(df_bars["tick_count"].sum()),
+        "quality_score_mean": round(float(df_bars["quality_score_mean"].mean()), 1),
+        "low_confidence_ratio": round(float(np.mean(df_bars["low_confidence"])), 3)
+    }
+
+    df_new_row = pd.DataFrame([daily_record])
+    history_file = QUANT_HISTORY_DIR / "daily_history_30d.parquet"
+
+    df_history = pd.DataFrame()
+    if history_file.exists():
+        try:
+            df_history = pd.read_parquet(history_file)
+        except Exception as e:
+            logger.error(f"⚠️ Error cargando el historial existente: {e}")
+
+    if not df_history.empty:
+        df_combined = pd.concat([df_history, df_new_row], ignore_index=True)
+        df_combined = df_combined.drop_duplicates(subset=["symbol", "fecha"], keep="last")
+    else:
+        df_combined = df_new_row
+
+    df_combined = df_combined.sort_values(by=["symbol", "fecha"]).reset_index(drop=True)
+    df_combined["daily_return"] = df_combined.groupby("symbol")["close"].transform(lambda x: np.log(x / x.shift(1))).fillna(0.0)
+    df_truncated = df_combined.groupby("symbol").tail(LOOKBACK_DAYS).reset_index(drop=True)
+
+    temp_file = history_file.with_suffix(".tmp.parquet")
+    try:
+        df_truncated.to_parquet(temp_file, index=False)
+        temp_file.replace(history_file)
+        logger.info(f"💾 {symbol}: Historial de 30 días actualizado con éxito.")
+        return True
+    except Exception as e:
+        if temp_file.exists(): temp_file.unlink()
+        logger.error(f"❌ Error fatal en persistencia para {symbol}: {e}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description="History Manager - Sliding 30-Day Window")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    logger.info(f"🚀 Iniciando consolidación de historial para: {fecha}")
+    procesados = sum(1 for s in SYMBOLS_TO_QUANT if agregar_dia_al_historial(s, fecha))
+    logger.info(f"📋 Cierre diario de base de datos finalizado: {procesados}/{len(SYMBOLS_TO_QUANT)} actualizados.")
+    
+if __name__ == "__main__":
+    main()

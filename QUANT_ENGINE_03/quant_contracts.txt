@@ -1,0 +1,114 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+QUANT CONTRACTS - PUENTE DE CONTRATOS CANÓNICOS (FASE 3)
+==========================================================================
+Ubicación: QUANT_ENGINE_03
+Dependencias: quant_config (system_canonical, settings)
+Responsabilidad: Proveer utilidades para la construcción estricta de
+                 certificados Quant y Readiness alineados al SYSTEM_CANONICAL.
+REGLA: Todo concepto F3 debe pasar por estas funciones constructoras.
+==========================================================================
+"""
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
+
+from quant_config import (
+    MarketRegime,
+    MarketActivityState,
+    MarketReadinessStatus,
+    ContractType,
+    MetadataEnvelope,
+    validate_canonical_enum,
+    SCHEMA_VERSION_QUANT,
+    PRODUCER_QUANT
+)
+
+
+def create_quant_symbol_entry(
+    symbol: str,
+    market_regime: str,
+    market_liquidity_profile: float,
+    market_activity_state: str
+) -> Dict[str, Any]:
+    """Construye la entrada canónica por símbolo para el Quant Certificate."""
+    if not validate_canonical_enum(market_regime, MarketRegime):
+        raise ValueError(f"market_regime inválido: {market_regime}")
+    if not validate_canonical_enum(market_activity_state, MarketActivityState):
+        raise ValueError(f"market_activity_state inválido: {market_activity_state}")
+
+    return {
+        "symbol": symbol.upper(),
+        "market_regime": market_regime,
+        "market_liquidity_profile": round(float(market_liquidity_profile), 4),
+        "market_activity_state": market_activity_state
+    }
+
+
+def create_canonical_quant_certificate(
+    fecha: str,
+    symbols_data: List[Dict[str, Any]],
+    systemic_metrics: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Construye el QUANT_CERTIFICATE consolidado con envelope canónico."""
+    envelope = MetadataEnvelope(
+        schema_version=SCHEMA_VERSION_QUANT,
+        contract_type=ContractType.QUANT_CERTIFICATE,
+        producer_identity=PRODUCER_QUANT,
+        timestamp_emission=datetime.now(timezone.utc).isoformat()
+    )
+
+    return {
+        **envelope.to_dict(),
+        "fecha": fecha,
+        "systemic_metrics": systemic_metrics or {},
+        "symbols": symbols_data
+    }
+
+
+def create_canonical_readiness_certificate(
+    fecha: str,
+    readiness_entries: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Construye el certificado de Readiness con envelope canónico."""
+    envelope = MetadataEnvelope(
+        schema_version=SCHEMA_VERSION_QUANT,
+        contract_type=ContractType.QUANT_CERTIFICATE,
+        producer_identity=f"{PRODUCER_QUANT}/readiness",
+        timestamp_emission=datetime.now(timezone.utc).isoformat()
+    )
+
+    return {
+        **envelope.to_dict(),
+        "fecha": fecha,
+        "readiness_by_symbol": readiness_entries
+    }
+
+
+def create_readiness_entry(
+    symbol: str,
+    market_readiness_status: str,
+    readiness_scores: Dict[str, float],
+    capture_status: str
+) -> Dict[str, Any]:
+    """Construye la entrada de readiness por símbolo con traza de veto."""
+    if not validate_canonical_enum(market_readiness_status, MarketReadinessStatus):
+        raise ValueError(f"market_readiness_status inválido: {market_readiness_status}")
+
+    return {
+        "symbol": symbol.upper(),
+        "market_readiness_status": market_readiness_status,
+        "symbol_capture_status": capture_status,
+        "readiness_scores": readiness_scores
+    }
+
+
+def validate_quant_certificate(cert: Dict[str, Any]) -> bool:
+    """Valida que un Quant Certificate cumpla el esquema canónico V3."""
+    required = {"schema_version", "contract_type", "producer_identity",
+                "timestamp_emission", "fecha", "symbols"}
+    if not required.issubset(cert.keys()):
+        return False
+    if cert.get("contract_type") != ContractType.QUANT_CERTIFICATE.value:
+        return False
+    return True

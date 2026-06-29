@@ -1,0 +1,326 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+MARKET STATE BUILDER - SNAPSHOT DE ESTADO MULTIDIMENSIONAL (AUDIT V2)
+==========================================================================
+Ubicación: QUANT_ENGINE_03
+Dependencias: quant_config (paths, logging, symbols, settings)
+Responsabilidad: Tomar el Parquet GOLD V2, procesar y agrupar los ticks en
+                 intervalos de 1 minuto, y estructurar el estado del mercado
+                 en 10 capas unificadas (market_state.parquet) dentro de bars.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+import argparse
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone
+
+# Importaciones desde quant_config
+from quant_config import (
+    AUDIT_GOLD_DIR,
+    SPREAD_LIMITS,
+    BROKER_TZ,
+    QUANT_BARS_DIR,
+    SYMBOLS_TO_QUANT,
+    MIN_TICKS_FOR_CONFIDENCE,
+    MIN_TICKS_FOR_VOLATILITY,
+    init_quant_logging
+)
+
+# Inicializar logger
+logger = init_quant_logging("market_state_builder", "03_QUANT")
+
+# Máscaras de Bits (Sincronizadas con compile_maestros.py)
+BIT_REVERSED_SPREAD = 0x01
+BIT_WIDE_SPREAD     = 0x02
+BIT_STALE_TICK      = 0x04
+BIT_CLOCK_SYNC      = 0x08
+BIT_ZERO_SPREAD     = 0x10
+BIT_DUPLICATE_SEQ   = 0x20
+
+def clasificar_estado_minuto(tps: float, spread_mean: float, realized_vol: float, limit: float) -> str:
+    """🟢 CAPA 10: Clasificación del Estado Operacional del Minuto"""
+    if tps < 0.25: return "LOW_ACTIVITY"
+    if realized_vol > 0.08 and tps > 2.0: return "NEWS_LIKE"
+    if realized_vol > 0.04: return "VOLATILE"
+    if spread_mean > limit: return "WIDE_SPREAD"
+    if spread_mean > limit * 0.6 and tps < 0.5: return "ILLIQUID"
+    return "NORMAL"
+
+def construir_market_state(symbol: str, fecha: str) -> bool:
+    symbol = symbol.upper()
+    gold_path = AUDIT_GOLD_DIR / f"{symbol}_{fecha}_gold.parquet"
+
+    if not gold_path.exists():
+        logger.warning(f"⚠️ {symbol}: Parquet GOLD V2 ausente para {fecha}. Snapshot bloqueado.")
+        return False
+
+    logger.info(f"📊 {symbol}: Cargando Parquet GOLD V2...")
+    try:
+        df_gold = pd.read_parquet(gold_path)
+    except Exception as e:
+        logger.error(f"❌ Error leyendo Parquet GOLD para {symbol}: {e}")
+        return False
+
+    if df_gold.empty:
+        logger.warning(f"⚠️ {symbol}: Dataset GOLD vacío.")
+        return False
+
+    # Configurar índice de tiempo DatetimeIndex en UTC
+    df_gold['datetime_utc'] = pd.to_datetime(df_gold['time_msc'], unit='ms', utc=True)
+    df_gold = df_gold.set_index('datetime_utc').sort_index()
+
+    # Pre-cálculo de booleanos para optimización de NumPy
+    flags = df_gold['quality_flags'].values
+    df_gold['is_reversed']   = (flags & BIT_REVERSED_SPREAD) > 0
+    df_gold['is_wide']       = (flags & BIT_WIDE_SPREAD) > 0
+    df_gold['is_stale']      = (flags & BIT_STALE_TICK) > 0
+    df_gold['is_clock_sync'] = (flags & BIT_CLOCK_SYNC) > 0
+    df_gold['is_zero']       = (flags & BIT_ZERO_SPREAD) > 0
+    df_gold['is_duplicate']  = (flags & BIT_DUPLICATE_SEQ) > 0
+
+    # Tipos de actualización de cotización
+    q_type = df_gold['quote_update_type'].values
+    df_gold['is_bid_only'] = q_type == 1
+    df_gold['is_ask_only'] = q_type == 2
+    df_gold['is_both']     = q_type == 3
+
+    logger.info(f"🔄 Resampleando {len(df_gold):,} ticks en snapshots de 1 min...")
+    resampler = df_gold.resample('1min')
+
+    # ==============================================================================
+    # 🏛️ PROCESAMIENTO VECTORIAL DE LAS 10 CAPAS ATÓMICAS
+    # ==============================================================================
+
+    # CAPA 1: Precio (OHLC sobre mid_price)
+    df_ohlc = resampler['mid_price'].ohlc()
+
+    # CAPA 2: Microestructura (Spread Stats)
+    spread_mean = resampler['spread_pips'].mean().round(2)
+    spread_p95 = resampler['spread_pips'].quantile(0.95).round(2)
+    spread_max = resampler['spread_pips'].max().round(2)
+    spread_std = resampler['spread_pips'].std().fillna(0.0).round(2)
+    spread_cv = (spread_std / (spread_mean + 1e-9)).round(4)
+    spread_skew = resampler['spread_pips'].apply(lambda x: x.skew() if len(x) > 2 else 0.0).fillna(0.0).round(2)
+
+    # CAPA 3: Actividad (TPS Absoluto, TPS Efectivo y Active Duration)
+    tick_count = resampler.size()
+    max_time = resampler['time_msc'].max()
+    min_time = resampler['time_msc'].min()
+    effective_duration_seconds = ((max_time - min_time) / 1000.0).fillna(60.0)
+    
+    # Prevenir divisiones por cero en minutos de inactividad
+    duration_clean = np.where(effective_duration_seconds < 1.0, 1.0, effective_duration_seconds)
+    tps_abs = (tick_count / 60.0).round(3)
+    tps_effective = (tick_count / duration_clean).round(3)
+
+    # CAPA 4: Presión (Quote Update Ratios & Quote Balance)
+    bid_only_updates = resampler['is_bid_only'].sum()
+    ask_only_updates = resampler['is_ask_only'].sum()
+    both_updates = resampler['is_both'].sum()
+    total_upd = bid_only_updates + ask_only_updates + both_updates
+    
+    bid_pressure = (bid_only_updates / (total_upd + 1e-9)).round(3)
+    ask_pressure = (ask_only_updates / (total_upd + 1e-9)).round(3)
+    quote_balance = ((bid_only_updates - ask_only_updates) / (total_upd + 1e-9)).round(3)
+
+    # CAPA 5: Calidad (Proporción de ticks aptos para análisis)
+    quality_mean = resampler['quality_score'].mean().round(1)
+    quality_std = resampler['quality_score'].std().fillna(0.0).round(1)
+    quality_min = resampler['quality_score'].min().fillna(100.0).round(1)
+    quality_p10 = resampler['quality_score'].quantile(0.10).fillna(100.0).round(1)
+    
+    quality_ticks_for_vol = resampler['quality_score'].apply(lambda x: int(np.sum(x >= 70.0)))
+
+    # CAPA 6: Infraestructura (Latencia de red y Jitter)
+    latency_mean = resampler['latency_ms'].mean().round(1)
+    latency_max = resampler['latency_ms'].max().round(0)
+    latency_p95 = resampler['latency_ms'].quantile(0.95).fillna(0.0).round(1)
+    latency_std = resampler['latency_ms'].std().fillna(0.0)
+    latency_cv = (latency_std / (latency_mean + 1e-9)).fillna(0.0).round(3)
+    jitter_ms = resampler['latency_ms'].std().fillna(0.0).round(1)
+
+    # CAPA 7: Flujo (Tick Interval, Burstiness e Idle Ratio Dinámico)
+    tick_interval_mean_ms = resampler['tick_interval_ms'].mean().round(1)
+    tick_interval_std_ms = resampler['tick_interval_ms'].std().fillna(0.0).round(1)
+    
+    # Burstiness index (Coeficiente de variación del intervalo entre ticks)
+    burstiness = (tick_interval_std_ms / (tick_interval_mean_ms + 1e-9)).round(3)
+    burstiness_regime = np.select([burstiness > 1.3, burstiness < 0.7], ["BURST", "QUIET"], default="NORMAL")
+
+    # Idle Ratio Dinámico: 4 veces el intervalo mediano del minuto (umbral autocalibrado)
+    median_interval = resampler['tick_interval_ms'].median().fillna(50.0)
+    idle_thresholds = np.clip(4.0 * median_interval, 500.0, 10000.0)
+
+    idle_ratios = []
+    for (timestamp, group), threshold in zip(resampler, idle_thresholds):
+        intervals = group['tick_interval_ms'].values
+        gaps_sum = np.sum(intervals[intervals > threshold]) if len(intervals) > 0 else 0.0
+        idle_ratios.append(round(float(gaps_sum / 60000.0), 3))
+
+    # CAPA 8: Integridad (Forense de Fallos Enriquecido)
+    reversed_spread_ticks = resampler['is_reversed'].sum()
+    wide_spread_ticks = resampler['is_wide'].sum()
+    stale_ticks = resampler['is_stale'].sum()
+    clock_issue_ticks = resampler['is_clock_sync'].sum()
+    zero_spread_ticks = resampler['is_zero'].sum()
+    duplicate_ticks = resampler['is_duplicate'].sum()
+
+    # Penalizaciones acumuladas para el Score de Integridad
+    penalties = (duplicate_ticks * 5.0 + stale_ticks * 0.5 + reversed_spread_ticks * 10.0 +
+                 zero_spread_ticks * 10.0 + clock_issue_ticks * 5.0)
+    integrity_score = np.clip(100.0 - (penalties / (tick_count + 1e-9) * 100.0), 0.0, 100.0).round(1)
+
+    # CAPA 9: Dinámica (Realized Volatility, Median Return y MAD Return robusto)
+    realized_volatility = []
+    median_return = []
+    mad_return = []
+    
+    for _, group in resampler:
+        if len(group) < MIN_TICKS_FOR_VOLATILITY:
+            realized_volatility.append(0.0)
+            median_return.append(0.0)
+            mad_return.append(0.0)
+            continue
+        
+        quality_ticks = group[group['quality_score'] >= 70.0]
+        if len(quality_ticks) < MIN_TICKS_FOR_VOLATILITY:
+            realized_volatility.append(0.0)
+            median_return.append(0.0)
+            mad_return.append(0.0)
+            continue
+            
+        mid_prices = quality_ticks['mid_price'].values
+        log_returns = np.log(mid_prices[1:] / mid_prices[:-1])
+        
+        vol = float(np.std(log_returns) * 1000)
+        realized_volatility.append(round(vol, 6))
+
+        med = float(np.median(log_returns))
+        median_return.append(round(med * 1000, 6))
+
+        mad = float(np.median(np.abs(log_returns - med)) * 1.4826)
+        mad_return.append(round(mad * 1000, 6))
+
+    # ==============================================================================
+    # 🏗️ CONSOLIDACIÓN DE METADATOS Y SESIÓN
+    # ==============================================================================
+    df_bars = pd.DataFrame(index=df_ohlc.index)
+    df_bars['open'] = df_ohlc['open']
+    df_bars['high'] = df_ohlc['high']
+    df_bars['low'] = df_ohlc['low']
+    df_bars['close'] = df_ohlc['close']
+    
+    df_bars['timestamp'] = (df_bars.index.astype(np.int64) // 10**9).astype(int)
+    dt_utc = pd.to_datetime(df_bars['timestamp'], unit='s', utc=True)
+    
+    df_bars['session'] = resampler['session'].apply(lambda x: x.mode()[0] if not x.empty else "UNKNOWN")
+    df_bars['minutes_since_session_open'] = np.where(df_bars['session'] == "CLOSED", 0, (dt_utc.dt.hour - 6) * 60 + dt_utc.dt.minute).astype(int)
+
+    df_bars['tick_count'] = tick_count
+    df_bars['volume'] = resampler['volume'].sum()
+    df_bars['effective_duration'] = effective_duration_seconds.round(1)
+    df_bars['tps_abs'] = tps_abs
+    df_bars['tps_effective'] = tps_effective
+    
+    df_bars['spread_mean'] = spread_mean
+    df_bars['spread_p95'] = spread_p95
+    df_bars['spread_max'] = spread_max
+    df_bars['spread_std'] = spread_std
+    df_bars['spread_cv'] = spread_cv
+    df_bars['spread_skew'] = spread_skew
+    
+    df_bars['bid_only_updates'] = bid_only_updates
+    df_bars['ask_only_updates'] = ask_only_updates
+    df_bars['both_updates'] = both_updates
+    df_bars['bid_pressure'] = bid_pressure
+    df_bars['ask_pressure'] = ask_pressure
+    df_bars['quote_balance'] = quote_balance
+    
+    df_bars['quality_score_mean'] = quality_mean
+    df_bars['quality_std'] = quality_std
+    df_bars['quality_min'] = quality_min
+    df_bars['quality_p10'] = quality_p10
+    df_bars['quality_ticks_for_vol'] = quality_ticks_for_vol
+    
+    df_bars['latency_mean_ms'] = latency_mean
+    df_bars['latency_max_ms'] = latency_max
+    df_bars['latency_p95_ms'] = latency_p95
+    df_bars['latency_cv'] = latency_cv
+    df_bars['jitter_ms'] = jitter_ms
+    
+    df_bars['tick_interval_mean_ms'] = tick_interval_mean_ms
+    df_bars['tick_interval_std_ms'] = tick_interval_std_ms
+    df_bars['burstiness'] = burstiness
+    df_bars['burstiness_regime'] = burstiness_regime
+    df_bars['idle_ratio'] = idle_ratios
+    
+    df_bars['duplicate_ticks'] = duplicate_ticks
+    df_bars['stale_ticks'] = stale_ticks
+    df_bars['integrity_score'] = integrity_score
+    
+    df_bars['spread_acceleration'] = df_bars['spread_mean'].diff().diff().fillna(0.0).round(2)
+    df_bars['price_acceleration'] = df_bars['close'].diff().diff().fillna(0.0).round(6)
+    df_bars['realized_volatility'] = realized_volatility
+    df_bars['median_return'] = median_return
+    df_bars['mad_return'] = mad_return
+
+    # Clasificación del estado operativo por minuto
+    limit = SPREAD_LIMITS.get(symbol, SPREAD_LIMITS.get('DEFAULT', 30.0))
+    df_bars['minute_state'] = [clasificar_estado_minuto(t, s, v, limit) for t, s, v in zip(df_bars['tps_abs'], df_bars['spread_mean'], df_bars['realized_volatility'])]
+
+    df_bars['low_confidence'] = df_bars['tick_count'] < MIN_TICKS_FOR_CONFIDENCE
+    df_bars['vol_low_confidence'] = df_bars['quality_ticks_for_vol'] < MIN_TICKS_FOR_VOLATILITY
+
+    # Rellenar huecos de inactividad
+    df_bars['close'] = df_bars['close'].ffill()
+    df_bars['open'] = df_bars['open'].fillna(df_bars['close'])
+    df_bars['high'] = df_bars['high'].fillna(df_bars['close'])
+    df_bars['low'] = df_bars['low'].fillna(df_bars['close'])
+    df_bars['tick_count'] = df_bars['tick_count'].fillna(0).astype(int)
+    df_bars['volume'] = df_bars['volume'].fillna(0.0)
+    df_bars['spread_mean'] = df_bars['spread_mean'].ffill()
+    df_bars['spread_p95'] = df_bars['spread_p95'].ffill()
+    df_bars['spread_max'] = df_bars['spread_max'].ffill()
+    df_bars['session'] = df_bars['session'].ffill().fillna("UNKNOWN")
+    df_bars['minute_state'] = df_bars['minute_state'].ffill().fillna("NORMAL")
+
+    # CAPA 9BIS: Datos de Contexto
+    df_bars['spread_change_1m'] = df_bars['spread_mean'].diff().fillna(0.0).round(2)
+    df_bars['tps_change_1m'] = df_bars['tps_abs'].diff().fillna(0.0).round(3)
+    df_bars['volatility_change_1m'] = df_bars['realized_volatility'].diff().fillna(0.0).round(6)
+    df_bars['integrity_change_1m'] = df_bars['integrity_score'].diff().fillna(0.0).round(1)
+
+    df_bars = df_bars.reset_index(drop=True)
+    output_dir = QUANT_BARS_DIR / symbol
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"{symbol}_{fecha}_market_state.parquet"
+
+    try:
+        df_bars.to_parquet(output_file, index=False)
+        logger.info(f"✅ {symbol}: Snapshot de estado guardado en bars con éxito.")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error guardando snapshot para {symbol}: {e}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description="Market State Builder V2.2")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+
+    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    logger.info(f"🚀 Iniciando construcción de snapshot de estado para: {fecha}")
+
+    procesados = sum(1 for s in SYMBOLS_TO_QUANT if construir_market_state(s, fecha))
+    logger.info(f"📋 Cierre diario finalizado: {procesados}/{len(SYMBOLS_TO_QUANT)} snapshots unificados en bars.")
+    
+if __name__ == "__main__":
+    main()

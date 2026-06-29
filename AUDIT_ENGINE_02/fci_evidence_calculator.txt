@@ -1,0 +1,313 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+FCI EVIDENCE CALCULATOR - PERITO FORENSE DE CONECTIVIDAD
+==========================================================================
+Ubicación: AUDIT_ENGINE_02
+Dependencias: audit_config (paths, symbols, logging, timezone)
+Responsabilidad: Comparar y reconciliar los datos físicos del SSD/SAFE,
+                 analizando brechas basándose en marcas de tiempo absolutas
+                 del bróker (tm) para detectar cortes de red (H-10).
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección de ruta raíz
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+import json
+import re
+import gzip
+import argparse
+from datetime import datetime, timezone
+
+# Importación desde audit_config
+from audit_config import (
+    SSD_EVIDENCE_DIR,
+    ARCHIVE_SAFE_DIR,
+    AUDIT_REPORTES_DIR,
+    SYMBOLS_TO_AUDIT,
+    BROKER_TZ,
+    init_audit_logging,
+    save_contract_atomic
+)
+
+# Inicializar logger
+logger = init_audit_logging("fci_evidence_calculator", "02_AUDIT")
+
+# Constantes
+STALL_THRESHOLD_MS = 5000
+SESSION_START_UTC_H = 6
+SESSION_END_UTC_H = 22
+
+
+def is_in_session(tm_ms: int) -> bool:
+    """Verifica si un timestamp está dentro de la sesión de mercado."""
+    try:
+        hour = datetime.fromtimestamp(tm_ms / 1000, tz=timezone.utc).hour
+        return SESSION_START_UTC_H <= hour < SESSION_END_UTC_H
+    except Exception:
+        return False
+
+
+def normalize_to_ms(val) -> float:
+    """Normaliza un timestamp a milisegundos."""
+    if val is None:
+        return 0.0
+    try:
+        val_f = float(val)
+        if val_f < 1e11:
+            return val_f * 1000.0
+        elif val_f < 1e14:
+            return val_f
+        else:
+            return val_f / 1000.0
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def calculate_fci(ticks: int, missing_files: int, seq_loss_rate: float,
+                  seq_duplicates: int, seq_inversions: int, seq_resets: int,
+                  negative_gaps: int, bid_ask_inversions: int, stale_ticks_pct: float,
+                  infrastructure_silence_count: int) -> float:
+    """
+    Calcula el Feed Confidence Index (FCI) penalizando caídas de conectividad.
+
+    Args:
+        ticks: Total de ticks procesados
+        missing_files: Número de archivos faltantes estimados
+        seq_loss_rate: Tasa de pérdida de secuencias
+        seq_duplicates: Número de duplicados de secuencia
+        seq_inversions: Número de inversiones de secuencia
+        seq_resets: Número de reseteos de secuencia
+        negative_gaps: Número de gaps negativos en timestamps
+        bid_ask_inversions: Número de inversiones bid-ask
+        stale_ticks_pct: Porcentaje de ticks congelados
+        infrastructure_silence_count: Número de silencios de infraestructura
+
+    Returns:
+        float: FCI calculado (0-100)
+    """
+    if ticks == 0:
+        return 0.0
+
+    s_continuity = max(0.0, 100.0 - (missing_files * 20.0))
+    base_seq = 100.0 * (1.0 - seq_loss_rate)
+    s_seq = max(0.0, min(100.0, base_seq - min(15.0, seq_duplicates * 0.01) - (seq_inversions * 5.0) - (seq_resets * 10.0)))
+
+    # H-10: Penalización drástica por cortes de conectividad local
+    s_temporal = max(0.0, 100.0 - (infrastructure_silence_count * 10.0) - (negative_gaps * 5.0))
+    s_quality = max(0.0, 100.0 - (bid_ask_inversions * 1.0) - (max(0.0, stale_ticks_pct - 80.0) * 2.0))
+
+    return round(max(0.0, min(100.0, (s_continuity * 0.40) + (s_seq * 0.30) + (s_temporal * 0.20) + (s_quality * 0.10))), 2)
+
+
+def find_reconciliation_files(symbol: str, date_str: str) -> list:
+    """
+    Encuentra archivos de reconciliación para un símbolo y fecha.
+
+    Args:
+        symbol: Símbolo a buscar
+        date_str: Fecha en formato YYYYMMDD
+
+    Returns:
+        list: Lista de archivos encontrados
+    """
+    raw_paths = []
+
+    # Buscar en SSD_EVIDENCE
+    if SSD_EVIDENCE_DIR.exists():
+        for sym_dir in SSD_EVIDENCE_DIR.iterdir():
+            if sym_dir.is_dir() and sym_dir.name.lower() == symbol.lower():
+                date_dir = sym_dir / date_str
+                if date_dir.exists():
+                    raw_paths.extend(date_dir.glob("*.jsonl"))
+
+    # Buscar en ARCHIVE_SAFE
+    if ARCHIVE_SAFE_DIR.exists():
+        all_safe_files = list(ARCHIVE_SAFE_DIR.rglob("*"))
+        for p in all_safe_files:
+            if not p.is_file():
+                continue
+            if symbol.lower() not in p.name.lower():
+                continue
+            if not (p.name.endswith(".jsonl.gz") or p.name.endswith(".gz") or p.name.endswith(".jsonl")):
+                continue
+
+            match = re.search(r"(\d{10})", p.name)
+            if match:
+                try:
+                    ts = int(match.group(1))
+                    dt = datetime.fromtimestamp(ts, tz=BROKER_TZ)
+                    if dt.strftime("%Y%m%d") == date_str:
+                        raw_paths.append(p)
+                except Exception:
+                    pass
+            else:
+                if date_str in p.name:
+                    raw_paths.append(p)
+
+    # Deduplicación
+    dedup_dict = {}
+    for p in raw_paths:
+        base_name = p.name.replace(".gz", "").replace(".jsonl", "")
+        if base_name not in dedup_dict or p.suffix == ".jsonl":
+            dedup_dict[base_name] = p
+
+    return sorted(list(dedup_dict.values()), key=lambda x: x.name)
+
+
+def analyze_evidence(date_str: str, symbols: list):
+    """
+    Analiza la evidencia de conectividad para una fecha y lista de símbolos.
+
+    Args:
+        date_str: Fecha en formato YYYYMMDD
+        symbols: Lista de símbolos a analizar
+    """
+    logger.info(f"🔍 Reconciliación Forense de conectividad (Fase 0) - Fecha: {date_str}")
+    integrity_summary = []
+
+    for symbol in symbols:
+        all_files = find_reconciliation_files(symbol, date_str)
+        if not all_files:
+            continue
+
+        ticks_processed = 0
+        seq_min, seq_max, seq_count, seq_gaps, seq_duplicates, seq_inversions, seq_resets = None, None, 0, 0, 0, 0, 0
+        negative_ts_gaps, bid_ask_inversions, stale_ticks_count = 0, 0, 0
+        prev_tm, prev_seq, prev_bid, prev_ask = None, None, None, None
+        infrastructure_silence_count = 0
+
+        timestamps = []
+        for f in all_files:
+            nums = re.findall(r"\d+", f.stem)
+            if nums:
+                timestamps.append(int(nums[-1]))
+        timestamps.sort()
+        missing_files = sum(1 for i in range(len(timestamps) - 1) if round((timestamps[i+1] - timestamps[i]) / 3600.0) > 1)
+
+        for filepath in all_files:
+            try:
+                open_func = gzip.open(filepath, "rt", encoding="utf-8", errors="ignore") if filepath.suffix == ".gz" else open(filepath, "r", encoding="utf-8", errors="ignore")
+                with open_func as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except Exception:
+                            continue
+
+                        tm_raw = data.get("tm")
+                        if tm_raw is None:
+                            continue
+                        tm = int(normalize_to_ms(tm_raw))
+                        bid = data.get("b") if data.get("b") is not None else data.get("bid")
+                        ask = data.get("a") if data.get("a") is not None else data.get("ask")
+                        ticks_processed += 1
+
+                        if bid is not None and ask is not None:
+                            if bid >= ask:
+                                bid_ask_inversions += 1
+                            if prev_bid is not None and prev_ask is not None:
+                                if bid == prev_bid and ask == prev_ask:
+                                    stale_ticks_count += 1
+                            prev_bid, prev_ask = bid, ask
+
+                        raw_seq = data.get("seq")
+                        if raw_seq is not None:
+                            try:
+                                seq = int(raw_seq)
+                                if prev_seq is not None:
+                                    diff = seq - prev_seq
+                                    if diff == 0:
+                                        seq_duplicates += 1
+                                    elif diff < 0:
+                                        seq_inversions += 1
+                                    elif diff > 100000:
+                                        seq_resets += 1
+                                    elif diff > 1:
+                                        seq_gaps += (diff - 1)
+                                seq_count += 1
+                                if seq_min is None or seq < seq_min:
+                                    seq_min = seq
+                                if seq_max is None or seq > seq_max:
+                                    seq_max = seq
+                                prev_seq = seq
+                            except Exception:
+                                continue
+
+                        if prev_tm is not None:
+                            gap = tm - prev_tm
+                            if gap < 0:
+                                negative_ts_gaps += 1
+                            # H-10: Detección de silencio por desconexión local
+                            elif gap >= 300000:
+                                if is_in_session(tm):
+                                    infrastructure_silence_count += 1
+                                    logger.critical(f"⚠️ {symbol}: Silencio absoluto de {gap/1000:.1f}s detectado en sesión activa. Caída de red probable.")
+                        prev_tm = tm
+            except Exception as e:
+                logger.error(f"Error procesando {filepath.name}: {e}")
+
+        if ticks_processed == 0:
+            continue
+
+        stale_pct = round(stale_ticks_count / ticks_processed * 100, 2)
+        loss_rate_fci = seq_gaps / (seq_max - seq_min + 1) if (seq_max and seq_min and (seq_max - seq_min) > 0) else 0.0
+
+        fci_score = calculate_fci(
+            ticks=ticks_processed,
+            missing_files=missing_files,
+            seq_loss_rate=loss_rate_fci,
+            seq_duplicates=seq_duplicates,
+            seq_inversions=seq_inversions,
+            seq_resets=seq_resets,
+            negative_gaps=negative_ts_gaps,
+            bid_ask_inversions=bid_ask_inversions,
+            stale_ticks_pct=stale_pct,
+            infrastructure_silence_count=infrastructure_silence_count
+        )
+
+        logger.info(f"📊 {symbol:7} | Ticks: {ticks_processed:9,} | Gaps Conectividad: {infrastructure_silence_count} | FCI: {fci_score}%")
+
+        integrity_summary.append({
+            "symbol": symbol,
+            "ticks": ticks_processed,
+            "status_operativo": "ADMITIDO" if fci_score >= 70.0 else "NO_CONFIABLE",
+            "integrity_metrics": {
+                "feed_confidence_index": fci_score,
+                "infrastructure_silence_count": infrastructure_silence_count,
+                "stale_ticks_pct": stale_pct,
+                "bid_ask_inversions": bid_ask_inversions,
+                "negative_timestamp_gaps": negative_ts_gaps,
+                "missing_files_estimated": missing_files,
+                "seq_gaps_canonical": seq_gaps,
+                "seq_loss_rate": round(loss_rate_fci, 6) if seq_count > 0 else 0.0
+            }
+        })
+
+    AUDIT_REPORTES_DIR.mkdir(parents=True, exist_ok=True)
+    report_file = AUDIT_REPORTES_DIR / f"capture_audit_report_{date_str}.json"
+
+    save_contract_atomic({
+        "metadata": {"date": date_str, "generated_at": datetime.now(timezone.utc).isoformat(), "schema_version": "2.0"},
+        "integrity_summary": integrity_summary
+    }, report_file)
+    logger.info(f"✅ Reporte consolidado guardado en: {report_file.name}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="FCI Evidence Calculator")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    analyze_evidence(fecha, SYMBOLS_TO_AUDIT)
+
+
+if __name__ == "__main__":
+    main()

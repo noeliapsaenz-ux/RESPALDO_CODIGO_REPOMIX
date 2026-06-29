@@ -1,0 +1,821 @@
+"""
+==========================================================================
+TELEMETRY_DASHBOARD - Monitor de diagnóstico en tiempo real
+==========================================================================
+Ubicación: CAPTURE_ENGINE_01
+Dependencias: common_logger, paths, settings, capture_config
+Responsabilidad: Mostrar en tiempo real el estado de todos los capturadores,
+                 métricas del sistema (CPU, RAM, RAMDisk), persistencia
+                 de datos, estado del Archive Daemon, y alertas activas.
+                 Soporta modo headless para VPS y modo interactivo con
+                 teclas de control (Q, R, G, L, A, S, F).
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección de ruta del directorio superior (Single Source of Truth)
+raiz_proyecto = Path(__file__).parent.parent.resolve()
+if str(raiz_proyecto) not in sys.path:
+    sys.path.insert(0, str(raiz_proyecto))
+
+import gc
+import json
+import logging
+import os
+import signal
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+import psutil
+
+# Importaciones directas y limpias de soporte
+from common_logger import get_logger as init_logging
+from paths import (
+    ACTIVE_DATA_DIR, BASE_DIR, LOGS_UNIFIED_DIR, 
+    RAMDISK_PATH, SSD_EVIDENCE_DIR, STATE_DIR
+)
+from settings import BROKER_TZ, ENTORNO_ACTUAL, USAR_RAMDISK
+from capture_config import SYMBOLS_TO_CAPTURE, get_session_actual
+
+try:
+    from colorama import init, Fore, Style
+    init(autoreset=True)
+except ImportError:
+    class Fore:
+        RED = '\033[91m'; GREEN = '\033[92m'; YELLOW = '\033[93m'
+        BLUE = '\033[94m'; MAGENTA = '\033[95m'; CYAN = '\033[96m'
+        WHITE = '\033[97m'; RESET = '\033[0m'
+    class Style:
+        RESET = ''
+
+class StateCache:
+    def __init__(self, ttl_seconds: float = 2.0):
+        self._cache: Dict[str, Dict[str, Any]] = {}
+        self._timestamps: Dict[str, float] = {}
+        self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            if key in self._cache:
+                if time.time() - self._timestamps[key] < self._ttl:
+                    return self._cache[key].copy()
+                else:
+                    del self._cache[key]
+                    del self._timestamps[key]
+            return None
+
+    def set(self, key: str, value: Dict[str, Any]):
+        with self._lock:
+            self._cache[key] = value.copy()
+            self._timestamps[key] = time.time()
+
+    def clear(self):
+        with self._lock:
+            self._cache.clear()
+            self._timestamps.clear()
+
+
+class UnifiedMonitor:
+    def __init__(
+        self,
+        refresh_interval: float = 3.0,
+        cache_ttl: float = 2.0,
+        headless: Optional[bool] = None,
+        stale_threshold_sec: float = 30.0,
+        critical_threshold_sec: float = 120.0,
+        forensic_mode: bool = False
+    ):
+        self.logger = init_logging("monitor", "system")
+        self.refresh_interval = refresh_interval
+        self.cache_ttl = cache_ttl
+        self.headless = headless if headless is not None else self._detect_headless()
+        self.running = True
+        self.refresh_count = 0
+        self._start_time = time.time()
+        self._last_status_log = time.time()
+        self._status_log_interval = 30
+        
+        self.forensic_mode = forensic_mode
+        self.stale_threshold_sec = stale_threshold_sec
+        self.critical_threshold_sec = critical_threshold_sec
+        
+        self._state_cache = StateCache(cache_ttl)
+        self.symbol_cache: Dict[str, Dict[str, Any]] = {}
+        self.alerts_history = deque(maxlen=50)
+        self._stale_alerts = []
+        self._process_status: Dict[str, str] = {}
+        self._heartbeat_status: Dict[str, float] = {}
+        
+        self._system_metrics = {
+            'cpu': 0.0, 'ram': 0.0, 'uptime': 0,
+            'disk_usage': 0.0, 'ramdisk_usage': 0.0, 'ramdisk_free_gb': 0.0
+        }
+        
+        self._persistence_metrics: Dict[str, Dict[str, Any]] = {}
+        self._last_persistence_fetch = 0
+        self._persistence_fetch_interval = 10
+        
+        self._archive_daemon_stats = {
+            'files_archived': 0, 'bytes_archived': 0,
+            'bytes_freed': 0, 'compression_ratio_avg': 0.0,
+            'errors': 0, 'last_archive_time': None, 'available': False
+        }
+        
+        self._recovery_audits: Dict[str, int] = {}
+        self._cache_lock = threading.Lock()
+        
+        try:
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+        except ValueError:
+            pass
+        
+        mode_str = "FORENSE (SSD)" if self.forensic_mode else "LIVE (RAMDISK)"
+        self.logger.info(f"🖥️ Monitor V3.3 | Modo: {mode_str} | Headless: {'SÍ' if self.headless else 'NO'}")
+
+    def _detect_headless(self) -> bool:
+        if os.environ.get('VPS_MODE', '0') == '1': return True
+        if os.environ.get('AWS_EXECUTION_ENV') or os.environ.get('EC2_REGION'): return True
+        return ENTORNO_ACTUAL == 'VPS'
+    
+    def _signal_handler(self, signum, frame):
+        self.logger.info(f"🛑 Señal {signum} recibida. Apagando monitor...")
+        self.running = False
+    
+    def _check_shutdown_signal(self) -> bool:
+        return (STATE_DIR / "shutdown.signal").exists()
+    
+    def _read_state_file(self, file_path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            if not file_path.exists() or file_path.stat().st_size == 0:
+                return None
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+    
+    def _check_process_alive(self, symbol: str) -> Tuple[bool, str]:
+        """Verifica si el proceso del capturador está vivo de manera híbrida."""
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    cmdline = ' '.join(proc.info['cmdline'] or [])
+                    if ('mt5_tick_engine.py' in cmdline or 'capturer_v2.py' in cmdline) and symbol.upper() in cmdline:
+                        if proc.is_running():
+                            return True, f"PID {proc.info['pid']}"
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            return False, "No encontrado"
+        except Exception:
+            return False, "Error"
+
+    def _check_heartbeat(self, symbol: str) -> Tuple[bool, float]:
+        """Verifica el heartbeat del capturador"""
+        heartbeat_file = STATE_DIR / f"{symbol}.heartbeat"
+        if not heartbeat_file.exists():
+            return False, 0.0
+        
+        try:
+            with open(heartbeat_file, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                lines = content.split('\n')
+                if lines:
+                    timestamp = float(lines[0].strip())
+                    age = time.time() - timestamp
+                    return True, age
+        except Exception:
+            pass
+        return False, 0.0
+
+    def _determine_real_state(self, symbol: str, data: Dict[str, Any]) -> Tuple[str, str, str]:
+        """
+        Determina el estado REAL del sistema unificando el pid y las alertas de tiempo local.
+        """
+        process_alive, pid_info = self._check_process_alive(symbol)
+        heartbeat_exists, heartbeat_age = self._check_heartbeat(symbol)
+        
+        system_timestamp = data.get('system_timestamp', 0)
+        
+        # Uso estricto de marcas de tiempo de PC local para evitar desfases
+        if system_timestamp > 0:
+            data_age = time.time() - system_timestamp
+            if data_age < 0:
+                data_age = 0.0
+        else:
+            state_file = STATE_DIR / f"{symbol}_state.json"
+            if state_file.exists():
+                data_age = time.time() - state_file.stat().st_mtime
+            else:
+                data_age = float('inf')
+        
+        data_fresh = data_age < self.stale_threshold_sec
+        data_critical = data_age > self.critical_threshold_sec
+        
+        if process_alive:
+            process_status = "RUNNING"
+        else:
+            process_status = "STOPPED"
+        
+        if process_status == "RUNNING" and data_fresh:
+            real_status = "LIVE"
+            real_color = "GREEN"
+            detail = f"PID activo | Heartbeat: {heartbeat_age:.0f}s"
+        elif process_status == "RUNNING" and not data_fresh and not data_critical:
+            real_status = "STALE"
+            real_color = "YELLOW"
+            detail = f"Proceso vivo | Sin datos {data_age:.0f}s"
+        elif process_status == "RUNNING" and data_critical:
+            real_status = "STALLED"
+            real_color = "ORANGE"
+            detail = f"Proceso atascado | Sin datos {data_age:.0f}s"
+        elif process_status == "STOPPED" and data_age > 60:
+            real_status = "DEAD"
+            real_color = "RED"
+            detail = f"Proceso detenido | Último dato {data_age:.0f}s"
+        else:
+            real_status = "OFFLINE"
+            real_color = "GRAY"
+            detail = "Sistema inactivo"
+        
+        return real_status, real_color, detail
+
+    def _get_active_data_dir(self) -> Path:
+        return SSD_EVIDENCE_DIR if self.forensic_mode else ACTIVE_DATA_DIR
+    
+    def _fetch_symbol_state(self, symbol: str) -> Optional[Dict[str, Any]]:
+        cache_key = f"symbol_{symbol}"
+        cached = self._state_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        
+        state_file = STATE_DIR / f"{symbol}_state.json"
+        sys_state_file = STATE_DIR / f"{symbol}_system_state.json"
+        
+        state_data = {}
+        
+        data = self._read_state_file(state_file)
+        if data:
+            state_data.update(data)
+        
+        sys_data = self._read_state_file(sys_state_file)
+        if sys_data and isinstance(sys_data, dict):
+            state_data['state'] = sys_data.get('state', 'UNKNOWN')
+            if 'metrics' in sys_data:
+                state_data['metrics'] = sys_data.get('metrics', {})
+                state_data['system_timestamp'] = sys_data.get('timestamp', 0)
+        
+        state_data.setdefault('symbol', symbol)
+        state_data.setdefault('state', 'UNKNOWN')
+        state_data.setdefault('metrics', {})
+        state_data.setdefault('last_sequence', 0)
+        state_data.setdefault('total_ticks_accepted', 0)
+        state_data.setdefault('last_tick_msc', 0)
+        state_data.setdefault('timestamp', 0)
+        
+        if 'last_tick_msc' not in state_data.get('metrics', {}):
+            if 'metrics' not in state_data:
+                state_data['metrics'] = {}
+            state_data['metrics']['last_tick_msc'] = state_data.get('last_tick_msc', 0)
+        
+        self._state_cache.set(cache_key, state_data)
+        return state_data
+    
+    def _fetch_all_states(self):
+        new_cache = {}
+        for symbol in SYMBOLS_TO_CAPTURE:
+            state = self._fetch_symbol_state(symbol)
+            if state:
+                new_cache[symbol] = state
+        with self._cache_lock:
+            self.symbol_cache = new_cache
+    
+    def _get_system_metrics(self):
+        try:
+            self._system_metrics['cpu'] = psutil.cpu_percent(interval=0.1)
+            mem = psutil.virtual_memory()
+            self._system_metrics['ram'] = mem.percent
+            
+            data_path = ACTIVE_DATA_DIR
+            if data_path.exists():
+                usage = psutil.disk_usage(str(data_path))
+                self._system_metrics['disk_usage'] = (usage.used / usage.total) * 100
+            
+            if USAR_RAMDISK and RAMDISK_PATH.exists():
+                try:
+                    ramdisk_usage = psutil.disk_usage(str(RAMDISK_PATH))
+                    self._system_metrics['ramdisk_usage'] = (ramdisk_usage.used / ramdisk_usage.total) * 100
+                    self._system_metrics['ramdisk_free_gb'] = ramdisk_usage.free / (1024**3)
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.debug(f"Error calculando recursos del sistema: {e}")
+        
+        self._system_metrics['uptime'] = time.time() - self._start_time
+    
+    def _fetch_persistence_metrics(self):
+        now = time.time()
+        if now - self._last_persistence_fetch < self._persistence_fetch_interval:
+            return
+        
+        self._last_persistence_fetch = now
+        data_dir = self._get_active_data_dir()
+        
+        for symbol in SYMBOLS_TO_CAPTURE:
+            symbol_dir = data_dir / symbol
+            if not symbol_dir.exists():
+                continue
+            
+            total_lines = 0
+            total_size_kb = 0
+            file_count = 0
+            last_recv_ts = 0
+            
+            try:
+                for date_dir in symbol_dir.iterdir():
+                    if not date_dir.is_dir():
+                        continue
+                    for jsonl_file in date_dir.glob("*.jsonl"):
+                        try:
+                            file_count += 1
+                            file_size = jsonl_file.stat().st_size
+                            total_size_kb += file_size / 1024
+                            
+                            with open(jsonl_file, 'r', encoding='utf-8', errors='ignore') as f:
+                                line_count = sum(1 for _ in f)
+                                total_lines += line_count
+                                
+                                if jsonl_file.stat().st_mtime > now - 3600:
+                                    f.seek(max(0, file_size - 1024))
+                                    last_lines = f.readlines()
+                                    if last_lines:
+                                        try:
+                                            last_tick = json.loads(last_lines[-1])
+                                            recv_ts = last_tick.get('recv_ts', 0)
+                                            if recv_ts > last_recv_ts:
+                                                last_recv_ts = recv_ts
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            
+            latency_ms = (now * 1000 - last_recv_ts) if last_recv_ts > 0 else 0
+            source_label = "📂 SSD" if self.forensic_mode else "💾 RAM"
+            
+            self._persistence_metrics[symbol] = {
+                'lines': total_lines,
+                'size_kb': total_size_kb,
+                'files': file_count,
+                'latency_ms': latency_ms,
+                'source': source_label,
+                'recovery': self._recovery_audits.get(symbol, 0)
+            }
+    
+    def _fetch_archive_daemon_stats(self):
+        daemon_state_file = STATE_DIR / "archive_daemon_state.json"
+        data = self._read_state_file(daemon_state_file)
+        if data and isinstance(data, dict):
+            self._archive_daemon_stats.update(data)
+            self._archive_daemon_stats['available'] = True
+        else:
+            self._archive_daemon_stats['available'] = False
+    
+    def _fetch_recovery_audits(self):
+        recovery_dir = LOGS_UNIFIED_DIR / "recovery"
+        if not recovery_dir.exists():
+            return
+        for symbol in SYMBOLS_TO_CAPTURE:
+            audit_file = recovery_dir / f"{symbol}_recovery_audit.json"
+            if audit_file.exists():
+                try:
+                    with open(audit_file, 'r', encoding='utf-8') as f:
+                        lines = f.readlines()
+                        self._recovery_audits[symbol] = len([l for l in lines if l.strip()])
+                except Exception:
+                    pass
+    
+    def _check_stale_data(self) -> List[Dict[str, Any]]:
+        """Identifica alertas de congelamiento EXCLUSIVAMENTE para capturadores encendidos."""
+        now = time.time()
+        alerts = []
+        
+        with self._cache_lock:
+            for symbol, data in self.symbol_cache.items():
+                # Evitar alertas ruidosas si el capturador está apagado a propósito
+                process_alive, _ = self._check_process_alive(symbol)
+                if not process_alive:
+                    continue
+                
+                system_timestamp = data.get('system_timestamp', 0)
+                if system_timestamp > 0:
+                    age_sec = now - system_timestamp
+                else:
+                    state_file = STATE_DIR / f"{symbol}_state.json"
+                    if state_file.exists():
+                        age_sec = now - state_file.stat().st_mtime
+                    else:
+                        continue
+                
+                if age_sec < 0:
+                    age_sec = 0.0
+                
+                if age_sec > self.critical_threshold_sec:
+                    alerts.append({
+                        'symbol': symbol,
+                        'level': 'CRITICAL',
+                        'age_seconds': age_sec,
+                        'message': f'⚠️ ¡SIN DATOS! Último tick hace {age_sec:.0f}s'
+                    })
+                elif age_sec > self.stale_threshold_sec:
+                    alerts.append({
+                        'symbol': symbol,
+                        'level': 'WARNING',
+                        'age_seconds': age_sec,
+                        'message': f'⚠️ Datos congelados hace {age_sec:.0f}s'
+                    })
+        
+        self._stale_alerts = alerts
+        return alerts
+    
+    def _fetch_loop(self):
+        while self.running:
+            try:
+                if self._check_shutdown_signal():
+                    self.running = False
+                    break
+                
+                self._fetch_all_states()
+                self._get_system_metrics()
+                self._fetch_persistence_metrics()
+                self._fetch_archive_daemon_stats()
+                self._fetch_recovery_audits()
+                self._check_stale_data()
+                
+                if self.headless:
+                    now = time.time()
+                    if now - self._last_status_log >= self._status_log_interval:
+                        self._log_status_headless()
+                        self._last_status_log = now
+                
+                time.sleep(self.refresh_interval)
+            except Exception as e:
+                self.logger.error(f"Error en bucle de monitorización: {e}")
+                time.sleep(1)
+    
+    def _start_fetch_thread(self):
+        self._fetch_thread = threading.Thread(
+            target=self._fetch_loop,
+            daemon=True,
+            name="monitor_fetch"
+        )
+        self._fetch_thread.start()
+    
+    def _get_age_color(self, age_sec: float) -> str:
+        if age_sec < 5: return Fore.GREEN
+        elif age_sec < 30: return Fore.YELLOW
+        else: return Fore.RED
+    
+    def _get_status_color(self, status: str) -> str:
+        colors = {
+            'LIVE': Fore.GREEN,
+            'STALE': Fore.YELLOW,
+            'STALLED': '\033[38;5;208m',  # Orange
+            'DEAD': Fore.RED,
+            'OFFLINE': Fore.WHITE
+        }
+        return colors.get(status, Fore.WHITE)
+    
+    def _get_status_icon(self, status: str) -> str:
+        icons = {
+            'LIVE': '🟢',
+            'STALE': '🟡',
+            'STALLED': '🟠',
+            'DEAD': '🔴',
+            'OFFLINE': '⚫'
+        }
+        return icons.get(status, '❓')
+    
+    def _clear_screen(self):
+        os.system('cls' if os.name == 'nt' else 'clear')
+    
+    def _draw_dashboard(self):
+        self._clear_screen()
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        uptime = int(self._system_metrics['uptime'])
+        uptime_str = f"{uptime//3600:02d}:{(uptime%3600)//60:02d}:{uptime%60:02d}"
+        
+        total_recovery = sum(self._recovery_audits.values())
+        mode_str = "🔍 FORENSE (SSD)" if self.forensic_mode else "📡 LIVE (RAMDISK)"
+        mode_color = Fore.CYAN if self.forensic_mode else Fore.GREEN
+        
+        # Contar estados reales
+        real_states = {}
+        for symbol in SYMBOLS_TO_CAPTURE:
+            data = self.symbol_cache.get(symbol, {})
+            state, _, _ = self._determine_real_state(symbol, data)
+            real_states[state] = real_states.get(state, 0) + 1
+        
+        print(f"{Fore.CYAN}{'='*130}")
+        print(f"{Fore.YELLOW}📊 MONITOR V3.3 — ESTADO REAL DEL SISTEMA (TIME COMPENSATED)")
+        print(f"{mode_color}📂 MODO: {mode_str}{Fore.RESET}")
+        
+        # Resumen de estados
+        print(f"{'':<2} | ".join([f"{self._get_status_icon(s)} {s}: {c}" for s, c in real_states.items()]))
+        
+        print(f"{Fore.WHITE}🕐 {now} | 🔄 #{self.refresh_count} | ⏱️ Uptime: {uptime_str} | 📅 Sesión: {get_session_actual()}")
+        print(f"{Fore.WHITE}💾 Modo: {'RAMDISK+SSD' if USAR_RAMDISK else 'SSD/EBS'} | Entorno: {ENTORNO_ACTUAL} | Recovery Audits: {total_recovery}")
+        print(f"{Fore.CYAN}{'='*130}")
+        
+        # ==============================================================================
+        # ⚠️ BANNER DE ALERTAS COMPACTO (Filtra solo capturadores ENCENDIDOS con fallos)
+        # ==============================================================================
+        stale_alerts = self._stale_alerts
+        if stale_alerts:
+            critical_symbols = [a['symbol'] for a in stale_alerts if a['level'] == 'CRITICAL']
+            warning_symbols = [a['symbol'] for a in stale_alerts if a['level'] == 'WARNING']
+            
+            alert_parts = []
+            if critical_symbols:
+                alert_parts.append(f"{Fore.RED}🔴 CONGELADOS: {', '.join(critical_symbols)}{Fore.RESET}")
+            if warning_symbols:
+                alert_parts.append(f"{Fore.YELLOW}🟡 INACTIVOS: {', '.join(warning_symbols)}{Fore.RESET}")
+                
+            print(f"⚠️ {Fore.RED}ALERTAS ACTIVAS:{Fore.RESET} | " + " | ".join(alert_parts) + f" {Fore.CYAN}(Presione 'S' para ver detalle){Fore.RESET}")
+            print(f"{Fore.CYAN}{'-'*130}")
+            print()
+        
+        print(f"{Fore.MAGENTA}🛡️ ESTADO REAL (PROCESO + FLUJO + HEARTBEAT){Fore.WHITE}")
+        print(f"{Fore.CYAN}{'-'*130}")
+        print(f"{'SÍMBOLO':<10} {'ESTADO REAL':<14} {'PROCESO':<10} {'FLUJO':<10} {'HEARTBEAT':<12} {'BUFFER%':<9} {'SEQ':<12} {'ÚLTIMO TICK'}")
+        print(f"{Fore.CYAN}{'-'*130}")
+        
+        with self._cache_lock:
+            symbols = list(self.symbol_cache.items())
+        
+        for symbol, data in symbols:
+            # Determinar estado REAL
+            real_status, _, detail = self._determine_real_state(symbol, data)
+            status_color = self._get_status_color(real_status)
+            status_icon = self._get_status_icon(real_status)
+            
+            metrics = data.get('metrics', {})
+            buffer_pct = metrics.get('buffer_pct', 0)
+            seq = data.get('last_sequence', 0)
+            
+            # Verificar proceso y heartbeat
+            process_alive, pid_info = self._check_process_alive(symbol)
+            heartbeat_exists, heartbeat_age = self._check_heartbeat(symbol)
+            
+            process_display = f"✅ {pid_info}" if process_alive else "❌ DETENIDO"
+            heartbeat_display = f"✅ {heartbeat_age:.0f}s" if heartbeat_exists else "❌ NO"
+            
+            # Cálculo de edad del dato basado en el reloj local
+            system_timestamp = data.get('system_timestamp', 0)
+            if system_timestamp > 0:
+                age_sec = time.time() - system_timestamp
+                if age_sec < 0:
+                    age_sec = 0.0
+                age_color = self._get_age_color(age_sec)
+                tick_age = f"{age_color}{age_sec:.0f}s{Fore.RESET}"
+            else:
+                state_file = STATE_DIR / f"{symbol}_state.json"
+                if state_file.exists():
+                    age_sec = time.time() - state_file.stat().st_mtime
+                    if age_sec < 0:
+                        age_sec = 0.0
+                    age_color = self._get_age_color(age_sec)
+                    tick_age = f"{age_color}{age_sec:.0f}s{Fore.RESET}"
+                else:
+                    tick_age = f"{Fore.RED}NO DATA{Fore.RESET}"
+            
+            print(f"{Fore.WHITE}{symbol:<10} "
+                  f"{status_color}{status_icon} {real_status:<10}{Fore.RESET} "
+                  f"{process_display:<10} "
+                  f"{real_status:<10} "
+                  f"{heartbeat_display:<12} "
+                  f"{buffer_pct:>6.1f}% "
+                  f"{seq:>12,} "
+                  f"{tick_age}")
+        
+        print()
+        
+        print(f"{Fore.MAGENTA}📁 PERSISTENCIA & ARCHIVOS{Fore.WHITE}")
+        print(f"{Fore.CYAN}{'-'*130}")
+        print(f"{'SÍMBOLO':<10} {'LÍNEAS':<12} {'KB':<10} {'#ARCH':<7} {'LAT_ms':<9} {'FUENTE':<12} {'RECOVERY'}")
+        print(f"{Fore.CYAN}{'-'*130}")
+        
+        for symbol in SYMBOLS_TO_CAPTURE:
+            pm = self._persistence_metrics.get(symbol, {})
+            lines = pm.get('lines', 0)
+            size_kb = pm.get('size_kb', 0)
+            files = pm.get('files', 0)
+            latency = pm.get('latency_ms', 0)
+            source = pm.get('source', '💾 RAM')
+            recovery = pm.get('recovery', 0)
+            
+            lat_color = Fore.GREEN if latency < 100 else (Fore.YELLOW if latency < 500 else Fore.RED)
+            rec_text = f"❌ {recovery}" if recovery > 0 else "✅ None"
+            rec_color = Fore.RED if recovery > 0 else Fore.GREEN
+            source_color = Fore.CYAN if "SSD" in source else Fore.GREEN
+            
+            print(f"{Fore.WHITE}{symbol:<10} "
+                  f"{lines:>12,} "
+                  f"{size_kb:>10,.0f} "
+                  f"{files:>7} "
+                  f"{lat_color}{latency:>6.0f}ms{Fore.RESET} "
+                  f"{source_color}{source:<12}{Fore.RESET} "
+                  f"{rec_color}{rec_text}{Fore.RESET}")
+        
+        print()
+        
+        ads = self._archive_daemon_stats
+        last_archive = "N/A"
+        if ads.get('last_archive_time'):
+            age = time.time() - ads['last_archive_time']
+            if age < 60:
+                last_archive = f"hace {age:.0f}s"
+            elif age < 3600:
+                last_archive = f"hace {age/60:.0f} min"
+            else:
+                last_archive = f"hace {age/3600:.1f} h"
+        
+        daemon_status = "✅ ACTIVO" if ads.get('available', False) else "⏸️ SIN ESTADO"
+        daemon_color = Fore.GREEN if ads.get('available', False) else Fore.YELLOW
+        
+        print(f"{Fore.MAGENTA}📦 ARCHIVE DAEMON{Fore.WHITE}")
+        print(f"{Fore.CYAN}{'-'*130}")
+        print(f"Estado: {daemon_color}{daemon_status}{Fore.RESET} | "
+              f"Archivados: {ads.get('files_archived', 0)} | "
+              f"Comprimidos: {ads.get('bytes_archived', 0)/(1024**2):.1f} MB | "
+              f"Liberados: {ads.get('bytes_freed', 0)/(1024**2):.1f} MB | "
+              f"Ratio: {ads.get('compression_ratio_avg', 0):.1f}%")
+        print(f"Errores I/O: {ads.get('errors', 0)} | "
+              f"Último archive: {last_archive}")
+        
+        print()
+        
+        print(f"{Fore.MAGENTA}💻 RECURSOS DEL SISTEMA{Fore.WHITE}")
+        print(f"{Fore.CYAN}{'-'*130}")
+        
+        cpu = self._system_metrics['cpu']
+        ram = self._system_metrics['ram']
+        disk = self._system_metrics.get('disk_usage', 0)
+        
+        cpu_color = Fore.GREEN if cpu < 70 else (Fore.YELLOW if cpu < 90 else Fore.RED)
+        ram_color = Fore.GREEN if ram < 75 else (Fore.YELLOW if ram < 90 else Fore.RED)
+        disk_color = Fore.GREEN if disk < 70 else (Fore.YELLOW if disk < 85 else Fore.RED)
+        
+        print(f"CPU: {cpu_color}{cpu:>5.1f}%{Fore.RESET} | "
+              f"RAM: {ram_color}{ram:>5.1f}%{Fore.RESET} | "
+              f"Disco C:\\: {disk_color}{disk:>5.1f}%{Fore.RESET} | "
+              f"GC: {'ON' if gc.isenabled() else 'OFF'} | "
+              f"Headless: {'SÍ' if self.headless else 'NO'}")
+        
+        if USAR_RAMDISK:
+            ramdisk_pct = self._system_metrics.get('ramdisk_usage', 0)
+            ramdisk_free = self._system_metrics.get('ramdisk_free_gb', 0)
+            ramdisk_color = Fore.GREEN if ramdisk_pct < 70 else (Fore.YELLOW if ramdisk_pct < 85 else Fore.RED)
+            print(f"RAMDisk (M:\\): {ramdisk_color}{ramdisk_pct:>5.1f}%{Fore.RESET} usado | "
+                  f"Libre: {ramdisk_free:.2f} GB")
+        
+        print(f"{Fore.CYAN}{'='*130}")
+        
+        if not self.headless:
+            print(f"{Fore.YELLOW}💡 [Q] Salir | [R] Refresco | [G] GC | [L] Logs | [A] Alertas | [S] Stale | [F] Forense{Fore.RESET}")
+    
+    def _handle_input(self) -> bool:
+        if self.headless:
+            return True
+        
+        if os.name == 'nt':
+            import msvcrt
+            if msvcrt.kbhit():
+                try:
+                    key = msvcrt.getch().decode('ascii', errors='ignore').upper()
+                except Exception:
+                    return True
+                
+                if key == 'Q':
+                    self.running = False
+                    return False
+                elif key == 'R':
+                    self._state_cache.clear()
+                    self._fetch_all_states()
+                    return True
+                elif key == 'G':
+                    collected = gc.collect()
+                    print(f"\n{Fore.GREEN}✅ Liberados {collected:,} objetos{Fore.RESET}")
+                    time.sleep(1)
+                    return True
+                elif key == 'L':
+                    print(f"\n{Fore.CYAN}📂 Logs: {LOGS_UNIFIED_DIR}{Fore.RESET}")
+                    time.sleep(2)
+                    return True
+                elif key == 'A':
+                    print(f"\n{Fore.CYAN}📋 Últimas alertas:{Fore.RESET}")
+                    for alert in list(self.alerts_history)[-5:]:
+                        print(f"  {alert}")
+                    if not self.alerts_history:
+                        print("  (Sin alertas recientes)")
+                    print(f"{Fore.YELLOW}Presiona Enter para continuar...{Fore.RESET}")
+                    input()
+                    return True
+                elif key == 'S':
+                    print(f"\n{Fore.CYAN}📊 Estado de STALE DATA:{Fore.RESET}")
+                    alerts = self._stale_alerts
+                    if alerts:
+                        for alert in alerts:
+                            color = Fore.RED if alert['level'] == 'CRITICAL' else Fore.YELLOW
+                            print(f"  {color}[{alert['level']}] {alert['symbol']}: {alert['message']}{Fore.RESET}")
+                    else:
+                        print(f"  {Fore.GREEN}✅ Todos los símbolos están actualizados{Fore.RESET}")
+                    print(f"{Fore.YELLOW}Presiona Enter para continuar...{Fore.RESET}")
+                    input()
+                    return True
+                elif key == 'F':
+                    self.forensic_mode = not self.forensic_mode
+                    mode_str = "FORENSE (SSD)" if self.forensic_mode else "LIVE (RAMDISK)"
+                    print(f"\n{Fore.CYAN}📂 Modo cambiado a: {mode_str}{Fore.RESET}")
+                    self._state_cache.clear()
+                    self._fetch_all_states()
+                    time.sleep(1)
+                    return True
+        return True
+    
+    def _log_status_headless(self):
+        with self._cache_lock:
+            total_tps = sum(data.get('metrics', {}).get('tps', 0) for data in self.symbol_cache.values())
+            critical = sum(1 for data in self.symbol_cache.values() if data.get('state', '').upper() in ['ORANGE', 'RED', 'ERROR'])
+        
+        stale_alerts = self._stale_alerts
+        stale_count = len(stale_alerts)
+        
+        mode_str = "F" if self.forensic_mode else "L"
+        
+        msg = (f"Monitor[{mode_str}] | TPS: {total_tps:.1f} | "
+               f"Críticos: {critical} | "
+               f"STALE: {stale_count} | "
+               f"RAM: {self._system_metrics['ram']:.1f}% | "
+               f"CPU: {self._system_metrics['cpu']:.1f}%")
+        
+        if USAR_RAMDISK:
+            msg += f" | RAMDisk: {self._system_metrics.get('ramdisk_usage', 0):.1f}%"
+        
+        self.logger.info(msg)
+    
+    def run(self):
+        self._start_fetch_thread()
+        
+        try:
+            while self.running:
+                if self._check_shutdown_signal():
+                    break
+                
+                if self.headless:
+                    time.sleep(self.refresh_interval)
+                else:
+                    self._draw_dashboard()
+                    self.refresh_count += 1
+                    
+                    if not self._handle_input():
+                        break
+                    
+                    time.sleep(self.refresh_interval)
+        
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.running = False
+            if hasattr(self, '_fetch_thread') and self._fetch_thread.is_alive():
+                self._fetch_thread.join(timeout=3.0)
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Monitor V3.3 - Estado Real del Sistema')
+    parser.add_argument('--interval', type=float, default=3.0)
+    parser.add_argument('--cache-ttl', type=float, default=2.0)
+    parser.add_argument('--headless', action='store_true')
+    parser.add_argument('--stale-threshold', type=float, default=30.0)
+    parser.add_argument('--critical-threshold', type=float, default=120.0)
+    parser.add_argument('--forensic', action='store_true')
+    args = parser.parse_args()
+    
+    monitor = UnifiedMonitor(
+        refresh_interval=args.interval,
+        cache_ttl=args.cache_ttl,
+        headless=args.headless,
+        stale_threshold_sec=args.stale_threshold,
+        critical_threshold_sec=args.critical_threshold,
+        forensic_mode=args.forensic
+    )
+    monitor.run()
+
+if __name__ == "__main__":
+    main()

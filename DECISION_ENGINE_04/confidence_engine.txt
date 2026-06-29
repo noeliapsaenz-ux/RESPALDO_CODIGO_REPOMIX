@@ -1,0 +1,184 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+CONFIDENCE_ENGINE - Fusión de confianza global (Fail-Closed)
+==========================================================================
+Ubicación: DECISION_ENGINE_04/confidence_engine.py
+Dependencias: decision_config, contract_manager, numpy
+Responsabilidad: Fusionar las 4 señales críticas (Edge, FCI, Anomaly,
+                 Readiness) utilizando los pesos parametrizados de forma
+                 defensiva y robusta ante pérdidas de datos.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+current_dir = Path(__file__).resolve().parent
+if str(current_dir) not in sys.path:
+    sys.path.insert(0, str(current_dir))
+
+import argparse
+import json
+import numpy as np
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+
+from decision_config import (
+    BROKER_TZ, init_logging, SYMBOLS_TO_CAPTURE, AUDIT_REPORTES_DIR,
+    PROCESSED_DATA_DIR, CONFIDENCE_WEIGHTS_DECISION, DECISION_WORKSPACE_DIR,
+    SymbolCaptureStatus
+)
+from contract_manager import load_contract_safe
+
+logger = init_logging("confidence_engine", "04_DECISION")
+
+def load_feature_vector(symbol: str, fecha: str) -> Optional[Dict[str, Any]]:
+    fv_file = DECISION_WORKSPACE_DIR / "feature_vectors" / f"fv_{symbol}_{fecha}.json"
+    return load_contract_safe(fv_file) if fv_file.exists() else None
+
+def load_edge_scores(fecha: str) -> Optional[Dict[str, Any]]:
+    edge_file = DECISION_WORKSPACE_DIR / "edge_scores" / f"edge_scores_{fecha}.json"
+    return load_contract_safe(edge_file) if edge_file.exists() else None
+
+def load_readiness_report(fecha: str) -> Dict[str, Any]:
+    readiness_file = PROCESSED_DATA_DIR / "readiness" / f"readiness_report_{fecha}.json"
+    return load_contract_safe(readiness_file) if readiness_file.exists() else {}
+
+def load_anomaly_report(fecha: str) -> Dict[str, Any]:
+    anomaly_file = PROCESSED_DATA_DIR / "anomalies" / f"anomaly_report_{fecha}.json"
+    return load_contract_safe(anomaly_file) if anomaly_file.exists() else {}
+
+def get_fci_for_symbol(fecha: str, symbol: str) -> float:
+    audit_file = AUDIT_REPORTES_DIR / f"audit_report_{fecha}.json"
+    if not audit_file.exists():
+        logger.critical(f"🛑 Fail-Closed: Reporte de Auditoria ausente para {symbol}. FCI asignado en 0.0.")
+        return 0.0
+    try:
+        with open(audit_file, "r", encoding="utf-8") as f: 
+            data = json.load(f)
+        for item in data.get("resultados_auditoria", []):
+            if item.get("symbol") == symbol.upper():
+                return float(item.get("metadata", {}).get("fci_captura", 0.0))
+        return 0.0
+    except Exception:
+        return 0.0
+
+def get_anomaly_score_for_symbol(anomaly_report: Dict, symbol: str) -> tuple:
+    for res in anomaly_report.get("results", []):
+        if res.get("symbol") == symbol.upper():
+            return float(res.get("anomaly_score", 0.0)), res.get("classification_level", "NORMAL")
+    return 0.0, "NORMAL"
+
+def get_readiness_for_symbol(readiness_report: Dict, symbol: str, style: str) -> tuple:
+    for item in readiness_report.get("resultados_readiness", []):
+        if item.get("symbol") == symbol.upper():
+            style_data = item.get("readiness_by_style", {}).get(style, {})
+            return float(style_data.get("readiness_score", 0.0)), style_data.get("status", "VETOED")
+    return 0.0, "VETOED"
+
+def calculate_confidence_score(
+    execution_feasibility_score: float,
+    fci: float, 
+    anomaly_score: float, 
+    readiness: float,
+    capture_status: str
+) -> Dict[str, Any]:
+    if capture_status == SymbolCaptureStatus.NO_CONFIABLE.value:
+        return {
+            "decision_confidence_score": 0.0,
+            "veto_applied": True,
+            "veto_reason": "symbol_capture_status == NO_CONFIABLE (H-03)",
+            "inputs": {
+                "execution_feasibility_score": 0.0,
+                "fci": fci,
+                "anomaly_score": anomaly_score,
+                "readiness": readiness
+            }
+        }
+    
+    weights = CONFIDENCE_WEIGHTS_DECISION
+    anomaly_inverted = 100.0 - anomaly_score
+    
+    confidence = (
+        execution_feasibility_score * weights['edge_score'] +
+        fci * weights['fci'] +
+        anomaly_inverted * weights['anomaly_score'] +
+        readiness * weights['readiness']
+    )
+    confidence = float(np.clip(confidence, 0.0, 100.0))
+    
+    return {
+        "decision_confidence_score": round(confidence, 1),
+        "veto_applied": False,
+        "veto_reason": None,
+        "inputs": {
+            "execution_feasibility_score": round(execution_feasibility_score, 1),
+            "fci": round(fci, 1),
+            "anomaly_score": round(anomaly_score, 1),
+            "readiness": round(readiness, 1)
+        }
+    }
+
+def main():
+    parser = argparse.ArgumentParser(description="Confidence Engine V1.0")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    
+    logger.info("=" * 80 + f"\n🎯 INICIANDO CONFIDENCE ENGINE - FECHA: {fecha}\n" + "=" * 80)
+    
+    edge_data = load_edge_scores(fecha)
+    if edge_data is None:
+        logger.critical("❌ Sin datos de Edge. Abortando calculo de confianza.")
+        return
+    
+    readiness_report = load_readiness_report(fecha)
+    anomaly_report = load_anomaly_report(fecha)
+    
+    confidence_data = {
+        "fecha": fecha, 
+        "timestamp_generacion": datetime.now(timezone.utc).isoformat(), 
+        "confidence_scores": {}
+    }
+    
+    for symbol in SYMBOLS_TO_CAPTURE:
+        fv = load_feature_vector(symbol, fecha)
+        if fv is None: 
+            continue
+        
+        capture_status = fv.get("symbol_capture_status", SymbolCaptureStatus.NO_CONFIABLE.value)
+        fci = get_fci_for_symbol(fecha, symbol)
+        anomaly_score, anomaly_level = get_anomaly_score_for_symbol(anomaly_report, symbol)
+        symbol_confidences = {}
+        
+        for style in ['scalping', 'intraday', 'swing']:
+            edge_info = edge_data.get("edge_scores", {}).get(symbol, {}).get(style, {})
+            edge_score = edge_info.get("edge_score", 0.0)
+            readiness, readiness_status = get_readiness_for_symbol(readiness_report, symbol, style)
+            
+            result = calculate_confidence_score(
+                edge_score, fci, anomaly_score, readiness, capture_status
+            )
+            
+            symbol_confidences[style] = {
+                **result, 
+                "anomaly_classification": anomaly_level, 
+                "readiness_status": readiness_status
+            }
+            
+            if result["decision_confidence_score"] >= 50.0:
+                logger.info(f"✅ {symbol:8} | {style:10} | Confianza: {result['decision_confidence_score']:5.1f} | Edge: {edge_score:.1f} | FCI: {fci:.1f}")
+        
+        confidence_data["confidence_scores"][symbol] = symbol_confidences
+        
+    from contract_manager import save_contract_atomic
+    output_path = DECISION_WORKSPACE_DIR / "confidence_scores" / f"confidence_scores_{fecha}.json"
+    save_contract_atomic(confidence_data, output_path)
+    logger.info(f"💾 Resultados de confianza generados de forma atomica en: {output_path.name}")
+
+if __name__ == "__main__":
+    main()

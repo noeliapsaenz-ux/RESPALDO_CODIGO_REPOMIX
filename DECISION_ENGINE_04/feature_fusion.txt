@@ -1,0 +1,252 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+FEATURE_FUSION - Fusion de datos certificados en Feature Vector
+==========================================================================
+Ubicacion: DECISION_ENGINE_04/feature_fusion.py
+Dependencias: decision_config, contract_manager, pandas, numpy
+Responsabilidad: Integrar la telemetria en vivo, certificados de auditoria (F2)
+                 e inteligencia cuantitativa (F3) en un vector consolidado
+                 por simbolo de forma segura.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+current_dir = Path(__file__).resolve().parent
+if str(current_dir) not in sys.path:
+    sys.path.insert(0, str(current_dir))
+
+import argparse
+import json
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+
+from decision_config import (
+    PROCESSED_DATA_DIR, AUDIT_STATE_DIR, AUDIT_REPORTES_DIR,
+    SPREAD_LIMITS, BROKER_TZ, init_logging, SYMBOLS_TO_CAPTURE,
+    DECISION_WORKSPACE_DIR, SymbolCaptureStatus, MarketReadinessStatus,
+    load_json_safe
+)
+
+logger = init_logging("feature_fusion", "04_DECISION")
+
+def load_market_state(symbol: str, fecha: str) -> Optional[pd.DataFrame]:
+    # Corregido: Se redirige la busqueda de la carpeta legada "market_state" a la carpeta real "bars"
+    state_file = PROCESSED_DATA_DIR / "bars" / symbol / f"{symbol}_{fecha}_market_state.parquet"
+    if not state_file.exists(): 
+        return None
+    try:
+        df = pd.read_parquet(state_file)
+        return df if not df.empty else None
+    except Exception as e:
+        logger.error(f"❌ {symbol}: Error leyendo market_state: {e}")
+        return None
+
+def load_anomaly_report(symbol: str, fecha: str) -> Dict[str, Any]:
+    anomaly_file = PROCESSED_DATA_DIR / "anomalies" / f"anomaly_report_{fecha}.json"
+    if not anomaly_file.exists(): 
+        return {"anomaly_score": 0.0, "classification_level": "NORMAL"}
+    try:
+        with open(anomaly_file, "r", encoding="utf-8") as f: 
+            data = json.load(f)
+        for res in data.get("results", []):
+            if res.get("symbol") == symbol.upper():
+                return {
+                    "anomaly_score": float(res.get("anomaly_score", 0.0)), 
+                    "classification_level": res.get("classification_level", "NORMAL"), 
+                    "anomaly_probability": float(res.get("anomaly_probability", 0.0))
+                }
+        return {"anomaly_score": 0.0, "classification_level": "NORMAL"}
+    except Exception: 
+        return {"anomaly_score": 0.0, "classification_level": "NORMAL"}
+
+def load_portfolio_contract(fecha: str) -> Dict[str, Any]:
+    contract_file = AUDIT_STATE_DIR / "portfolio_execution_contract.json"
+    if not contract_file.exists(): 
+        return {}
+    try:
+        with open(contract_file, "r", encoding="utf-8") as f: 
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"⚠️ Error leyendo portfolio_contract: {e}")
+        return {}
+
+def load_readiness_report(symbol: str, fecha: str) -> Dict[str, Any]:
+    readiness_file = PROCESSED_DATA_DIR / "readiness" / f"readiness_report_{fecha}.json"
+    if not readiness_file.exists(): 
+        return {}
+    try:
+        with open(readiness_file, "r", encoding="utf-8") as f: 
+            data = json.load(f)
+        for item in data.get("resultados_readiness", []):
+            if item.get("symbol") == symbol.upper(): 
+                return item
+        return {}
+    except Exception: 
+        return {}
+
+def load_fci(symbol: str, fecha: str) -> tuple:
+    from decision_config import AUDIT_REPORTES_DIR, load_json_safe
+    
+    cert_path = AUDIT_REPORTES_DIR / f"audit_certificate_{fecha}.json"
+    cert = load_json_safe(cert_path)
+    
+    if not cert or not cert.get("certificados_por_simbolo"):
+        logger.critical(f"🛑 Fail-Closed: audit_certificate ausente para {symbol}.")
+        return 0.0, SymbolCaptureStatus.NO_CONFIABLE.value
+    
+    for entry in cert["certificados_por_simbolo"]:
+        if entry.get("symbol", "").upper() == symbol.upper():
+            return (
+                float(entry.get("fci_score", 0.0)),
+                entry.get("symbol_capture_status", SymbolCaptureStatus.NO_CONFIABLE.value)
+            )
+    
+    return 0.0, SymbolCaptureStatus.NO_CONFIABLE.value
+
+def load_trend_persistence(symbol: str) -> float:
+    history_file = PROCESSED_DATA_DIR / "history" / "daily_history_30d.parquet"
+    if not history_file.exists(): 
+        return 0.0
+    try:
+        df = pd.read_parquet(history_file)
+        df_sym = df[df["symbol"] == symbol.upper()].sort_values(by="fecha")
+        if len(df_sym) < 5: 
+            return 0.0
+        returns = df_sym["daily_return"].tail(15).values
+        N = len(returns)
+        x = np.arange(N)
+        cov_matrix = np.cov(x, returns)
+        slope = cov_matrix[0, 1] / (np.var(x) + 1e-9)
+        direction = np.sign(slope)
+        if direction == 0: 
+            return 0.0
+        aligned_days = int(np.sum(np.sign(returns) == direction))
+        return round((aligned_days / N) * 100.0, 1)
+    except Exception: 
+        return 0.0
+
+def _check_portfolio_operable(portfolio_contract: Dict, style: str, symbol: str) -> bool:
+    try:
+        readiness = portfolio_contract.get('readiness_by_style', {})
+        style_data = readiness.get(style, {})
+        if style_data.get('status') != 'OPERABLE': 
+            return False
+        trio = style_data.get('trio', [])
+        return symbol.upper() in [s.upper() for s in trio]
+    except Exception: 
+        return False
+
+def build_feature_vector(symbol: str, fecha: str) -> Optional[Dict[str, Any]]:
+    symbol = symbol.upper()
+    df_state = load_market_state(symbol, fecha)
+    if df_state is None: 
+        return None
+    last_bar = df_state.iloc[-1]
+    
+    fci, capture_status = load_fci(symbol, fecha)
+    
+    from decision_config import PROCESSED_DATA_DIR, load_json_safe
+    readiness_cert_path = PROCESSED_DATA_DIR / "readiness" / f"readiness_certificate_{fecha}.json"
+    readiness_cert = load_json_safe(readiness_cert_path)
+    
+    readiness_status = MarketReadinessStatus.NOT_READY_DATA_GAP.value
+    readiness_scores = {}
+    if readiness_cert and readiness_cert.get("readiness_by_symbol"):
+        for entry in readiness_cert["readiness_by_symbol"]:
+            if entry.get("symbol", "").upper() == symbol.upper():
+                readiness_status = entry.get(
+                    "market_readiness_status", 
+                    MarketReadinessStatus.NOT_READY_DATA_GAP.value
+                )
+                readiness_scores = entry.get("readiness_scores", {})
+                break
+
+    anomaly_data = load_anomaly_report(symbol, fecha)
+    portfolio_contract = load_portfolio_contract(fecha)
+    readiness_data = load_readiness_report(symbol, fecha)
+    trend_persistence = load_trend_persistence(symbol)
+    spread_limit = SPREAD_LIMITS.get(symbol, SPREAD_LIMITS.get('DEFAULT', 30.0))
+
+    return {
+        'symbol': symbol, 
+        'fecha': fecha, 
+        'timestamp_generacion': datetime.now(timezone.utc).isoformat(),
+        'symbol_capture_status': capture_status,
+        'market_readiness_status': readiness_status,
+        'fci': fci,
+        'spread_mean': float(last_bar.get('spread_mean', 0.0)),
+        'spread_p95': float(last_bar.get('spread_p95', 0.0)),
+        'spread_cv': float(last_bar.get('spread_cv', 0.0)),
+        'tps_abs': float(last_bar.get('tps_abs', 0.0)),
+        'tps_effective': float(last_bar.get('tps_effective', 0.0)),
+        'realized_volatility': float(last_bar.get('realized_volatility', 0.0)),
+        'jitter_ms': float(last_bar.get('jitter_ms', 0.0)),
+        'quality_score_mean': float(last_bar.get('quality_score_mean', 100.0)),
+        'integrity_score': float(last_bar.get('integrity_score', 100.0)),
+        'minute_state': str(last_bar.get('minute_state', 'NORMAL')),
+        'burstiness': float(last_bar.get('burstiness', 1.0)),
+        'idle_ratio': float(last_bar.get('idle_ratio', 0.0)),
+        'quote_balance': float(last_bar.get('quote_balance', 0.0)),
+        'tick_count': int(last_bar.get('tick_count', 0)), 
+        'spread_limit': spread_limit,
+        'regime_duration_bars': int(last_bar.get('regime_duration_bars', 1)),
+        'regime_age_minutes': int(last_bar.get('regime_age_minutes', 0)),
+        'minutes_since_last_anomalous_minute': int(last_bar.get('minutes_since_last_anomalous_minute', 9999)),
+        'minutes_since_extreme_spread': int(last_bar.get('minutes_since_extreme_spread', 9999)),
+        'regime_transitions_count': int(last_bar.get('regime_transitions_count', 0)),
+        'liquidity_changes_count': int(last_bar.get('liquidity_changes_count', 0)),
+        'anomaly_score': anomaly_data.get('anomaly_score', 0.0),
+        'anomaly_classification': anomaly_data.get('classification_level', 'NORMAL'),
+        'anomaly_probability': anomaly_data.get('anomaly_probability', 0.0),
+        'trend_persistence': trend_persistence,
+        'readiness_scalping': float(readiness_data.get('readiness_by_style', {}).get('scalping', {}).get('readiness_score', 0.0)),
+        'readiness_intraday': float(readiness_data.get('readiness_by_style', {}).get('intraday', {}).get('readiness_score', 0.0)),
+        'readiness_swing': float(readiness_data.get('readiness_by_style', {}).get('swing', {}).get('readiness_score', 0.0)),
+        'status_scalping': readiness_data.get('readiness_by_style', {}).get('scalping', {}).get('status', 'VETOED'),
+        'status_intraday': readiness_data.get('readiness_by_style', {}).get('intraday', {}).get('status', 'VETOED'),
+        'status_swing': readiness_data.get('readiness_by_style', {}).get('swing', {}).get('status', 'VETOED'),
+        'portfolio_operable_scalping': _check_portfolio_operable(portfolio_contract, 'scalping', symbol),
+        'portfolio_operable_intraday': _check_portfolio_operable(portfolio_contract, 'intraday', symbol),
+        'portfolio_operable_swing': _check_portfolio_operable(portfolio_contract, 'swing', symbol),
+        'readiness_scores': readiness_scores,
+    }
+
+def save_feature_vector(fv: Dict[str, Any], fecha: str) -> bool:
+    symbol = fv['symbol']
+    output_dir = DECISION_WORKSPACE_DIR / "feature_vectors"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"fv_{symbol}_{fecha}.json"
+    try:
+        from contract_manager import save_contract_atomic
+        save_contract_atomic(fv, output_file)
+        logger.info(f"💾 {symbol}: FeatureVector guardado de forma atomica.")
+        return True
+    except Exception as e:
+        logger.error(f"❌ {symbol}: Error guardando FeatureVector: {e}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description="Feature Fusion V1.0")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    logger.info("=" * 80 + f"\n🔄 INICIANDO FUSION DE FEATURES - FECHA: {fecha}\n" + "=" * 80)
+    
+    success_count = 0
+    for symbol in SYMBOLS_TO_CAPTURE:
+        fv = build_feature_vector(symbol, fecha)
+        if fv is not None and save_feature_vector(fv, fecha): 
+            success_count += 1
+            
+    logger.info(f"📋 FUSION COMPLETA: {success_count}/{len(SYMBOLS_TO_CAPTURE)} feature vectors generados.")
+
+if __name__ == "__main__":
+    main()

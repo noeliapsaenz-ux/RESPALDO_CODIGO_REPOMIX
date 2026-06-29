@@ -1,0 +1,230 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+MULTIDIMENSIONAL ANOMALY - DETECTOR MULTIDIMENSIONAL DE ANOMALÍAS
+==========================================================================
+Ubicación: QUANT_ENGINE_03
+Dependencias: quant_config (paths, logging, symbols, settings)
+Responsabilidad: Detectar anomalías multidimensionales en el mercado
+                 utilizando MAD (Median Absolute Deviation) y EWMA.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección de ruta raíz
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+import os
+import json
+import math
+import argparse
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional, Tuple
+import pandas as pd
+import numpy as np
+
+# Importación desde quant_config
+from quant_config import (
+    OI_OUTPUT_DIR,
+    AUDIT_STATE_DIR,
+    AUDIT_REPORTES_DIR,
+    PROCESSED_DATA_DIR,
+    QUANT_ANOMALIES_DIR,
+    SYMBOLS_TO_QUANT,
+    get_fecha_broker_str,
+    NumpySafeEncoder,
+    init_quant_logging,
+    ANOMALY_CONFIG
+)
+
+# Inicializar logger
+logger = init_quant_logging("multidimensional_anomaly", "03_QUANT")
+
+
+class AnomalyDetectorV2:
+    def __init__(self, fecha: str):
+        self.fecha = fecha
+        self.historical_metrics_path = AUDIT_STATE_DIR / "anomaly_historical_metrics.parquet"
+        self.cold_start_score = 50.0
+        self.ewma_lambda = 0.92
+
+    def _calculate_mad_scaled(self, data: np.ndarray) -> Tuple[float, float]:
+        median = float(np.median(data))
+        absolute_deviations = np.abs(data - median)
+        mad = float(np.median(absolute_deviations))
+        mad_scaled = mad * 1.4826
+        return median, mad_scaled
+
+    def _calculate_p_value_analytical(self, z_score: float) -> float:
+        abs_z = abs(z_score)
+        cdf = 0.5 * (1.0 + math.erf(abs_z / math.sqrt(2.0)))
+        p_value = 2.0 * (1.0 - cdf)
+        return round(float(p_value), 6)
+
+    def _load_historical_windows(self, symbol: str) -> Dict[str, Tuple[float, float]]:
+        defaults = {"spread": (1.0, 0.5), "volatility": (1.0, 0.5), "stalls": (0.0, 1.0), "tps": (10.0, 5.0)}
+        if not self.historical_metrics_path.exists():
+            return defaults
+        try:
+            df = pd.read_parquet(self.historical_metrics_path)
+            df_sym = df[(df['symbol'] == symbol.upper()) & (df['fecha'] < self.fecha)]
+            if len(df_sym) < 7:
+                return defaults
+            profiles = {}
+            for col in ["spread", "volatility", "stalls", "tps"]:
+                if col in df_sym.columns:
+                    data = df_sym[col].dropna().values
+                    if len(data) >= 7:
+                        median, mad_scaled = self._calculate_mad_scaled(data)
+                        mad_scaled = max(0.0001, mad_scaled)
+                        profiles[col] = (median, mad_scaled)
+                    else:
+                        profiles[col] = defaults[col]
+            return profiles
+        except Exception as e:
+            logger.debug(f"Error cargando histórico, usando cold start: {e}")
+            return defaults
+
+    def evaluate_symbol_individual(self, symbol: str, current_metrics: Dict[str, float], fci: float) -> Dict[str, Any]:
+        symbol = symbol.upper()
+        profiles = self._load_historical_windows(symbol)
+        dimensions_breakdown = {}
+        z_scores = []
+
+        for dim, (median, mad_scaled) in profiles.items():
+            val = current_metrics.get(dim, median)
+            z_robust = (val - median) / mad_scaled
+            z_ewma = self.ewma_lambda * z_robust
+            dimensions_breakdown[dim] = {
+                "value": round(val, 4),
+                "median": round(median, 4),
+                "z_robust": round(z_ewma, 2),
+                "p_value": self._calculate_p_value_analytical(z_ewma)
+            }
+            z_scores.append(abs(z_ewma))
+
+        scores_centesimales = [min(100.0, max(0.0, z * 25.0)) for z in z_scores]
+        max_score = max(scores_centesimales) if scores_centesimales else 0.0
+        top3_avg = np.mean(sorted(scores_centesimales, reverse=True)[:3]) if scores_centesimales else 0.0
+        tension_count = sum(1 for z in z_scores if z > 1.5)
+        simultaneity_bonus = 10.0 if tension_count >= 2 else 0.0
+        
+        s_multi = 0.60 * max_score + 0.40 * top3_avg + simultaneity_bonus
+        s_multi = min(100.0, s_multi)
+        fci_factor = max(0.0, min(1.0, fci / 100.0))
+        s_final = s_multi * fci_factor
+
+        return {
+            "symbol": symbol,
+            "s_multi": round(s_multi, 2),
+            "s_final_raw": round(s_final, 2),
+            "fci_applied": fci,
+            "dimensions": dimensions_breakdown
+        }
+
+    def process_batch_portfolio(self, batch_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        elevated_count = sum(1 for item in batch_data if item["s_final_raw"] >= 50.0)
+        systemic_stress_active = elevated_count >= 3
+        multiplier = 1.25 if systemic_stress_active else 1.0
+        final_portfolio_outputs = []
+
+        for item in batch_data:
+            symbol = item["symbol"]
+            s_final_raw = item["s_final_raw"]
+            s_final_adjusted = min(100.0, s_final_raw * multiplier)
+            
+            if s_final_adjusted < 30.0:
+                classification = "NORMAL"
+            elif s_final_adjusted < 60.0:
+                classification = "ELEVATED"
+            elif s_final_adjusted < 85.0:
+                classification = "ANOMALOUS"
+            else:
+                classification = "EXTREME"
+
+            z_max = max(dim["z_robust"] for dim in item["dimensions"].values()) if item["dimensions"] else 0.0
+            anomaly_probability = 1.0 - self._calculate_p_value_analytical(z_max)
+
+            final_portfolio_outputs.append({
+                "symbol": symbol,
+                "anomaly_score": round(s_final_adjusted, 2),
+                "anomaly_probability": round(anomaly_probability, 4),
+                "classification_level": classification,
+                "systemic_stress_applied": systemic_stress_active,
+                "fci_applied": item["fci_applied"],
+                "dimensions": item["dimensions"]
+            })
+        return final_portfolio_outputs
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Anomaly Detector V2")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+
+    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
+    logger.info("=" * 80)
+    logger.info(f"🧠 INICIANDO DETECTOR DE ANOMALÍAS V2 — EN ESTADO REAL")
+    logger.info(f"   Fecha: {fecha}")
+    logger.info("=" * 80)
+
+    fase2_report_path = AUDIT_REPORTES_DIR / f"audit_certificate_{fecha}.json"
+    fci_map = {}
+    if fase2_report_path.exists():
+        try:
+            with open(fase2_report_path, "r", encoding="utf-8") as f:
+                f2_data = json.load(f)
+            for res in f2_data.get("certificados_por_simbolo", []):
+                fci_map[res["symbol"].upper()] = float(res.get("quality_mean", 95.0))
+        except Exception as e:
+            logger.warning(f"No se pudo leer el reporte de Fase 2 ({e}). Usando FCI por defecto.")
+
+    simulated_portfolio_input = []
+    detector = AnomalyDetectorV2(fecha)
+
+    for symbol in SYMBOLS_TO_QUANT:
+        symbol = symbol.upper()
+        state_file = PROCESSED_DATA_DIR / "market_state" / symbol / f"{symbol}_{fecha}_market_state.parquet"
+        
+        # Extracción segura de la información de mercado unificada diaria
+        if state_file.exists():
+            try:
+                df_state = pd.read_parquet(state_file)
+                spread_real = float(df_state["spread_mean"].mean())
+                vol_real = float(df_state["realized_volatility"].mean())
+                tps_real = float(df_state["tps_abs"].mean())
+            except Exception:
+                spread_real, vol_real, tps_real = 1.0, 1.0, 10.0
+        else:
+            spread_real, vol_real, tps_real = 1.0, 1.0, 10.0
+
+        current_metrics = {
+            "spread": spread_real,
+            "volatility": vol_real,
+            "stalls": 0.0,
+            "tps": tps_real
+        }
+        
+        fci_real = fci_map.get(symbol, 98.0)
+        ind_eval = detector.evaluate_symbol_individual(symbol, current_metrics, fci_real)
+        simulated_portfolio_input.append(ind_eval)
+
+    portfolio_outputs = detector.process_batch_portfolio(simulated_portfolio_input)
+    output_report_file = QUANT_ANOMALIES_DIR / f"anomaly_report_{fecha}.json"
+    output_report_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    stress_applied = portfolio_outputs[0]["systemic_stress_applied"] if portfolio_outputs else False
+
+    with open(output_report_file, "w", encoding="utf-8") as f:
+        json.dump(
+            {"fecha": fecha, "systemic_stress_detected": stress_applied, "results": portfolio_outputs},
+            f, indent=2, ensure_ascii=False, cls=NumpySafeEncoder
+        )
+    logger.info(f"💾 Reporte de anomalías guardado en: {output_report_file.name}")
+
+
+if __name__ == "__main__":
+    main()

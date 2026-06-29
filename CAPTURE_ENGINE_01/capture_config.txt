@@ -1,0 +1,97 @@
+"""
+==========================================================================
+CAPTURE_CONFIG - Configuración operativa del módulo de captura
+==========================================================================
+Ubicación: CAPTURE_ENGINE_01
+Dependencias: settings (BROKER_TZ, USAR_RAMDISK), paths (DYNAMIC_SYMBOL_CONFIG_PATH)
+Responsabilidad: Definir la lista de símbolos operables, límites de spread,
+                 tamaños de buffer por símbolo, y parámetros del demonio
+                 de compresión. Carga dinámica de configuraciones desde
+                 DYNAMIC_SYMBOL_CONFIG_PATH para ajustes en caliente.
+==========================================================================
+"""
+import json
+from datetime import datetime
+from pathlib import Path
+from settings import BROKER_TZ, USAR_RAMDISK
+from paths import DYNAMIC_SYMBOL_CONFIG_PATH
+
+# Universo de Símbolos Operables en Captura
+SYMBOLS_TO_CAPTURE = [
+    'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 
+    'NZDUSD', 'GBPJPY', 'EURJPY', 'CHFJPY', 'CADJPY'
+]
+
+# Límites Base de Spread por Símbolo (en Pips)
+SPREAD_LIMITS = {
+    'EURUSD': 20.0, 'GBPUSD': 25.0, 'USDJPY': 20.0, 'GBPJPY': 35.0, 
+    'USDCAD': 25.0, 'AUDUSD': 25.0, 'NZDUSD': 30.0, 'EURJPY': 25.0, 
+    'CHFJPY': 30.0, 'CADJPY': 30.0, 'DEFAULT': 25.0
+}
+
+# Límites de Tamaño de Búfer de Escritura de Memoria
+SYMBOL_CONFIG = {
+    'EURUSD': {'buffer_size': 5000}, 'GBPUSD': {'buffer_size': 5000},
+    'USDJPY': {'buffer_size': 5000}, 'GBPJPY': {'buffer_size': 4000},
+    'AUDUSD': {'buffer_size': 2000}, 'USDCAD': {'buffer_size': 2000},
+    'NZDUSD': {'buffer_size': 1500}, 'EURJPY': {'buffer_size': 3000},
+    'CHFJPY': {'buffer_size': 1500}, 'CADJPY': {'buffer_size': 1500},
+    'DEFAULT': {'buffer_size': 2000}
+}
+
+# Parámetros del Demonio de Compresión (Compuerta Forense)
+VERIFY_RAMDISK_SSD_MATCH = True
+QUARANTINE_SUFFIX = ".QUARANTINE_MISMATCH"
+
+
+# ==============================================================================
+# CARGA DINÁMICA DE CONFIGURACIÓN DESDE FEEDBACK
+# ==============================================================================
+if DYNAMIC_SYMBOL_CONFIG_PATH.exists():
+    try:
+        with open(DYNAMIC_SYMBOL_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            dynamic_cfg = json.load(f)
+            for sym, cfg in dynamic_cfg.items():
+                sym = sym.upper()
+                if sym not in SYMBOLS_TO_CAPTURE:
+                    continue
+                
+                # Sanitización de Límites de Spread (Mínimo 5.0 pips, Máximo 200.0 pips)
+                if "spread_limit_pips" in cfg:
+                    val = float(cfg["spread_limit_pips"])
+                    if 5.0 <= val <= 200.0:
+                        SPREAD_LIMITS[sym] = val
+                
+                # Sanitización de Búfer de persistencia (Factor mínimo 0.1x, Máximo 10.0x)
+                if "buffer_adjustment" in cfg and sym in SYMBOL_CONFIG:
+                    factor = float(cfg["buffer_adjustment"])
+                    if 0.1 <= factor <= 10.0:
+                        base_buffer = SYMBOL_CONFIG[sym].get('buffer_size', 2000)
+                        SYMBOL_CONFIG[sym]['buffer_size'] = int(base_buffer * factor)
+    except Exception:
+        pass
+
+
+def get_optimized_gc_interval() -> int:
+    return 60 if USAR_RAMDISK else 45
+
+def classify_session(hour: int) -> str:
+    if 6 <= hour < 14: return "LONDON"
+    elif 14 <= hour < 18: return "OVERLAP"
+    elif 18 <= hour < 22: return "NEW_YORK"
+    elif 22 <= hour < 24: return "CLOSED"
+    else: return "ASIA"
+
+def get_session_actual() -> str:
+    ahora = datetime.now(BROKER_TZ)
+    return classify_session(ahora.hour)
+
+def is_market_open() -> bool:
+    """Determina si el mercado está abierto según hora del broker."""
+    ahora = datetime.now(BROKER_TZ)
+    dia_semana = ahora.weekday()
+    if dia_semana == 5:  # Sábado
+        return False
+    if dia_semana == 6:  # Domingo
+        return ahora.hour >= 22
+    return True

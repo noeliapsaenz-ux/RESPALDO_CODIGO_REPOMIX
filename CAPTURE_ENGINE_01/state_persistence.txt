@@ -1,0 +1,284 @@
+"""
+==========================================================================
+STATE_PERSISTENCE - Persistencia y recuperación de estados
+==========================================================================
+Ubicación: CAPTURE_ENGINE_01
+Dependencias: paths (ACTIVE_DATA_DIR, STATE_DIR), settings (OPTIMIZACION)
+Responsabilidad: Almacenar y recuperar el estado de cada símbolo (secuencia,
+                 contadores, último tick) en archivos JSON. Incluye
+                 recuperación automática desde archivos JSONL si el
+                 estado en disco está corrupto o ausente.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección de ruta del directorio superior (Single Source of Truth)
+raiz_proyecto = Path(__file__).parent.parent.resolve()
+if str(raiz_proyecto) not in sys.path:
+    sys.path.insert(0, str(raiz_proyecto))
+
+import json
+import logging
+import os
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+# Importaciones directas (Independiente de config.py)
+from paths import ACTIVE_DATA_DIR, STATE_DIR
+from settings import OPTIMIZACION
+
+logger = logging.getLogger("system.state_manager")
+
+
+# ==============================================================================
+# FUNCIONES AUXILIARES
+# ==============================================================================
+
+def read_last_valid_seq(file_path: Path) -> Optional[int]:
+    try:
+        if not file_path.exists():
+            return None
+        file_size = file_path.stat().st_size
+        if file_size == 0:
+            return None
+        chunk_size = 4096
+        pos = file_size
+        remainder = b""
+        lines_bytes_buffer: List[bytes] = []
+        
+        with open(file_path, "rb") as f:
+            while pos > 0 and len(lines_bytes_buffer) < 30:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                raw_data = chunk + remainder
+                parts = raw_data.split(b"\n")
+                if pos > 0:
+                    remainder = parts[0]
+                    complete_parts = parts[1:]
+                else:
+                    remainder = b""
+                    complete_parts = parts
+                for part in reversed(complete_parts):
+                    if part.strip():
+                        lines_bytes_buffer.append(part)
+                if remainder.strip():
+                    lines_bytes_buffer.append(remainder)
+                    
+        for raw_line in lines_bytes_buffer:
+            try:
+                line_str = raw_line.decode("utf-8").strip()
+                if not line_str:
+                    continue
+                data = json.loads(line_str)
+                if isinstance(data, dict) and "seq" in data:
+                    seq_val = data["seq"]
+                    if isinstance(seq_val, int):
+                        return seq_val
+            except Exception:
+                continue
+        return None
+    except Exception as e:
+        logger.error(f"Error en búsqueda regresiva sobre {file_path.name}: {e}")
+        return None
+
+
+def read_last_valid_timestamp(file_path: Path) -> Optional[int]:
+    try:
+        if not file_path.exists() or file_path.stat().st_size == 0:
+            return None
+        chunk_size = 1024
+        file_size = file_path.stat().st_size
+        pos = max(0, file_size - chunk_size)
+        with open(file_path, "rb") as f:
+            f.seek(pos)
+            chunk = f.read()
+            parts = chunk.split(b"\n")
+            for part in reversed(parts):
+                if not part.strip():
+                    continue
+                try:
+                    line_str = part.decode("utf-8").strip()
+                    data = json.loads(line_str)
+                    if isinstance(data, dict) and "tm" in data:
+                        return int(data["tm"])
+                except Exception:
+                    continue
+        return None
+    except Exception as e:
+        logger.debug(f"No se pudo extraer el timestamp del archivo {file_path.name}: {e}")
+        return None
+
+
+# ==============================================================================
+# CLASE PRINCIPAL - SIN DEPENDENCIA DE CONFIG.PY
+# ==============================================================================
+
+class StateManager:
+    def __init__(self):
+        # Usar directamente las variables importadas desde paths y settings
+        self.state_dir = STATE_DIR
+        self.active_data_dir = ACTIVE_DATA_DIR
+        self.optimizacion = OPTIMIZACION
+            
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger("state_manager")
+        
+        if self.optimizacion == "aws":
+            self.max_state_age_days = 7
+        else:
+            self.max_state_age_days = 14
+
+    def save_symbol_state(self, symbol: str, state_data: Dict[str, Any]) -> bool:
+        try:
+            if "last_sequence" not in state_data:
+                raise ValueError(f"Falta el campo obligatorio 'last_sequence' al intentar persistir el estado de {symbol}")
+            state_file = self.state_dir / f"{symbol}_state.json"
+            temp_file = self.state_dir / f"{symbol}_state.tmp"
+            state_data["last_saved"] = datetime.now().isoformat()
+            state_data["saved_by"] = f"pid_{os.getpid()}"
+            state_data["environment"] = self.optimizacion
+            
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(state_data, f, indent=2, default=str)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            os.replace(temp_file, state_file)
+            return True
+        except Exception as e:
+            self.logger.error(f"Error crítico guardando estado de {symbol}: {e}")
+            return False
+
+    def load_symbol_state(self, symbol: str) -> Optional[Dict[str, Any]]:
+        state_file = self.state_dir / f"{symbol}_state.json"
+        if state_file.exists():
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    state_data = json.load(f)
+                if self._validate_state(state_data):
+                    return state_data
+            except Exception:
+                pass
+        
+        recovered_state = self._recover_from_jsonl(symbol)
+        if recovered_state:
+            self.save_symbol_state(symbol, recovered_state)
+            return recovered_state
+        return None
+
+    def _validate_state(self, state_data: Dict[str, Any]) -> bool:
+        required_fields = ["symbol", "total_ticks_accepted", "last_tick_msc", "last_sequence"]
+        for field in required_fields:
+            if field not in state_data:
+                return False
+        if state_data.get("total_ticks_accepted", 0) < 0:
+            return False
+        if state_data.get("last_sequence", 0) < 0:
+            return False
+        if state_data.get("last_tick_msc", 0) < 0:
+            return False
+        return True
+
+    def _recover_from_jsonl(self, symbol: str) -> Optional[Dict[str, Any]]:
+        symbol_dir = self.active_data_dir / symbol
+        if not symbol_dir.exists():
+            return None
+        jsonl_files = []
+        for date_dir in symbol_dir.iterdir():
+            if date_dir.is_dir():
+                jsonl_files.extend(date_dir.glob("*.jsonl"))
+        if not jsonl_files:
+            return None
+        jsonl_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        
+        for jsonl_file in jsonl_files[:3]:
+            try:
+                recovered_seq = read_last_valid_seq(jsonl_file)
+                last_tick_msc = read_last_valid_timestamp(jsonl_file)
+                if recovered_seq is not None and last_tick_msc is not None:
+                    return {
+                        "symbol": symbol,
+                        "last_tick_msc": last_tick_msc,
+                        "total_ticks_accepted": recovered_seq,
+                        "total_ticks_received": recovered_seq,
+                        "last_sequence": recovered_seq,
+                        "ticks_with_high_spread": 0,
+                        "queue_overflows": 0,
+                        "recovered_from_jsonl": True,
+                        "recovery_file": jsonl_file.name,
+                        "recovery_time": datetime.now().isoformat()
+                    }
+            except Exception:
+                continue
+        return None
+
+    def save_system_state(self, symbol: str, state: str, metrics: Dict[str, Any]) -> bool:
+        try:
+            state_file = self.state_dir / f"{symbol}_system_state.json"
+            temp_file = self.state_dir / f"{symbol}_system_state.tmp"
+            
+            data = {
+                "symbol": symbol,
+                "state": state,
+                "metrics": metrics,
+                "timestamp": time.time(),
+                "datetime": datetime.now().isoformat()
+            }
+            
+            with open(state_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            if temp_file.exists():
+                temp_file.unlink()
+            
+            return True
+        except Exception as e:
+            self.logger.error(f"Error guardando estado para {symbol}: {e}")
+            return False
+
+    def cleanup_old_states(self, max_age_days: Optional[int] = None) -> int:
+        if max_age_days is None:
+            max_age_days = self.max_state_age_days
+        if not self.state_dir.exists():
+            return 0
+        cutoff_time = time.time() - (max_age_days * 24 * 3600)
+        deleted_count = 0
+        
+        for state_file in self.state_dir.glob("*_state.json"):
+            try:
+                if state_file.stat().st_mtime < cutoff_time:
+                    state_file.unlink()
+                    deleted_count += 1
+            except Exception:
+                pass
+                
+        for tmp_file in self.state_dir.glob("*.tmp"):
+            try:
+                if time.time() - tmp_file.stat().st_mtime > 3600:
+                    tmp_file.unlink()
+                    deleted_count += 1
+            except Exception:
+                pass
+        return deleted_count
+
+    def get_system_status(self) -> Dict[str, Any]:
+        status = {
+            "last_global_save": None,
+            "state_dir_size_mb": 0.0,
+            "oldest_state_days": None,
+            "environment": self.optimizacion
+        }
+        if self.state_dir.exists():
+            total_size = sum(f.stat().st_size for f in self.state_dir.glob("*") if f.is_file())
+            status["state_dir_size_mb"] = total_size / (1024 * 1024)
+            state_files = list(self.state_dir.glob("*_state.json"))
+            if state_files:
+                mtimes = [f.stat().st_mtime for f in state_files]
+                status["oldest_state_days"] = (time.time() - min(mtimes)) / (24 * 3600)
+        return status

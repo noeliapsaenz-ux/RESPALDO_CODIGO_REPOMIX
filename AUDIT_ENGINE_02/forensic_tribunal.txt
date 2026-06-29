@@ -1,0 +1,223 @@
+"""
+==========================================================================
+FORENSIC TRIBUNAL - VALIDADOR CRIPTOGRÁFICO DE LA CADENA DE CUSTODIA
+==========================================================================
+Ubicación: AUDIT_ENGINE_02
+Dependencias: audit_config (paths, logging, telegram, settings)
+Responsabilidad: Comparar criptográficamente el Búnker (.gz) contra la
+                 Evidencia en SSD (.jsonl). Autorizar la purga del SSD
+                 ÚNICAMENTE si la integridad es del 100%.
+Regla de Oro: Si hay MISMATCH, NO BORRAR EL SSD. Alertar por Telegram.
+==========================================================================
+"""
+import os
+import sys
+import gzip
+import hashlib
+import time
+import json
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Tuple, Optional, Any, List
+
+# Inyección de ruta raíz
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+# Importación desde audit_config
+from audit_config import (
+    init_audit_logging,
+    ARCHIVE_SAFE_DIR,
+    SSD_EVIDENCE_DIR,
+    BROKER_TZ,
+    send_telegram_alert,
+    get_fecha_broker_str
+)
+
+# Importar constante DELETE_SSD_ON_PASS desde config principal por ahora
+# TODO: Mover esta constante a audit_config
+try:
+    from config import DELETE_SSD_ON_PASS
+except ImportError:
+    DELETE_SSD_ON_PASS = True
+
+
+class ArchiveValidator:
+    """
+    El Tribunal Forense. Audita la cadena de custodia post-compresión.
+    """
+
+    def __init__(self):
+        self.logger = init_audit_logging("archive_validator", "02_AUDIT")
+
+        self.stats = {
+            "total_evaluated": 0,
+            "pass_count": 0,
+            "fail_count": 0,
+            "pending_count": 0,
+            "bytes_purged": 0,
+            "errors": 0
+        }
+
+        self.logger.info("=" * 70)
+        self.logger.info("⚖️ ARCHIVE VALIDATOR V2 INICIALIZADO (TRIBUNAL FORENSE)")
+        self.logger.info(f"   Evidencia (SSD)   : {SSD_EVIDENCE_DIR}")
+        self.logger.info(f"   Búnker (SAFE)     : {ARCHIVE_SAFE_DIR}")
+        self.logger.info(f"   Auto-Purga SSD    : {'ACTIVA' if DELETE_SSD_ON_PASS else 'INACTIVA (Solo Reporte)'}")
+        self.logger.info("=" * 70)
+
+    def _calculate_file_hash(self, file_path: Path) -> str:
+        """Calcula SHA-256 de un archivo plano (JSONL en SSD)."""
+        sha = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(65536):
+                sha.update(chunk)
+        return sha.hexdigest()
+
+    def _calculate_gzip_inner_hash(self, gz_path: Path) -> str:
+        """Calcula SHA-256 del contenido DESCOMPRIMIDO dentro del GZIP."""
+        sha = hashlib.sha256()
+        try:
+            with gzip.open(gz_path, "rb") as f:
+                while chunk := f.read(65536):
+                    sha.update(chunk)
+            return sha.hexdigest()
+        except Exception as e:
+            self.logger.error(f"❌ Error fatal leyendo GZIP {gz_path.name}: {e}")
+            return ""
+
+    def _safe_unlink_with_retry(self, file_path: Path, max_retries: int = 5, delay: float = 0.5):
+        """Intenta borrar un archivo con reintentos (vital para Windows/NTFS)."""
+        for i in range(max_retries):
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+                return True
+            except PermissionError:
+                if i == max_retries - 1:
+                    self.logger.error(f"❌ Bloqueo de permisos persistente en {file_path.name}")
+                    return False
+                time.sleep(delay)
+            except Exception as e:
+                self.logger.error(f"Error inesperado al remover {file_path.name}: {e}")
+                return False
+        return False
+
+    def _find_matching_gz(self, ssd_jsonl_path: Path) -> Optional[Path]:
+        """
+        Dada la ruta de un JSONL en SSD_EVIDENCE, construye la ruta esperada
+        de su contraparte .gz en ARCHIVE_SAFE.
+        """
+        try:
+            rel_path = ssd_jsonl_path.relative_to(SSD_EVIDENCE_DIR)
+            gz_path = ARCHIVE_SAFE_DIR / rel_path.parent / (rel_path.name + ".gz")
+            return gz_path if gz_path.exists() else None
+        except ValueError:
+            return None
+
+    def run_forensic_audit(self) -> Dict[str, Any]:
+        """
+        Escanea toda la Zona 2 (SSD_EVIDENCE) buscando archivos .jsonl.
+        Para cada uno, busca su par en el Búnker y ejecuta la validación.
+        """
+        self.logger.info("🔍 Iniciando escaneo forense de la Evidencia en SSD...")
+
+        if not SSD_EVIDENCE_DIR.exists():
+            self.logger.warning("⚠️ El directorio de evidencia SSD no existe. Nada que auditar.")
+            return self.stats
+
+        ssd_files = list(SSD_EVIDENCE_DIR.rglob("*.jsonl"))
+
+        if not ssd_files:
+            self.logger.info("✅ No hay archivos JSONL pendientes en SSD. El buffer forense está limpio.")
+            return self.stats
+
+        self.logger.info(f"📦 Encontrados {len(ssd_files)} archivos de evidencia en SSD para validar.")
+
+        for ssd_file in ssd_files:
+            self.stats["total_evaluated"] += 1
+            symbol = ssd_file.parent.parent.name
+            date_dir = ssd_file.parent.name
+
+            gz_file = self._find_matching_gz(ssd_file)
+
+            if not gz_file:
+                self.stats["pending_count"] += 1
+                self.logger.debug(f"⏳ PENDIENTE: {ssd_file.name} aún no tiene contraparte en el Búnker.")
+                continue
+
+            self.logger.info(f"⚖️ Evaluando par: {ssd_file.name} vs {gz_file.name}")
+            ssd_hash = self._calculate_file_hash(ssd_file)
+            gz_inner_hash = self._calculate_gzip_inner_hash(gz_file)
+
+            if not gz_inner_hash:
+                self.stats["errors"] += 1
+                self.logger.error(f"❌ ERROR: No se pudo leer el GZIP {gz_file.name}. Evidencia SSD preservada.")
+                continue
+
+            if ssd_hash == gz_inner_hash:
+                self.stats["pass_count"] += 1
+                self.logger.info(f"✅ PASS: Hash idéntico ({ssd_hash[:16]}). Cadena de custodia íntegra.")
+
+                if DELETE_SSD_ON_PASS:
+                    file_size = ssd_file.stat().st_size
+                    if self._safe_unlink_with_retry(ssd_file):
+                        self.stats["bytes_purged"] += file_size
+                        self.logger.info(f"🧹 PURGA AUTORIZADA: Evidencia SSD eliminada ({file_size / 1024:.1f} KB liberados).")
+                    else:
+                        self.logger.error(f"❌ FALLO DE PURGA: Windows bloqueó el borrado de {ssd_file.name}.")
+                else:
+                    self.logger.debug(f"💾 Evidencia SSD conservada (Auto-purga desactivada).")
+
+            else:
+                self.stats["fail_count"] += 1
+                error_msg = (
+                    f"🚨 ALERTA TRIBUNAL FORENSE 🚨\n"
+                    f"MISMATCH DETECTADO en {symbol} ({date_dir}).\n"
+                    f"Archivo: {ssd_file.name}\n"
+                    f"SSD Hash: {ssd_hash[:16]}\n"
+                    f"GZ  Hash: {gz_inner_hash[:16]}\n"
+                    f"ACCIÓN: Evidencia SSD PRESERVADA para análisis manual."
+                )
+                self.logger.critical(error_msg)
+
+                try:
+                    send_telegram_alert(error_msg)
+                except Exception:
+                    pass
+
+        return self.stats
+
+    def print_executive_summary(self):
+        """Imprime el resumen ejecutivo del tribunal."""
+        self.logger.info("=" * 70)
+        self.logger.info("📊 RESUMEN EJECUTIVO DEL TRIBUNAL FORENSE")
+        self.logger.info("=" * 70)
+        self.logger.info(f"  Evaluados de forma global   : {self.stats['total_evaluated']}")
+        self.logger.info(f"  Integridad validada (PASS)  : {self.stats['pass_count']}")
+        self.logger.info(f"  Discrepancias (FAIL)        : {self.stats['fail_count']}")
+        self.logger.info(f"  Pendientes de compresión    : {self.stats['pending_count']}")
+        self.logger.info(f"  Errores de I/O              : {self.stats['errors']}")
+
+        mb_purged = self.stats['bytes_purged'] / (1024 * 1024)
+        self.logger.info(f"  Espacio SSD liberado        : {mb_purged:.2f} MB")
+        self.logger.info("=" * 70)
+
+        if self.stats['fail_count'] > 0:
+            self.logger.critical("🚨 ALERTA CRÍTICA: Discrepancias detectadas. Revisar Telegram y SSD.")
+        else:
+            self.logger.info("💡 CONCORDANCIA COMPLETA: Toda la evidencia procesada es idéntica al Búnker.")
+
+
+def main():
+    validator = ArchiveValidator()
+    validator.run_forensic_audit()
+    validator.print_executive_summary()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 Validación cancelada por el operador.")

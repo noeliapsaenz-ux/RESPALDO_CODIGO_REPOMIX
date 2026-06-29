@@ -1,0 +1,118 @@
+"""
+==========================================================================
+BUFFER_SLOPE_MONITOR - Monitor de pendiente y aceleración del buffer
+==========================================================================
+Ubicación: CAPTURE_ENGINE_01
+Dependencias: logging, collections
+Responsabilidad: Calcular la tasa de cambio (pendiente) del buffer de
+                 persistencia mediante regresión lineal, detectar
+                 aceleraciones y predecir tiempos de overflow.
+==========================================================================
+"""
+import time
+import logging
+from collections import deque
+from typing import Dict, Any, Optional
+
+class SlopeMonitor:
+    """
+    Monitor predictivo de tasa de cambio (pendiente) del búfer de persistencia.
+    Implementa regresión lineal por mínimos cuadrados alineada a nivel de bytes
+    y protegida contra cancelación catastrófica de punto flotante.
+    """
+    def __init__(self, symbol: str, window_size: int = 10):
+        self.symbol = symbol.upper()
+        self.logger = logging.getLogger(f"slope.{self.symbol}")
+        self.window_size = window_size
+        self._measurements = deque(maxlen=window_size)
+        self._slope_history = deque(maxlen=100)
+        self._current_slope = 0.0
+        self._acceleration = 0.0
+        self._trend = 'STABLE'
+        self.SLOPE_WARNING = 5.0
+        self.SLOPE_CRITICAL = 20.0
+        self.logger.info(f"✅ SlopeMonitor iniciado para {self.symbol} (Ventana: {window_size})")
+
+    def add_measurement(self, buffer_size: int, timestamp: Optional[float] = None):
+        if timestamp is None:
+            timestamp = time.time()
+        self._measurements.append({'time': timestamp, 'size': buffer_size})
+        if len(self._measurements) >= 2:
+            self._calculate_slope()
+
+    def _calculate_slope(self):
+        """
+        Calcula la pendiente utilizando mínimos cuadrados ordinarios.
+        Centra los timestamps en t_0 para prevenir la cancelación catastrófica de float64.
+        """
+        if len(self._measurements) < 2:
+            return
+            
+        # Centrar los tiempos restando el primer elemento de la ventana (t_0)
+        t_0 = self._measurements[0]['time']
+        
+        times = [m['time'] - t_0 for m in self._measurements]
+        sizes = [m['size'] for m in self._measurements]
+        
+        n = len(times)
+        sum_t = sum(times)
+        sum_s = sum(sizes)
+        sum_tt = sum(t * t for t in times)
+        sum_ts = sum(t * s for t, s in zip(times, sizes))
+        
+        denominator = n * sum_tt - sum_t * sum_t
+        
+        # Si no hay variación de tiempo significativa, omitimos la división
+        if denominator == 0:
+            return
+            
+        slope = (n * sum_ts - sum_t * sum_s) / denominator
+        self._slope_history.append(slope)
+        self._current_slope = slope
+        
+        if len(self._slope_history) >= 2:
+            self._acceleration = self._slope_history[-1] - self._slope_history[-2]
+            
+        if abs(slope) < 1.0:
+            self._trend = 'STABLE'
+        elif slope > 0:
+            self._trend = 'RISING'
+        else:
+            self._trend = 'FALLING'
+
+    def get_slope(self) -> float:
+        return self._current_slope
+
+    def get_acceleration(self) -> float:
+        return self._acceleration
+
+    def get_trend(self) -> str:
+        return self._trend
+
+    def get_risk_level(self) -> str:
+        slope = abs(self._current_slope)
+        if slope < self.SLOPE_WARNING:
+            return 'LOW'
+        elif slope < self.SLOPE_CRITICAL:
+            return 'MEDIUM' if self._acceleration > 0 else 'LOW'
+        else:
+            return 'CRITICAL' if self._acceleration > 0 else 'HIGH'
+
+    def predict_overflow(self, current_buffer_size: int, max_buffer_size: int) -> Optional[float]:
+        slope = self._current_slope
+        if slope <= 0:
+            return None
+        remaining = max_buffer_size - current_buffer_size
+        if remaining <= 0:
+            return 0.0
+        time_to_overflow = remaining / slope
+        return time_to_overflow if time_to_overflow < 60 else None
+
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            'symbol': self.symbol,
+            'current_slope': self._current_slope,
+            'acceleration': self._acceleration,
+            'trend': self._trend,
+            'risk_level': self.get_risk_level()
+        }

@@ -1,0 +1,55 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+HYPOTHESIS_CONDITIONS - Registro de condiciones para hipotesis
+==========================================================================
+Ubicacion: DECISION_ENGINE_04/hypothesis_conditions.py
+Dependencias: Ninguna
+Responsabilidad: Almacenar la logica booleana discreta y las reglas de validacion
+                 para determinar la idoneidad tactica de los entornos operativos
+                 (Scalping, Intraday, Swing) en base a Feature Vectors.
+==========================================================================
+"""
+from typing import Dict, Any, Callable, Optional
+
+def check_stable_spread(fv: Dict[str, Any]) -> bool:
+    return float(fv.get("minutes_since_extreme_spread", 120.0)) >= 60.0
+
+def check_no_anomalies(fv: Dict[str, Any]) -> bool:
+    return float(fv.get("minutes_since_last_anomalous_minute", 120.0)) >= 60.0
+
+def check_strong_trend(fv: Dict[str, Any]) -> bool:
+    return float(fv.get("trend_persistence", 0.0)) >= 65.0
+
+def check_established_regime(fv: Dict[str, Any]) -> bool:
+    return int(fv.get("regime_duration_bars", 0)) >= 10
+
+def check_low_transitions(fv: Dict[str, Any]) -> bool:
+    return int(fv.get("regime_transitions_count", 0)) <= 3
+
+def check_high_fci(fv: Dict[str, Any]) -> bool:
+    return float(fv.get("fci", 0.0)) >= 85.0
+
+def check_scalping_conditions(fv: Dict[str, Any]) -> bool:
+    return check_stable_spread(fv) and check_high_fci(fv)
+
+def check_intraday_conditions(fv: Dict[str, Any]) -> bool:
+    return check_no_anomalies(fv) and float(fv.get("trend_persistence", 0.0)) >= 50.0
+
+def check_swing_conditions(fv: Dict[str, Any]) -> bool:
+    return check_established_regime(fv) and check_strong_trend(fv)
+
+CONDITION_REGISTRY: Dict[str, Callable[[Dict[str, Any]], bool]] = {
+    "check_stable_spread": check_stable_spread,
+    "check_no_anomalies": check_no_anomalies,
+    "check_strong_trend": check_strong_trend,
+    "check_established_regime": check_established_regime,
+    "check_low_transitions": check_low_transitions,
+    "check_high_fci": check_high_fci,
+    "check_scalping_conditions": check_scalping_conditions,
+    "check_intraday_conditions": check_intraday_conditions,
+    "check_swing_conditions": check_swing_conditions,
+}
+
+def get_condition_function(name: str) -> Optional[Callable[[Dict[str, Any]], bool]]:
+    return CONDITION_REGISTRY.get(name)

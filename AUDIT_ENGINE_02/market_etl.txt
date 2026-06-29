@@ -1,0 +1,287 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+MARKET ETL - COMPILADOR DE MAESTROS Y GOLD V2.1
+==========================================================================
+Ubicación: AUDIT_ENGINE_02
+Dependencias: audit_config (paths, symbols, logging, validation)
+Responsabilidad: Compilar Parquets Maestros y Gold a partir de JSONL/JSONL.GZ
+                 con enriquecimiento de features y certificación de calidad.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección de ruta raíz
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+import json
+import gzip
+import argparse
+from datetime import datetime, timezone
+import pandas as pd
+import numpy as np
+
+# Importación desde audit_config
+from audit_config import (
+    ARCHIVE_SAFE_DIR,
+    SSD_EVIDENCE_DIR,
+    AUDIT_MAESTROS_DIR,
+    AUDIT_GOLD_DIR,
+    SYMBOLS_TO_AUDIT,
+    SPREAD_LIMITS,
+    BROKER_TZ,
+    init_audit_logging,
+    classify_session,
+    PROCESSED_DATA_DIR,
+    STRUCTURE_VALIDATION,
+    BIT_REVERSED_SPREAD,
+    BIT_WIDE_SPREAD,
+    BIT_STALE_TICK,
+    BIT_CLOCK_SYNC,
+    BIT_ZERO_SPREAD,
+    BIT_DUPLICATE_SEQ
+)
+
+# Inicializar logger
+logger = init_audit_logging("market_etl", "02_AUDIT")
+
+# Obtener esquemas de STRUCTURE_VALIDATION
+MAESTRO_SCHEMA_V2 = STRUCTURE_VALIDATION.get("maestro_schema_v2", [])
+GOLD_SCHEMA_V2 = STRUCTURE_VALIDATION.get("gold_schema_v2", [])
+
+
+def generar_parquet_gold(symbol: str, fecha: str, df_maestro: pd.DataFrame) -> bool:
+    """
+    Construye el Parquet GOLD a partir del Maestro.
+    Filtra físicamente los duplicados, pero conserva el flag de evidencia.
+
+    Args:
+        symbol: Símbolo
+        fecha: Fecha en formato YYYYMMDD
+        df_maestro: DataFrame Maestro
+
+    Returns:
+        bool: True si se generó correctamente
+    """
+    if df_maestro.empty:
+        return False
+
+    logger.info(f"✨ {symbol}: Construyendo Parquet GOLD certificado (Esquema V2)...")
+
+    # Eliminar duplicados físicos para análisis cuantitativo limpio
+    df_gold = df_maestro.drop_duplicates(subset=["seq"], keep="first").copy()
+
+    # Evaluación de Calidad Vectorial
+    limit = SPREAD_LIMITS.get(symbol, SPREAD_LIMITS.get('DEFAULT', 30.0))
+    spreads = df_gold['spread_pips'].values
+    bids = df_gold['bid'].values
+    asks = df_gold['ask'].values
+
+    scores = np.ones(len(df_gold)) * 100.0
+    bitmask = np.zeros(len(df_gold), dtype=np.uint8)
+
+    # Detección de condiciones anómalas
+    reversed_mask = bids >= asks
+    zero_spread_mask = spreads <= 0
+    wide_spread_mask = (spreads > limit) & (~reversed_mask) & (~zero_spread_mask)
+
+    # Cotización congelada (stale)
+    stale_cond = (df_gold['delta_bid'] == 0) & (df_gold['delta_ask'] == 0)
+    if len(stale_cond) > 0:
+        stale_cond.iloc[0] = False
+
+    clock_cond = df_gold['clock_sync_issue'].values
+    dup_cond = df_gold['duplicate_tick'].values
+
+    # Construcción de la Máscara de Bits
+    bitmask |= np.where(reversed_mask, BIT_REVERSED_SPREAD, 0).astype(np.uint8)
+    bitmask |= np.where(wide_spread_mask, BIT_WIDE_SPREAD, 0).astype(np.uint8)
+    bitmask |= np.where(stale_cond, BIT_STALE_TICK, 0).astype(np.uint8)
+    bitmask |= np.where(clock_cond, BIT_CLOCK_SYNC, 0).astype(np.uint8)
+    bitmask |= np.where(zero_spread_mask, BIT_ZERO_SPREAD, 0).astype(np.uint8)
+    bitmask |= np.where(dup_cond, BIT_DUPLICATE_SEQ, 0).astype(np.uint8)
+
+    # Cálculo dinámico del Quality Score
+    scores[reversed_mask | zero_spread_mask] = 20.0
+    scores[wide_spread_mask] = np.clip(100.0 - (spreads[wide_spread_mask] - limit) * 3.0, 10.0, 100.0)
+    scores[stale_cond & (~reversed_mask)] -= 5.0
+    scores[clock_cond & (~reversed_mask)] -= 10.0
+    scores[dup_cond & (~reversed_mask)] -= 15.0
+
+    df_gold['quality_score'] = np.clip(scores, 0.0, 100.0).round(1)
+    df_gold['quality_flags'] = bitmask
+
+    # Asegurar orden exacto de columnas del esquema GOLD V2
+    df_gold = df_gold[GOLD_SCHEMA_V2]
+
+    # Guardar archivo certificado
+    AUDIT_GOLD_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = AUDIT_GOLD_DIR / f"{symbol}_{fecha}_gold.parquet"
+
+    try:
+        df_gold.to_parquet(output_path, index=False)
+        logger.info(f"✨ {symbol}: Parquet GOLD V2 guardado con éxito ({len(df_gold):,} ticks limpios).")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error escribiendo Parquet GOLD para {symbol}: {e}")
+        return False
+
+
+def compilar_parquet_maestro(symbol: str, fecha: str) -> bool:
+    """
+    Compila el Parquet Maestro para un símbolo y fecha.
+
+    Args:
+        symbol: Símbolo
+        fecha: Fecha en formato YYYYMMDD
+
+    Returns:
+        bool: True si se compiló correctamente
+    """
+    symbol = symbol.upper()
+    safe_dir = ARCHIVE_SAFE_DIR / symbol / fecha
+    ssd_dir = SSD_EVIDENCE_DIR / symbol / fecha
+    historic_compressed_dir = PROCESSED_DATA_DIR / "compressed" / symbol / fecha
+
+    sources = []
+    if safe_dir.exists():
+        sources = sorted(list(safe_dir.glob("*.jsonl.gz")))
+    if not sources and historic_compressed_dir.exists():
+        sources = sorted(list(historic_compressed_dir.glob("*.jsonl.gz")))
+    if not sources and ssd_dir.exists():
+        sources = sorted(list(ssd_dir.glob("*.jsonl")))
+
+    if not sources:
+        logger.warning(f"⚠️ {symbol}: Sin archivos origen para compilar el {fecha}.")
+        return False
+
+    logger.info(f"📂 {symbol}: Leyendo y normalizando {len(sources)} archivos de entrada...")
+
+    rows = []
+    for fp in sources:
+        try:
+            open_func = gzip.open(fp, "rt", encoding="utf-8", errors="ignore") if fp.suffix == ".gz" else open(fp, "r", encoding="utf-8", errors="ignore")
+            with open_func as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        tick = json.loads(line)
+                        tm = tick.get("tm")
+                        if tm is not None:
+                            bid = float(tick.get("b", 0.0) if tick.get("b") is not None else tick.get("bid", 0.0))
+                            ask = float(tick.get("a", 0.0) if tick.get("a") is not None else tick.get("ask", 0.0))
+                            spread = float(tick.get("sp", 0.0) if tick.get("sp") is not None else tick.get("spread", 0.0))
+                            raw_spread = float(tick.get("rs", 0.0) if tick.get("rs") is not None else spread)
+                            mid_price = float(tick.get("mp", (bid + ask) * 0.5) if tick.get("mp") is not None else (bid + ask) * 0.5)
+                            volume = float(tick.get("v", 0.0) if tick.get("v") is not None else tick.get("volume", 0.0))
+                            flags_mt5 = int(tick.get("f", 0) if tick.get("f") is not None else tick.get("flags", 0))
+                            recv_ts = tick.get("recv_ts")
+
+                            rows.append({
+                                "time": int(tm // 1000),
+                                "time_msc": int(tm),
+                                "recv_ts": int(recv_ts) if recv_ts is not None else int(tm),
+                                "bid": bid,
+                                "ask": ask,
+                                "mid_price": mid_price,
+                                "spread_pips": spread,
+                                "raw_spread_pips": raw_spread,
+                                "volume": volume,
+                                "flags_mt5": flags_mt5,
+                                "seq": int(tick.get("seq", 0))
+                            })
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"Error procesando {fp.name}: {e}")
+
+    if not rows:
+        logger.warning(f"⚠️ {symbol}: Datos insuficientes para procesar.")
+        return False
+
+    # Convertir a DataFrame primario
+    df = pd.DataFrame(rows)
+    df = df.sort_values(by=["time_msc", "seq"]).reset_index(drop=True)
+
+    # Detección y Marcado de Duplicados de Secuencia
+    df["duplicate_tick"] = df.duplicated(subset=["seq"], keep=False)
+    df["duplicate_group"] = np.where(df["duplicate_tick"], df["seq"], 0)
+
+    # Autocalibración de Latencia de Red
+    median_diff_ms = np.median(df['time_msc'] - df['recv_ts'])
+    offset_hours = round(median_diff_ms / 3600000.0)
+    offset_ms = offset_hours * 3600000.0
+
+    adjusted_tm = df['time_msc'] - offset_ms
+    latency = df['recv_ts'] - adjusted_tm
+
+    df['clock_sync_issue'] = latency < 0
+    df['latency_ms'] = np.where(df['clock_sync_issue'], 0, latency).astype(int)
+
+    # Datos de Tiempo
+    dt_broker = pd.to_datetime(df['time_msc'], unit='ms', utc=False)
+    dt_utc = pd.to_datetime(df['recv_ts'], unit='ms', utc=True)
+
+    df['broker_hour'] = dt_broker.dt.hour
+    df['utc_hour'] = dt_utc.dt.hour
+    df['weekday'] = dt_utc.dt.weekday
+    df['session'] = df['broker_hour'].apply(classify_session)
+
+    # Cálculo Vectorial de Deltas y Velocidades
+    df['tick_interval_ms'] = df['time_msc'].diff().fillna(0).astype(int)
+    df['delta_bid'] = df['bid'].diff().fillna(0.0)
+    df['delta_ask'] = df['ask'].diff().fillna(0.0)
+    df['delta_mid'] = df['mid_price'].diff().fillna(0.0)
+    df['delta_spread'] = df['spread_pips'].diff().fillna(0.0)
+    df['delta2_spread'] = df['delta_spread'].diff().fillna(0.0)
+
+    # Clasificación del Tipo de Actualización de Cotización
+    bid_changed = df['delta_bid'] != 0.0
+    ask_changed = df['delta_ask'] != 0.0
+    df['quote_update_type'] = np.select(
+        [bid_changed & ask_changed, bid_changed, ask_changed],
+        [3, 1, 2],
+        default=0
+    ).astype(np.uint8)
+
+    # Asegurar consistencia del esquema Maestro V2
+    df = df[MAESTRO_SCHEMA_V2]
+
+    # Guardar Parquet Maestro
+    AUDIT_MAESTROS_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = AUDIT_MAESTROS_DIR / f"ticks_maestro_{symbol}_{fecha}.parquet"
+
+    try:
+        df.to_parquet(output_path, index=False)
+        logger.info(f"✅ {symbol}: Parquet Maestro V2 unificado ({len(df):,} ticks) guardado.")
+
+        # Generar Parquet GOLD V2
+        generar_parquet_gold(symbol, fecha, df)
+        return True
+    except Exception as e:
+        logger.critical(f"❌ Error guardando Parquet Maestro para {symbol}: {e}")
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Market ETL - Compilador de Maestros & GOLD V2.1")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+
+    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    logger.info(f"🏭 Iniciando Feature Engine Nivel 0 (ETL Maestros V2) para la fecha: {fecha}")
+
+    compilados = sum(1 for s in SYMBOLS_TO_AUDIT if compilar_parquet_maestro(s, fecha))
+
+    if compilados == 0:
+        logger.warning("⚠️ No se generó ningún archivo maestro.")
+    else:
+        logger.info(f"🏭 Fin de compilación. {compilados}/{len(SYMBOLS_TO_AUDIT)} contratos de datos estandarizados en V2.")
+
+
+if __name__ == "__main__":
+    main()

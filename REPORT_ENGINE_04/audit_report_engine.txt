@@ -1,0 +1,854 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+AUDIT REPORT ENGINE - GENERADOR DE INFORME EJECUTIVO EN WORD (FASE 2)
+==========================================================================
+Ubicación: REPORT_ENGINE_04
+Dependencias: audit_config (paths, symbols, logging, contracts)
+Responsabilidad: Compilar los datos de auditoría forense de Fase 2 y
+                 generar el reporte Word (.docx) en la Zona 4 (AUDIT_WORKSPACE).
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección dinámica de la carpeta raíz del proyecto
+root_path = Path(__file__).resolve().parent.parent
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+# Inyección dinámica de la carpeta AUDIT_ENGINE_02
+# Esto permite que 'audit_contracts.py' pueda resolver 'from audit_config import ...' sin errores
+audit_engine_path = root_path / "AUDIT_ENGINE_02"
+if audit_engine_path.exists() and str(audit_engine_path) not in sys.path:
+    sys.path.insert(0, str(audit_engine_path))
+
+import os
+import json
+import argparse
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List, Tuple
+
+# Importaciones desde el espacio de nombres de auditoría (ahora seguras)
+from AUDIT_ENGINE_02.audit_config import (
+    AUDIT_REPORTES_DIR,
+    AUDIT_FLOW_DIR,
+    AUDIT_LINEAGE_DIR,
+    AUDIT_STATE_DIR,
+    SYMBOLS_TO_AUDIT,
+    get_fecha_broker_str,
+    init_audit_logging,
+    send_telegram_alert,
+    load_contract_safe,
+    save_contract_atomic,
+    BROKER_TZ
+)
+
+# Importación desde audit_contracts
+from AUDIT_ENGINE_02.audit_contracts import (
+    load_json_safe,
+    resolve_target_date
+)
+
+# Importación desde config para DEEPSEEK (mantener hasta migrar)
+try:
+    from config import DEEPSEEK_ENABLED, DEEPSEEK_API_KEY
+except ImportError:
+    DEEPSEEK_ENABLED = False
+    DEEPSEEK_API_KEY = ""
+
+# Inicializar logger
+logger = init_audit_logging("audit_report_engine", "04_REPORT")
+
+# Verificar disponibilidad de python-docx
+try:
+    from docx import Document
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+    logger.warning("⚠️ python-docx no instalado. Los reportes Word no estarán disponibles.")
+
+# Paleta corporativa
+NAVY = RGBColor(0x1F, 0x38, 0x64)
+BLUE = RGBColor(0x2E, 0x75, 0xB6)
+GREEN = RGBColor(0x2E, 0x7D, 0x32)
+AMBER = RGBColor(0xB8, 0x86, 0x0B)
+RED = RGBColor(0xC0, 0x39, 0x2B)
+GRAY = RGBColor(0x59, 0x59, 0x59)
+
+FILL_LIGHTGREEN = "E8F5E9"
+FILL_LIGHTRED = "FBEAEA"
+FILL_LIGHTAMBER = "FFF3E0"
+FILL_NAVY = "1F3864"
+FILL_LIGHTGRAY = "F2F2F2"
+FILL_WHITE = "FFFFFF"
+
+UMBRAL_SEQ_LOSS_ALERTA = 4.0
+UMBRAL_SPREAD_P95_ALERTA = 5.0
+UMBRAL_FCI_BAJO = 85.0
+
+
+# ==========================================================================
+# HELPERS DE INYECCIÓN XML DE WORD
+# ==========================================================================
+def _insert_in_tcpr_order(tc_pr, new_el, tag_name: str):
+    order = [
+        "cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders",
+        "shd", "noWrap", "tcMar", "textDirection", "tcFitText", "vAlign", "hideMark"
+    ]
+    idx_target = order.index(tag_name)
+    anchor = None
+    for tag in reversed(order[:idx_target]):
+        found = tc_pr.find(qn(f"w:{tag}"))
+        if found is not None:
+            anchor = found
+            break
+    if anchor is not None:
+        anchor.addnext(new_el)
+    else:
+        tc_pr.insert(0, new_el)
+
+
+def _set_cell_background(cell, hex_color: str):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_color)
+    _insert_in_tcpr_order(tc_pr, shd, "shd")
+
+
+def _set_cell_borders(cell, color: str = "D9D9D9", size: int = 4):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    borders = OxmlElement("w:tcBorders")
+    for edge in ("top", "start", "bottom", "end"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), str(size))
+        el.set(qn("w:color"), color)
+        borders.append(el)
+    _insert_in_tcpr_order(tc_pr, borders, "tcBorders")
+
+
+def _set_cell_margins(cell, top=60, bottom=60, left=100, right=100):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    mar = OxmlElement("w:tcMar")
+    for edge, val in (("top", top), ("start", left), ("bottom", bottom), ("end", right)):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:w"), str(val))
+        el.set(qn("w:type"), "dxa")
+        mar.append(el)
+    _insert_in_tcpr_order(tc_pr, mar, "tcMar")
+
+
+def _style_run(run, size=11, bold=False, italic=False, color: Optional[RGBColor] = None, font="Calibri"):
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.italic = italic
+    run.font.name = font
+    if color is not None:
+        run.font.color.rgb = color
+    return run
+
+
+def _write_cell(cell, text, size=10, bold=False, color: Optional[RGBColor] = None,
+                align=WD_ALIGN_PARAGRAPH.CENTER, fill: Optional[str] = None, vertical_center=True):
+    cell.text = ""
+    p = cell.paragraphs[0]
+    p.alignment = align
+    run = p.add_run(str(text))
+    _style_run(run, size=size, bold=bold, color=color)
+    if fill:
+        _set_cell_background(cell, fill)
+    _set_cell_borders(cell)
+    _set_cell_margins(cell)
+    if vertical_center:
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    return cell
+
+
+def _add_heading(doc, text, level=1):
+    h = doc.add_heading(text, level=level)
+    for run in h.runs:
+        run.font.name = "Calibri"
+        run.font.color.rgb = NAVY if level == 1 else BLUE
+    return h
+
+
+def _add_paragraph(doc, text, size=11, italic=False, color: Optional[RGBColor] = None,
+                   bold=False, space_after=8):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_after = Pt(space_after)
+    run = p.add_run(text)
+    _style_run(run, size=size, italic=italic, color=color, bold=bold)
+    return p
+
+
+def _add_bullet(doc, text, bold=False, color: Optional[RGBColor] = None, size=11):
+    p = doc.add_paragraph(style="List Bullet")
+    p.paragraph_format.space_after = Pt(6)
+    run = p.add_run(text)
+    _style_run(run, size=size, bold=bold, color=color)
+    return p
+
+
+def _add_divider(doc):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.space_after = Pt(6)
+    p_pr = p._p.get_or_add_pPr()
+    borders = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "6")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "2E75B6")
+    borders.append(bottom)
+    p_pr.insert(0, borders)
+    return p
+
+
+def _set_col_widths(table, widths: Tuple[Cm, ...]):
+    for row in table.rows:
+        for i, w in enumerate(widths):
+            if i < len(row.cells):
+                row.cells[i].width = w
+
+
+def _fix_zoom_settings(doc: Document):
+    settings = doc.settings.element
+    zoom = settings.find(qn("w:zoom"))
+    if zoom is not None and zoom.get(qn("w:percent")) is None:
+        zoom.set(qn("w:percent"), "100")
+
+
+# ==========================================================================
+# FUNCIONES AUXILIARES DE FORMATEO CORPORATIVO
+# ==========================================================================
+def _agregar_veredicto(doc, nivel: str, titulo: str, cuerpo: str):
+    table = doc.add_table(rows=1, cols=1)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    cell = table.cell(0, 0)
+
+    if nivel == "critico":
+        fill = FILL_LIGHTRED
+        color = RED
+    elif nivel == "alerta":
+        fill = FILL_LIGHTAMBER
+        color = AMBER
+    else:
+        fill = FILL_LIGHTGREEN
+        color = GREEN
+
+    _set_cell_background(cell, fill)
+    _set_cell_borders(cell, color="D9D9D9", size=4)
+    _set_cell_margins(cell, top=140, bottom=140, left=180, right=180)
+
+    p = cell.paragraphs[0]
+    p.paragraph_format.space_after = Pt(4)
+    run_title = p.add_run(titulo + "\n")
+    _style_run(run_title, size=12, bold=True, color=color)
+
+    run_body = p.add_run(cuerpo)
+    _style_run(run_body, size=10.5, color=GRAY)
+
+
+def _agregar_tarjetas_indicadores(doc, tarjetas: List[Tuple[str, str, str, RGBColor]]):
+    table = doc.add_table(rows=1, cols=len(tarjetas))
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    _set_col_widths(table, (Cm(4.0),) * len(tarjetas))
+
+    for i, (val, label, sub, color) in enumerate(tarjetas):
+        cell = table.cell(0, i)
+        _set_cell_background(cell, FILL_LIGHTGRAY)
+        _set_cell_borders(cell, color="D9D9D9", size=4)
+        _set_cell_margins(cell, top=100, bottom=100, left=100, right=100)
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+
+        p1 = cell.paragraphs[0]
+        p1.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p1.paragraph_format.space_after = Pt(2)
+        run_val = p1.add_run(str(val))
+        _style_run(run_val, size=16, bold=True, color=color)
+
+        p2 = cell.add_paragraph()
+        p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p2.paragraph_format.space_after = Pt(2)
+        run_lbl = p2.add_run(str(label))
+        _style_run(run_lbl, size=9, bold=True, color=GRAY)
+
+        p3 = cell.add_paragraph()
+        p3.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p3.paragraph_format.space_after = Pt(0)
+        run_sub = p3.add_run(str(sub))
+        _style_run(run_sub, size=8, italic=True, color=GRAY)
+
+
+def _agregar_tabla_simbolos(doc, datos_simbolos: Dict[str, Dict[str, Any]]):
+    headers = [
+        "SÍMBOLO", "TICKS", "FCI", "PÉRDIDA",
+        "STALE%", "SPR. MED", "SPR. P95", "ESTADO", "RÉGIMEN"
+    ]
+    widths = (Cm(2.2), Cm(2.0), Cm(1.5), Cm(1.8), Cm(1.5), Cm(1.8), Cm(1.8), Cm(1.8), Cm(2.2))
+
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    hdr_cells = table.rows[0].cells
+    for i, title in enumerate(headers):
+        _write_cell(
+            hdr_cells[i], title, size=9, bold=True,
+            color=RGBColor(0xFF, 0xFF, 0xFF), fill=FILL_NAVY,
+            align=WD_ALIGN_PARAGRAPH.CENTER
+        )
+
+    for symbol, d in sorted(datos_simbolos.items()):
+        row_cells = table.add_row().cells
+
+        _write_cell(row_cells[0], d["symbol"], size=9.5, bold=True, align=WD_ALIGN_PARAGRAPH.LEFT)
+
+        ticks_str = f"{d['ticks']:,}"
+        _write_cell(row_cells[1], ticks_str, size=9, align=WD_ALIGN_PARAGRAPH.RIGHT)
+
+        fci_val = d["fci"]
+        fci_str = f"{fci_val:.1f}%" if fci_val is not None else "N/A"
+        fci_color = GREEN if (fci_val is not None and fci_val >= 90) else (AMBER if (fci_val is not None and fci_val >= 80) else RED)
+        _write_cell(row_cells[2], fci_str, size=9, bold=True, color=fci_color)
+
+        loss_val = d["loss_rate"]
+        loss_str = f"{loss_val:.2f}%" if loss_val is not None else "0.00%"
+        loss_color = RED if (loss_val is not None and loss_val >= UMBRAL_SEQ_LOSS_ALERTA) else GRAY
+        _write_cell(row_cells[3], loss_str, size=9, color=loss_color)
+
+        stale_val = d["stale_pct"]
+        stale_str = f"{stale_val:.1f}%" if stale_val is not None else "N/A"
+        _write_cell(row_cells[4], stale_str, size=9)
+
+        _write_cell(row_cells[5], f"{d['mean_spread']:.2f}", size=9, align=WD_ALIGN_PARAGRAPH.RIGHT)
+
+        p95_val = d["p95_spread"]
+        p95_color = RED if p95_val >= UMBRAL_SPREAD_P95_ALERTA else GRAY
+        _write_cell(row_cells[6], f"{p95_val:.2f}", size=9, color=p95_color, align=WD_ALIGN_PARAGRAPH.RIGHT)
+
+        status_val = d["status"]
+        status_bg = FILL_LIGHTGREEN if status_val == "PASS" else (FILL_LIGHTAMBER if status_val == "WARNING" else FILL_LIGHTRED)
+        status_color = GREEN if status_val == "PASS" else (AMBER if status_val == "WARNING" else RED)
+        _write_cell(row_cells[7], status_val, size=8.5, bold=True, color=status_color, fill=status_bg)
+
+        regime_val = d["regime"] or "UNKNOWN"
+        _write_cell(row_cells[8], regime_val, size=8.5)
+
+    _set_col_widths(table, widths)
+
+
+def generate_deepseek_summary(data_summary: str) -> Optional[str]:
+    """Genera un análisis sintético del mercado si la API de DeepSeek está habilitada"""
+    if not DEEPSEEK_ENABLED or not DEEPSEEK_API_KEY:
+        return None
+    try:
+        import requests
+        headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": "Eres un perito forense cuantitativo y auditor HFT. Genera un párrafo ejecutivo corto (máximo 4 líneas) analizando los siguientes datos operativos de la sesión. Sé sumamente técnico, directo y aséptico. No uses adornos ni superlativos."},
+                {"role": "user", "content": data_summary}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 150
+        }
+        response = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=8)
+        if response.status_code == 200:
+            return response.json()["choices"][0]["message"]["content"].strip()
+    except Exception:
+        pass
+    return None
+
+
+def _extraer_datos_por_simbolo(all_reports: Dict[str, Optional[Dict]]) -> Dict[str, Dict[str, Any]]:
+    datos: Dict[str, Dict[str, Any]] = {}
+    audit_summary = all_reports.get("audit_summary_report") or {}
+    resultados = audit_summary.get("resultados_auditoria") or []
+
+    for item in resultados:
+        item = item or {}
+        symbol = item.get("symbol")
+        if not symbol:
+            continue
+        meta = item.get("metadata") or {}
+        detalles = meta.get("detalles_calidad") or {}
+        captura = detalles.get("captura") or {}
+        perfil = detalles.get("perfil_mercado") or {}
+
+        datos[symbol] = {
+            "symbol": symbol,
+            "ticks": meta.get("total_ticks", 0),
+            "fci": meta.get("fci_captura"),
+            "loss_rate": (captura.get("seq_loss_rate", 0.0) or 0.0) * 100.0,
+            "stale_pct": captura.get("stale_ticks_pct", 0.0),
+            "mean_spread": perfil.get("mean_pips", 0.0),
+            "p95_spread": perfil.get("p95_pips", 0.0),
+            "status": item.get("status", "FAIL"),
+            "regime": None,
+        }
+
+    market_profile = all_reports.get("market_profile_report") or {}
+    perfiles_mercado = market_profile.get("perfiles") or []
+    for p in perfiles_mercado:
+        p = p or {}
+        p_meta = p.get("metadata") or {}
+        symbol = p_meta.get("symbol")
+        if not symbol:
+            continue
+        regime = (p.get("market_regime") or {}).get("state")
+
+        if symbol in datos:
+            datos[symbol]["regime"] = regime
+        else:
+            p_spread = p.get("spread_profile") or {}
+            datos[symbol] = {
+                "symbol": symbol,
+                "ticks": p_meta.get("total_ticks", 0),
+                "fci": None,
+                "loss_rate": 0.0,
+                "stale_pct": None,
+                "mean_spread": p_spread.get("mean_pips", 0.0),
+                "p95_spread": p_spread.get("p95_pips", 0.0),
+                "status": "N/A",
+                "regime": regime,
+            }
+    return datos
+
+
+def _detectar_no_shutdown_ok(all_reports: Dict[str, Optional[Dict]]) -> List[str]:
+    flow_report = all_reports.get("flow_report") or {}
+    resultados = flow_report.get("resultados") or {}
+    afectados = []
+    for symbol, res in resultados.items():
+        res = res or {}
+        codes = [w.get("code") for w in (res.get("warnings") or []) if w]
+        if "no_shutdown_ok" in codes:
+            afectados.append(symbol)
+    return afectados
+
+
+# ==========================================================================
+# INTEGRAR RECOVERY FORENSICS
+# ==========================================================================
+def _extraer_recovery_data(all_reports: Dict[str, Optional[Dict]]) -> Dict[str, Any]:
+    """
+    Extrae datos de Recovery Forensics del flow_report para incluirlos en el reporte Word.
+    """
+    flow_report = all_reports.get("flow_report") or {}
+    recovery_integration = flow_report.get("recovery_integration") or {}
+
+    if not recovery_integration.get("enabled", False):
+        return {
+            "enabled": False,
+            "symbols": {},
+            "summary": {
+                "total": 0,
+                "state_consistent": 0,
+                "seq_integrity_pass": 0,
+                "critical": 0,
+                "avg_largest_gap": 0
+            }
+        }
+
+    symbols_data = recovery_integration.get("symbols") or {}
+
+    total = len(symbols_data)
+    state_consistent = sum(1 for s in symbols_data.values() if s.get("state_consistent", False))
+    seq_integrity_pass = sum(1 for s in symbols_data.values() if s.get("seq_integrity") == "PASS")
+    critical = sum(1 for s in symbols_data.values() if s.get("status") in [
+        "CRITICAL_RESET_DETECTED", "SEQ_ANOMALY_DETECTED", "SEQ_JUMP_DETECTED"
+    ])
+
+    gaps = [s.get("largest_gap_seconds", 0) for s in symbols_data.values() if s.get("largest_gap_seconds", 0) > 0]
+    avg_gap = sum(gaps) / len(gaps) if gaps else 0
+
+    return {
+        "enabled": True,
+        "symbols": symbols_data,
+        "summary": {
+            "total": total,
+            "state_consistent": state_consistent,
+            "seq_integrity_pass": seq_integrity_pass,
+            "critical": critical,
+            "avg_largest_gap": round(avg_gap, 2)
+        }
+    }
+
+
+def _agregar_seccion_recovery(doc, recovery_data: Dict[str, Any]):
+    """Agrega la sección de Recovery Forensics al reporte Word"""
+    if not recovery_data.get("enabled", False):
+        return
+
+    summary = recovery_data.get("summary", {})
+    symbols = recovery_data.get("symbols", {})
+
+    total = summary.get("total", 0)
+    if total == 0:
+        return
+
+    _add_heading(doc, "1.3 Auditoría Forense de Recuperación (Recovery)", level=2)
+    _add_paragraph(
+        doc,
+        "Análisis post-mortem de la continuidad de secuencia durante el corte/interrupción del servicio. "
+        "Evalúa si el contador SEQ se mantuvo, se reinició o presentó anomalías.",
+        italic=True,
+        color=GRAY,
+    )
+
+    tarjetas_recovery = [
+        (f"{summary.get('seq_integrity_pass', 0)}/{total}", "SEQ ÍNTEGRA", "Sin saltos/duplicados", GREEN if summary.get('seq_integrity_pass', 0) == total else AMBER),
+        (f"{summary.get('state_consistent', 0)}/{total}", "STATE CONSISTENTE", "State.json coincide", GREEN if summary.get('state_consistent', 0) == total else RED),
+        (f"{summary.get('critical', 0)}", "CRÍTICOS", "Reinicios/Saltos/Anomalías", RED if summary.get('critical', 0) > 0 else GREEN),
+        (f"{summary.get('avg_largest_gap', 0):.0f}s", "GAP PROMEDIO", "Sin datos (máximo)", NAVY),
+    ]
+    _agregar_tarjetas_indicadores(doc, tarjetas_recovery)
+
+    symbols_with_issues = []
+    for symbol, data in symbols.items():
+        has_issue = (
+            data.get("seq_integrity") == "FAIL" or
+            data.get("state_consistent") == False or
+            data.get("reset_from_zero", False) or
+            data.get("status") in ["CRITICAL_RESET_DETECTED", "SEQ_ANOMALY_DETECTED", "SEQ_JUMP_DETECTED"] or
+            data.get("largest_gap_seconds", 0) > 60
+        )
+        if has_issue:
+            symbols_with_issues.append((symbol, data))
+
+    if symbols_with_issues:
+        _add_heading(doc, "1.3.1 Puntos de Atención en Recuperación", level=3)
+
+        headers = ["SÍMBOLO", "ESTADO RECOVERY", "SEQ", "STATE", "GAP MAX (s)", "GAPS"]
+        widths = (Cm(2.5), Cm(3.5), Cm(2.0), Cm(2.5), Cm(2.5), Cm(2.0))
+
+        table = doc.add_table(rows=1, cols=len(headers))
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+        hdr_cells = table.rows[0].cells
+        for i, title in enumerate(headers):
+            _write_cell(
+                hdr_cells[i], title, size=9, bold=True,
+                color=RGBColor(0xFF, 0xFF, 0xFF), fill=FILL_NAVY,
+                align=WD_ALIGN_PARAGRAPH.CENTER
+            )
+
+        symbols_with_issues.sort(key=lambda x: x[1].get("largest_gap_seconds", 0), reverse=True)
+
+        for symbol, data in symbols_with_issues:
+            row_cells = table.add_row().cells
+
+            status = data.get("status", "UNKNOWN")
+            status_bg = FILL_LIGHTGREEN if status == "PERFECT_RECOVERY" else (FILL_LIGHTAMBER if "GAP" in status else FILL_LIGHTRED)
+            status_color = GREEN if status == "PERFECT_RECOVERY" else (AMBER if "GAP" in status else RED)
+
+            _write_cell(row_cells[0], symbol, size=9.5, bold=True, align=WD_ALIGN_PARAGRAPH.LEFT)
+            _write_cell(row_cells[1], status, size=8.5, color=status_color, fill=status_bg)
+
+            seq_status = "✅ PASS" if data.get("seq_integrity") == "PASS" else "❌ FAIL"
+            seq_color = GREEN if data.get("seq_integrity") == "PASS" else RED
+            _write_cell(row_cells[2], seq_status, size=9, color=seq_color)
+
+            state_status = "✅ OK" if data.get("state_consistent") else "❌ INCONSISTENTE"
+            state_color = GREEN if data.get("state_consistent") else RED
+            _write_cell(row_cells[3], state_status, size=9, color=state_color)
+
+            gap_val = data.get("largest_gap_seconds", 0)
+            gap_str = f"{gap_val:.0f}" if gap_val > 0 else "0"
+            gap_color = RED if gap_val > 300 else (AMBER if gap_val > 60 else GRAY)
+            _write_cell(row_cells[4], gap_str, size=9, color=gap_color, align=WD_ALIGN_PARAGRAPH.RIGHT)
+
+            gaps_count = data.get("capture_gaps", 0)
+            _write_cell(row_cells[5], str(gaps_count), size=9, align=WD_ALIGN_PARAGRAPH.CENTER)
+
+        _set_col_widths(table, widths)
+
+        if any(d.get("seq_integrity") == "FAIL" for _, d in symbols_with_issues):
+            _add_paragraph(
+                doc,
+                "⚠️ Se detectaron símbolos con fallos en la integridad de secuencia (SEQ). "
+                "Revisar logs de recovery para determinar si hubo reinicio desde cero o saltos.",
+                color=RED,
+                bold=True
+            )
+        elif any(d.get("state_consistent") == False for _, d in symbols_with_issues):
+            _add_paragraph(
+                doc,
+                "⚠️ Hay símbolos donde el state.json no coincide con el último SEQ del archivo. "
+                "Posible desincronización entre estado y datos físicos.",
+                color=AMBER,
+                bold=True
+            )
+        else:
+            _add_paragraph(
+                doc,
+                "✅ Los símbolos con gaps de captura mantuvieron integridad de SEQ. "
+                "Los gaps corresponden a ausencia de datos (corte de internet/backoff), no a pérdida.",
+                color=GREEN
+            )
+    else:
+        _add_paragraph(
+            doc,
+            "✅ Todos los símbolos pasaron la auditoría de recuperación: "
+            "sin reinicios desde cero, sin saltos, sin duplicados y state.json consistente.",
+            color=GREEN
+        )
+
+
+# ==========================================================================
+# FUNCIÓN PRINCIPAL DE GENERACIÓN DE REPORTE
+# ==========================================================================
+def generar_reporte_docx(all_reports: Dict[str, Optional[Dict]], fecha: str, output_dir: Path) -> Path:
+    if not DOCX_AVAILABLE:
+        raise ImportError("python-docx no está instalado. No se puede generar el reporte Word.")
+
+    doc = Document()
+    for section in doc.sections:
+        section.top_margin = Cm(2.0)
+        section.bottom_margin = Cm(2.0)
+        section.left_margin = Cm(2.0)
+        section.right_margin = Cm(2.0)
+
+    datos_simbolos = _extraer_datos_por_simbolo(all_reports)
+    fci_vals = [v["fci"] for v in datos_simbolos.values() if v["fci"] is not None]
+    loss_vals = [v["loss_rate"] for v in datos_simbolos.values() if v["loss_rate"] is not None]
+    total_ticks = sum(v["ticks"] for v in datos_simbolos.values())
+
+    avg_fci = sum(fci_vals) / len(fci_vals) if fci_vals else 0.0
+    avg_loss = sum(loss_vals) / len(loss_vals) if loss_vals else 0.0
+
+    audit_summary = all_reports.get("audit_summary_report") or {}
+    flow_report = all_reports.get("flow_report") or {}
+    execution_contract = all_reports.get("execution_contract") or {}
+
+    certificados = audit_summary.get("simbolos_certificados") or []
+    observacion = audit_summary.get("simbolos_observacion") or []
+    rechazados = audit_summary.get("simbolos_rechazados") or []
+    total_simbolos = len(datos_simbolos)
+    simbolos_sin_shutdown = _detectar_no_shutdown_ok(all_reports)
+
+    alertas_tecnicas = (1 if simbolos_sin_shutdown else 0) + (1 if avg_loss >= UMBRAL_SEQ_LOSS_ALERTA else 0)
+
+    lineage_fail = False
+    lineage_rep = all_reports.get("lineage_report") or {}
+    lineage_res = lineage_rep.get("resultados") or {}
+    for r in lineage_res.values():
+        if r and r.get("status") == "FAIL":
+            lineage_fail = True
+            break
+
+    if rechazados or lineage_fail:
+        nivel = "critico"
+        titulo_veredicto = "⚠ REVISAR ANTES DE OPERAR"
+        cuerpo_veredicto = "Se detectaron fallos críticos o símbolos rechazados por la auditoría. Detener operaciones automatizadas hoy."
+    elif observacion:
+        nivel = "alerta"
+        titulo_veredicto = "MONITOREAR — Símbolos en Observación"
+        cuerpo_veredicto = f"Se certificaron {len(certificados)} símbolos. Hay {len(observacion)} símbolos con advertencias menores. Operar con cautela."
+    else:
+        nivel = "ok"
+        titulo_veredicto = "✓ PUEDES OPERAR CON CONFIANZA HOY"
+        cuerpo_veredicto = f"Los {total_simbolos} símbolos quedaron certificados. No hay fallos críticos ni rechazos."
+        if alertas_tecnicas:
+            cuerpo_veredicto += (
+                f" Hay {alertas_tecnicas} punto(s) de atención técnica de bajo riesgo descritos en este "
+                f"informe que no bloquean la operación, pero conviene tener en el radar."
+            )
+
+    _add_heading(doc, f"📋 REPORTE EJECUTIVO DE TELEMETRÍA HFT", level=1)
+    _add_paragraph(
+        doc,
+        f"Fecha Auditada: {fecha} | Generado el: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        italic=True,
+        color=GRAY,
+    )
+    _add_divider(doc)
+
+    _agregar_veredicto(doc, nivel, titulo_veredicto, cuerpo_veredicto)
+
+    tarjetas = [
+        (f"{len(certificados)}/{total_simbolos}", "CERTIFICADOS", "Admitidos trading", GREEN),
+        (f"{avg_fci:.1f}%", "FCI PROMEDIO", "Confianza feed", NAVY),
+        (f"{avg_loss:.2f}%", "PERDIDA CANON.", "Descarte de red", NAVY if avg_loss < 0.5 else RED),
+        (f"{total_ticks:,}", "TICKS TOTALES", "Volumen diario", NAVY),
+    ]
+    _agregar_tarjetas_indicadores(doc, tarjetas)
+
+    _add_heading(doc, "1. Resumen General de la Jornada", level=1)
+    _add_paragraph(
+        doc,
+        f"Durante la sesión de adquisición de datos para la jornada {fecha}, se registró un volumen neto de {total_ticks:,} ticks. "
+        f"La auditoría general del pool de activos certificó un FCI promedio de {avg_fci:.1f}% con una pérdida canónica de "
+        f"secuencias del {avg_loss:.2f}%.",
+    )
+
+    # Integrar Recovery Forensics
+    recovery_data = _extraer_recovery_data(all_reports)
+    _agregar_seccion_recovery(doc, recovery_data)
+
+    # Inyección de Interpretación de Inteligencia Artificial (DeepSeek)
+    if DEEPSEEK_ENABLED:
+        simple_summary = f"Fecha: {fecha}, Ticks: {total_ticks}, FCI promedio: {avg_fci:.2f}%, Pérdida canónica: {avg_loss:.2f}%, Rechazados: {len(rechazados)}."
+        ai_summary = generate_deepseek_summary(simple_summary)
+        if ai_summary:
+            _add_heading(doc, "1.4 Interpretación Operativa Asistida por IA (DeepSeek)", level=2)
+            _add_paragraph(doc, ai_summary, italic=True, color=BLUE)
+
+    _add_heading(doc, "1.2 Salud de la Infraestructura Windows (Hardware)", level=2)
+    _add_paragraph(
+        doc,
+        "Telemetría física recopilada asíncronamente en el servidor local. Diseñada para prevenir bloqueos "
+        "de archivos por antivirus, desvíos de tiempo (NTP Drift) o saturación de Ramdisk.",
+        italic=True,
+        color=GRAY,
+    )
+
+    env = flow_report.get("windows_environment") or {}
+    if env:
+        telemetry = env.get("telemetry") or {}
+        ramdisk = telemetry.get("ramdisk_health") or {}
+        drift = telemetry.get("ntp_drift_ms", 0.0)
+        warnings_env = env.get("warnings") or []
+        drift_color = RED if abs(drift) > 50.0 else GREEN
+
+        _add_bullet(doc, f"Desviación del Reloj (NTP): {drift:.2f} ms de desfase detectados contra pool.ntp.org.", color=drift_color, bold=bool(abs(drift) > 50.0))
+
+        ramdisk_pct = ramdisk.get("space_free_pct", 100.0)
+        ramdisk_status = ramdisk.get("status", "OK")
+        ram_color = RED if ramdisk_status == "CRITICAL" else (AMBER if ramdisk_status == "WARNING" else GREEN)
+        _add_bullet(doc, f"Unidad Ramdisk M:\\: {ramdisk_pct}% de espacio libre restante (Estatus: {ramdisk_status}).", color=ram_color, bold=(ram_color in [RED, AMBER]))
+
+        mems = []
+        flow_res = flow_report.get("resultados") or {}
+        for res in flow_res.values():
+            if res:
+                allocated = ((res.get("metadata") or {}).get("windows_process") or {}).get("allocated_ram_mb", 0.0)
+                if allocated > 0.0:
+                    mems.append(allocated)
+
+        avg_ram = sum(mems) / len(mems) if mems else 0.0
+        _add_bullet(doc, f"Consumo de Recursos: El peso promedio de los capturadores en RAM es de {avg_ram:.1f} MB por símbolo.")
+        if warnings_env:
+            for w in warnings_env:
+                if w:
+                    code = w.get("code") or ""
+                    _add_paragraph(doc, f"⚠️  ALERTA DE HARDWARE: {w.get('message')}", color=RED if "clock" in code else AMBER, bold=True)
+    else:
+        _add_paragraph(doc, "Telemetría de hardware no disponible para esta fecha.", color=GRAY, italic=True)
+
+    if simbolos_sin_shutdown or avg_loss >= UMBRAL_SEQ_LOSS_ALERTA:
+        _add_heading(doc, "2. Puntos de atención técnica (no bloqueantes)", level=1)
+        _add_paragraph(doc, "Estos hallazgos no necesariamente afectan el veredicto de hoy, pero son señales recurrentes.", italic=True, color=GRAY)
+        if simbolos_sin_shutdown:
+            _add_heading(doc, "2.1 Ausencia de firma de apagado limpio (no_shutdown_ok)", level=2)
+            todos = len(simbolos_sin_shutdown) == total_simbolos
+            alcance = f"Los {total_simbolos} símbolos, sin excepción," if todos else f"{len(simbolos_sin_shutdown)} símbolo(s) ({', '.join(simbolos_sin_shutdown)})"
+            _add_bullet(doc, f"{alcance} terminaron la sesión sin el archivo .shutdown_ok que certifica un cierre controlado del proceso de captura.", bold=True, color=AMBER)
+        if avg_loss >= UMBRAL_SEQ_LOSS_ALERTA:
+            _add_heading(doc, "2.2 Pérdida de secuencia elevada", level=2)
+            altos = sorted(((s, v["loss_rate"]) for s, v in datos_simbolos.items() if v.get("loss_rate") is not None), key=lambda x: x[1], reverse=True)[:3]
+            top_txt = ", ".join(f"{s} ({v:.2f}%)" for s, v in altos)
+            _add_bullet(doc, f"La pérdida de secuencia promedio ({avg_loss:.2f}%) supera el umbral de {UMBRAL_SEQ_LOSS_ALERTA:.0f}%. Los más altos: {top_txt}.", color=AMBER)
+
+    _add_heading(doc, "3. Desglose Métrico por Símbolo", level=1)
+    _agregar_tabla_simbolos(doc, datos_simbolos)
+
+    _add_heading(doc, "4. Contrato de Admisión — Fase 3", level=1)
+    if execution_contract and execution_contract.get("contracts"):
+        contratos = execution_contract["contracts"]
+        admitidos = [s for s, c in contratos.items() if c and c.get("status") == "ADMITIDO"]
+        num_admitidos = len(admitidos)
+        num_no_confiables = len(contratos) - num_admitidos
+        _add_bullet(doc, f"Símbolos ADMITIDOS para trading: {num_admitidos}")
+        _add_bullet(doc, f"Símbolos NO CONFIABLES (Bloqueados): {num_no_confiables}")
+        if num_no_confiables > 0:
+            _add_paragraph(doc, "❌ El Contrato de Ejecución tiene pares NO CONFIABLES. La Fase 3 los ignorará.", color=RED)
+        else:
+            _add_paragraph(doc, "✅ El Contrato de Ejecución autoriza a todos los pares para la Fase 3.", color=GREEN)
+
+    _add_divider(doc)
+    _add_heading(doc, "5. Recomendación para el Operador", level=1)
+    if nivel == "critico":
+        _add_bullet(doc, "Detener operaciones automáticas de inmediato en los pares rechazados (FAIL).", bold=True, color=RED)
+    elif nivel == "alerta":
+        _add_bullet(doc, "Operar de forma manual o bajo supervisión en pares en observación.", bold=True, color=AMBER)
+    else:
+        _add_bullet(doc, "Operar con normalidad hoy bajo el perfil de riesgo habitual.", bold=True, color=GREEN)
+
+    _fix_zoom_settings(doc)
+    output_path = output_dir / f"diagnostico_operacional_{fecha}.docx"
+    doc.save(str(output_path))
+    return output_path
+
+
+# ==========================================================================
+# PUNTO DE ENTRADA EXECUTABLE
+# ==========================================================================
+def main():
+    parser = argparse.ArgumentParser(description="Audit Report Engine - Generador de Reporte Word")
+    parser.add_argument("--date", type=str, default="latest",
+                       help="Fecha en formato YYYYMMDD o 'latest' para la última auditar")
+    args = parser.parse_args()
+
+    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
+    logger.info(f"💾 Iniciando compilación de reportes de auditoría para la fecha: {fecha}")
+
+    all_reports = {
+        "audit_summary_report": load_json_safe(AUDIT_REPORTES_DIR / f"audit_report_{fecha}.json"),
+        "market_profile_report": load_json_safe(AUDIT_REPORTES_DIR / f"market_profile_report_{fecha}.json"),
+        "flow_report": load_json_safe(AUDIT_FLOW_DIR / f"flow_report_{fecha}.json"),
+        "lineage_report": load_json_safe(AUDIT_LINEAGE_DIR / f"lineage_report_{fecha}.json"),
+        "execution_contract": load_json_safe(AUDIT_STATE_DIR / "execution_contract.json")
+    }
+
+    if not all_reports["audit_summary_report"] and not all_reports["market_profile_report"]:
+        logger.warning(f"⚠️ No se encontraron reportes base JSON para compilar el informe de auditoría del {fecha}.")
+        return
+
+    try:
+        output_path = generar_reporte_docx(all_reports, fecha, AUDIT_REPORTES_DIR)
+        logger.info(f"✅ Reporte Word de Auditoría generado exitosamente en: {output_path}")
+
+        # Calcular estadísticas de Recovery para el mensaje de Telegram
+        recovery_data = _extraer_recovery_data(all_reports)
+        recovery_summary = recovery_data.get("summary", {})
+        recovery_msg = ""
+        if recovery_data.get("enabled", False):
+            recovery_msg = (
+                f"\n🔄 *Recovery Forensics:*\n"
+                f"   SEQ Íntegra: {recovery_summary.get('seq_integrity_pass', 0)}/{recovery_summary.get('total', 0)}\n"
+                f"   State OK: {recovery_summary.get('state_consistent', 0)}/{recovery_summary.get('total', 0)}\n"
+                f"   Críticos: {recovery_summary.get('critical', 0)}"
+            )
+
+        deepseek_status = "Habilitado y Aplicado" if DEEPSEEK_ENABLED else "No configurado"
+        msg = (
+            f"📄 *REPORTE WORD DE AUDITORÍA CREADO*\n"
+            f"📅 Fecha: {fecha}\n"
+            f"📂 Archivo: `{output_path.name}`\n"
+            f"📍 Ubicación: `{output_path.parent}`\n"
+            f"🤖 IA DeepSeek: {deepseek_status}\n"
+            f"📊 FCI Promedio: {all_reports['audit_summary_report'].get('resumen', {}).get('avg_confidence', 'N/A')}%"
+            f"{recovery_msg}"
+        )
+        send_telegram_alert(msg)
+        logger.info("📡 Notificación de reporte de auditoría enviada a Telegram.")
+    except Exception as e:
+        logger.error(f"❌ Error crítico generando reporte unificado de auditoría: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    main()

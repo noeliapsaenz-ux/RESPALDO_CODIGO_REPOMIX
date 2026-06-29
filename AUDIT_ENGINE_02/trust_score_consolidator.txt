@@ -1,0 +1,270 @@
+"""
+==========================================================================
+TRUST SCORE CONSOLIDATOR V3.0 - EMISOR OFICIAL DE CERTIFICADOS F0
+==========================================================================
+Ubicación: AUDIT_ENGINE_02
+Dependencias: audit_config (system_canonical, paths, symbols, logging, contracts)
+Responsabilidad: Consolidar métricas de captura y perfil de mercado,
+                 aplicar la lógica de veto H-03 y emitir el audit_certificate.json
+                 canónico firmado con el metadata_envelope.
+REGLA: Este es el ÚNICO módulo autorizado para emitir symbol_capture_status.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección de ruta raíz
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+local_path = Path(__file__).resolve().parent
+if str(local_path) not in sys.path:
+    sys.path.insert(0, str(local_path))
+
+import io
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except AttributeError:
+        pass
+
+import json
+import argparse
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+
+# Importación desde audit_config
+from audit_config import (
+    AUDIT_REPORTES_DIR,
+    AUDIT_STATE_DIR,
+    SYMBOLS_TO_AUDIT,
+    get_fecha_broker_str,
+    PROCESSED_DATA_DIR,
+    NumpySafeEncoder,
+    SymbolCaptureStatus,
+    DataIntegrity,
+    AuditSeverityLevel,
+    ContractType,
+    MetadataEnvelope,
+    validate_canonical_enum,
+    SCHEMA_VERSION_AUDIT,
+    PRODUCER_AUDIT,
+    VETO_FCI_THRESHOLD,
+    init_audit_logging,
+    save_contract_atomic
+)
+
+# Importación desde audit_contracts
+from audit_contracts import (
+    load_json_safe,
+    resolve_target_date,
+    create_canonical_audit_certificate,
+    validate_audit_certificate
+)
+
+# Inicializar logger
+logger = init_audit_logging("trust_score_consolidator", "02_AUDIT")
+
+
+def find_capture_report(fecha: str) -> Path:
+    """Localiza el reporte de captura física en las rutas posibles."""
+    posibles_rutas = [
+        AUDIT_REPORTES_DIR / f"capture_audit_report_{fecha}.json",
+        PROCESSED_DATA_DIR / f"capture_audit_report_{fecha}.json",
+        AUDIT_STATE_DIR / f"capture_audit_report_{fecha}.json"
+    ]
+    for r in posibles_rutas:
+        if r.exists():
+            return r
+    return posibles_rutas[0]
+
+
+def consolidate_symbol_quality(
+    symbol: str,
+    capture_data: Optional[Dict],
+    profile_data: Optional[Dict]
+) -> Dict[str, Any]:
+    """
+    Consolida calidad y emite directamente el Certificado Canónico V3.
+    Implementa Veto Duro H-03 basado en FCI e Integridad.
+
+    Args:
+        symbol: Símbolo
+        capture_data: Datos de captura
+        profile_data: Datos de perfil de mercado
+
+    Returns:
+        Dict[str, Any]: Certificado canónico
+    """
+    symbol = symbol.upper()
+
+    # Extracción segura de métricas base
+    fci = 0.0
+    total_ticks = 0
+    integrity_status = DataIntegrity.INTEGRO.value
+    anomalies = []
+    metadata_extra = {}
+
+    if capture_data:
+        metrics = capture_data.get("integrity_metrics", {})
+        fci = float(metrics.get("feed_confidence_index", 0.0))
+        total_ticks = int(capture_data.get("ticks", 0))
+
+        # Mapeo de errores críticos a data_anomaly canónico
+        missing_files = metrics.get("missing_files_estimated", 0)
+        if missing_files > 0:
+            anomalies.append({"type": "GAP_CONNECTIVITY", "detail": f"{missing_files} archivos faltantes"})
+
+        infra_silence = metrics.get("infrastructure_silence_count", 0)
+        if infra_silence > 0:
+            anomalies.append({"type": "HEARTBEAT_LOSS", "detail": f"{infra_silence} silencios de infraestructura"})
+
+        if fci <= 0 and total_ticks == 0:
+            integrity_status = DataIntegrity.CORRUPTO.value
+    else:
+        integrity_status = DataIntegrity.CORRUPTO.value
+        anomalies.append({"type": "MISSING_CAPTURE_DATA", "detail": "Reporte de captura ausente"})
+
+    # Lógica de Perfil de Mercado
+    profile_conf = 0.0
+    if profile_data:
+        validation = profile_data.get("_validation", {})
+        profile_conf = float(validation.get("confidence", 0.0))
+        if total_ticks == 0:
+            total_ticks = int(profile_data.get("metadata", {}).get("total_ticks", 0))
+        if validation.get("status") == "FAIL":
+            anomalies.append({"type": "MARKET_PROFILE_FAIL", "detail": "Fallas críticas en perfil descriptivo"})
+    else:
+        anomalies.append({"type": "MISSING_MARKET_PROFILE", "detail": "Perfil de mercado ausente"})
+
+    # Cálculo de confianza consolidada
+    consolidated_confidence = (fci * 0.60) + (profile_conf * 0.40) if (capture_data and profile_data) else 0.0
+
+    # Aplicación de Veto Duro H-03
+    if integrity_status == DataIntegrity.CORRUPTO.value:
+        capture_status = SymbolCaptureStatus.NO_CONFIABLE.value
+    elif fci < VETO_FCI_THRESHOLD:
+        capture_status = SymbolCaptureStatus.NO_CONFIABLE.value
+    else:
+        capture_status = SymbolCaptureStatus.CONFIABLE.value
+
+    # Construcción del Certificado Canónico
+    metadata_extra = {
+        "consolidated_confidence_legacy": round(consolidated_confidence, 2),
+        "total_ticks": total_ticks,
+        "fci_raw": fci,
+        "profile_confidence_raw": profile_conf,
+        "detalles_calidad": {
+            "captura": capture_data.get("integrity_metrics", {}) if capture_data else {},
+            "perfil_mercado": profile_data.get("spread_profile", {}) if profile_data else {}
+        }
+    }
+
+    certificate = create_canonical_audit_certificate(
+        symbol=symbol,
+        fci_score=fci,
+        data_integrity=integrity_status,
+        capture_status=capture_status,
+        anomaly_list=anomalies,
+        metadata_extra=metadata_extra
+    )
+
+    # Auto-validación Fail-Closed
+    assert validate_audit_certificate(certificate), f"Certificado inválido generado para {symbol}"
+
+    return certificate
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Trust Score Consolidator V3.0")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+
+    fecha = resolve_target_date(args.date, AUDIT_STATE_DIR, get_fecha_broker_str)
+
+    logger.info(f"📊 CONSOLIDADOR CANÓNICO F0 - FECHA: {fecha}")
+
+    # Carga de insumos
+    capture_report_path = find_capture_report(fecha)
+    profile_report_path = AUDIT_REPORTES_DIR / f"market_profile_report_{fecha}.json"
+
+    capture_report = load_json_safe(capture_report_path)
+    profile_report = load_json_safe(profile_report_path)
+
+    capture_map = {item.get("symbol", "").upper(): item for item in capture_report.get("integrity_summary", [])} if capture_report else {}
+    profile_map = {item.get("metadata", {}).get("symbol", "").upper(): item for item in profile_report.get("perfiles", [])} if profile_report else {}
+
+    certificados_canonicos = []
+    simbolos_certificados = []
+    simbolos_vetados = []
+
+    for symbol in SYMBOLS_TO_AUDIT:
+        sym_upper = symbol.upper()
+        cert = consolidate_symbol_quality(
+            sym_upper,
+            capture_map.get(sym_upper),
+            profile_map.get(sym_upper)
+        )
+        certificados_canonicos.append(cert)
+
+        if cert["symbol_capture_status"] == SymbolCaptureStatus.CONFIABLE.value:
+            simbolos_certificados.append(sym_upper)
+        else:
+            simbolos_vetados.append(sym_upper)
+            logger.warning(f"🛡️ VETO H-03: {sym_upper} marcado como NO_CONFIABLE (FCI: {cert['fci_score']})")
+
+    # Emisión del Contrato Consolidado Oficial
+    envelope = MetadataEnvelope(
+        schema_version=SCHEMA_VERSION_AUDIT,
+        contract_type=ContractType.AUDIT_CERTIFICATE,
+        producer_identity=PRODUCER_AUDIT,
+        timestamp_emission=datetime.now(timezone.utc).isoformat()
+    )
+
+    payload_final = {
+        **envelope.to_dict(),
+        "fecha": fecha,
+        "resumen_ejecutivo": {
+            "total_simbolos": len(SYMBOLS_TO_AUDIT),
+            "certificados": len(simbolos_certificados),
+            "vetados": len(simbolos_vetados)
+        },
+        "simbolos_certificados": simbolos_certificados,
+        "simbolos_vetados": simbolos_vetados,
+        "certificados_por_simbolo": certificados_canonicos
+    }
+
+    # Guardado Atómico del Nuevo Certificado Canónico
+    report_path = AUDIT_REPORTES_DIR / f"audit_certificate_{fecha}.json"
+    save_contract_atomic(payload_final, report_path)
+
+    logger.info(f"✅ CERTIFICADO CANÓNICO EMITIDO: {report_path.name}")
+    logger.info(f"   • Certificados: {len(simbolos_certificados)} | Vetados: {len(simbolos_vetados)}")
+
+    # Compatibilidad Legacy Temporal
+    legacy_payload = {
+        "fecha": fecha,
+        "timestamp_generacion": datetime.now(timezone.utc).isoformat(),
+        "total_simbolos_analizados": len(SYMBOLS_TO_AUDIT),
+        "simbolos_certificados": simbolos_certificados,
+        "simbolos_observacion": [],
+        "simbolos_rechazados": simbolos_vetados,
+        "resultados_auditoria": [
+            {
+                "symbol": c["symbol"],
+                "status_operativo": "ADMITIDO" if c["symbol_capture_status"] == "CONFIABLE" else "NO_CONFIABLE",
+                "confidence": c["metadata"].get("consolidated_confidence_legacy", 0.0),
+                "metadata": c["metadata"]
+            } for c in certificados_canonicos
+        ]
+    }
+    legacy_path = AUDIT_REPORTES_DIR / f"audit_report_{fecha}.json"
+    with open(legacy_path, 'w', encoding='utf-8') as f:
+        json.dump(legacy_payload, f, indent=2, ensure_ascii=False, cls=NumpySafeEncoder)
+    logger.info(f"💾 Reporte Legacy mantenido para compatibilidad: {legacy_path.name}")
+
+
+if __name__ == "__main__":
+    main()

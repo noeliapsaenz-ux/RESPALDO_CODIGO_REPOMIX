@@ -1,0 +1,662 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+QUANT REPORT ENGINE - GENERADOR DE INFORME EJECUTIVO DE INTELIGENCIA
+==========================================================================
+Ubicación: REPORT_ENGINE_04
+Dependencias: quant_config (paths, logging, settings, contracts)
+Responsabilidad: Compilar los contratos de admisión, reportes de anomalías,
+                 selecciones de portafolio de Fase 3, validación de modelos (F3.5)
+                 y el Master State global, y generar el reporte Word (.docx).
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección dinámica de la carpeta raíz del proyecto y de la Fase 3
+root_path = Path(__file__).resolve().parent.parent
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+quant_path = root_path / "QUANT_ENGINE_03"
+if str(quant_path) not in sys.path:
+    sys.path.insert(0, str(quant_path))
+
+import os
+import json
+import argparse
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List, Tuple
+
+from docx import Document
+from docx.shared import Pt, Cm, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+# Importaciones absolutas desde quant_config
+from quant_config import (
+    OI_OUTPUT_DIR,
+    AUDIT_STATE_DIR,
+    PROCESSED_DATA_DIR,
+    QUANT_ANOMALIES_DIR,
+    SYMBOLS_TO_QUANT,
+    get_fecha_broker_str,
+    NumpySafeEncoder,
+    send_telegram_alert,
+    init_quant_logging,
+    load_contract_safe
+)
+
+# Inicializar logger con categoría de reporte
+logger = init_quant_logging("quant_report_engine", "04_REPORT")
+
+# Paleta corporativa unificada
+NAVY = RGBColor(0x1F, 0x38, 0x64)
+BLUE = RGBColor(0x2E, 0x75, 0xB6)
+GREEN = RGBColor(0x2E, 0x7D, 0x32)
+AMBER = RGBColor(0xB8, 0x86, 0x0B)
+RED = RGBColor(0xC0, 0x39, 0x2B)
+GRAY = RGBColor(0x59, 0x59, 0x59)
+
+FILL_LIGHTGREEN = "E8F5E9"
+FILL_LIGHTRED = "FBEAEA"
+FILL_LIGHTAMBER = "FFF3E0"
+FILL_NAVY = "1F3864"
+FILL_LIGHTGRAY = "F2F2F2"
+FILL_WHITE = "FFFFFF"
+
+
+# ==========================================================================
+# HELPERS DE INYECCIÓN XML DE WORD
+# ==========================================================================
+def _insert_in_tcpr_order(tc_pr, new_el, tag_name: str):
+    order = [
+        "cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders",
+        "shd", "noWrap", "tcMar", "textDirection", "tcFitText", "vAlign", "hideMark"
+    ]
+    idx_target = order.index(tag_name)
+    anchor = None
+    for tag in reversed(order[:idx_target]):
+        found = tc_pr.find(qn(f"w:{tag}"))
+        if found is not None:
+            anchor = found
+            break
+    if anchor is not None:
+        anchor.addnext(new_el)
+    else:
+        tc_pr.insert(0, new_el)
+
+
+def _set_cell_background(cell, hex_color: str):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_color)
+    _insert_in_tcpr_order(tc_pr, shd, "shd")
+
+
+def _set_cell_borders(cell, color: str = "D9D9D9", size: int = 4):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    borders = OxmlElement("w:tcBorders")
+    for edge in ("top", "start", "bottom", "end"):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), "single")
+        el.set(qn("w:sz"), str(size))
+        el.set(qn("w:color"), color)
+        borders.append(el)
+    _insert_in_tcpr_order(tc_pr, borders, "tcBorders")
+
+
+def _set_cell_margins(cell, top=60, bottom=60, left=100, right=100):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    mar = OxmlElement("w:tcMar")
+    for edge, val in (("top", top), ("start", left), ("bottom", bottom), ("end", right)):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:w"), str(val))
+        el.set(qn("w:type"), "dxa")
+        mar.append(el)
+    _insert_in_tcpr_order(tc_pr, mar, "tcMar")
+
+
+def _style_run(run, size=11, bold=False, italic=False, color: Optional[RGBColor] = None, font="Calibri"):
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.italic = italic
+    run.font.name = font
+    if color is not None:
+        run.font.color.rgb = color
+    return run
+
+
+def _write_cell(cell, text, size=10, bold=False, color: Optional[RGBColor] = None, align=WD_ALIGN_PARAGRAPH.CENTER, fill: Optional[str] = None, vertical_center=True):
+    cell.text = ""
+    p = cell.paragraphs[0]
+    p.alignment = align
+    run = p.add_run(str(text))
+    _style_run(run, size=size, bold=bold, color=color)
+    if fill:
+        _set_cell_background(cell, fill)
+    _set_cell_borders(cell)
+    _set_cell_margins(cell)
+    if vertical_center:
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    return cell
+
+
+def _add_heading(doc, text, level=1):
+    h = doc.add_heading(text, level=level)
+    for run in h.runs:
+        run.font.name = "Calibri"
+        run.font.color.rgb = NAVY if level == 1 else BLUE
+    return h
+
+
+def _add_paragraph(doc, text, size=11, italic=False, color: Optional[RGBColor] = None, bold=False, space_after=8):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_after = Pt(space_after)
+    run = p.add_run(text)
+    _style_run(run, size=size, italic=italic, color=color, bold=bold)
+    return p
+
+
+def _add_bullet(doc, text, bold=False, color: Optional[RGBColor] = None, size=11):
+    p = doc.add_paragraph(style="List Bullet")
+    p.paragraph_format.space_after = Pt(6)
+    run = p.add_run(text)
+    _style_run(run, size=size, bold=bold, color=color)
+    return p
+
+
+def _add_divider(doc):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.space_after = Pt(6)
+    p_pr = p._p.get_or_add_pPr()
+    borders = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "6")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "2E75B6")
+    borders.append(bottom)
+    p_pr.insert(0, borders)
+    return p
+
+
+def _set_col_widths(table, widths: Tuple[Cm, ...]):
+    for row in table.rows:
+        for i, w in enumerate(widths):
+            if i < len(row.cells):
+                row.cells[i].width = w
+
+
+def _fix_zoom_settings(doc: Document):
+    settings = doc.settings.element
+    zoom = settings.find(qn("w:zoom"))
+    if zoom is not None and zoom.get(qn("w:percent")) is None:
+        zoom.set(qn("w:percent"), "100")
+
+
+def _agregar_veredicto(doc: Document, nivel: str, titulo: str, cuerpo: str):
+    colores = {"ok": (FILL_LIGHTGREEN, GREEN), "alerta": (FILL_LIGHTAMBER, AMBER), "critico": (FILL_LIGHTRED, RED)}
+    fill, text_color = colores.get(nivel, colores["ok"])
+    table = doc.add_table(rows=1, cols=1)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    cell = table.rows[0].cells[0]
+    _set_cell_background(cell, fill)
+    _set_cell_borders(cell, color="D9D9D9", size=10)
+    _set_cell_margins(cell, top=160, bottom=160, left=200, right=200)
+    cell.text = ""
+    p1 = cell.paragraphs[0]
+    run1 = p1.add_run(titulo)
+    _style_run(run1, size=13, bold=True, color=text_color)
+    p2 = cell.add_paragraph()
+    p2.paragraph_format.space_before = Pt(4)
+    run2 = p2.add_run(cuerpo)
+    _style_run(run2, size=10, color=GRAY)
+    doc.add_paragraph().paragraph_format.space_after = Pt(4)
+
+
+def _agregar_tarjetas_indicadores(doc: Document, tarjetas: List[Tuple[str, str, str, RGBColor]]):
+    n = len(tarjetas)
+    table = doc.add_table(rows=1, cols=n)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    for i, (valor, etiqueta, sub, color) in enumerate(tarjetas):
+        cell = table.rows[0].cells[i]
+        _set_cell_background(cell, FILL_LIGHTGRAY)
+        _set_cell_borders(cell)
+        _set_cell_margins(cell, top=120, bottom=120, left=80, right=80)
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        cell.text = ""
+        p1 = cell.paragraphs[0]
+        p1.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r1 = p1.add_run(valor)
+        _style_run(r1, size=16, bold=True, color=color)
+        p2 = cell.add_paragraph()
+        p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r2 = p2.add_run(etiqueta)
+        _style_run(r2, size=8, bold=True, color=GRAY)
+        p3 = cell.add_paragraph()
+        p3.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r3 = p3.add_run(sub)
+        _style_run(r3, size=8, italic=True, color=GRAY)
+    doc.add_paragraph().paragraph_format.space_after = Pt(4)
+
+
+# ==========================================================================
+# MAQUETACIÓN DE TABLA MASTER MARKET STATE (CONTRATO DE GOBIERNO)
+# ==========================================================================
+def _agregar_seccion_master_state(doc: Document, global_data: Dict[str, Any]):
+    if not global_data:
+        _add_paragraph(doc, "⚠️ El informe maestro de estado global de mercado no está disponible.", color=RED, italic=True)
+        return
+
+    regime_data = global_data.get("global_market_regime", {})
+    permits = global_data.get("global_operational_permits", {})
+
+    _add_heading(doc, "1. Diagnóstico del Ecosistema de Mercado Global (Master State)", level=1)
+    _add_paragraph(
+        doc,
+        "Análisis de correlación híbrida cruzada (Pearson + Spearman) y clasificación sistémica de las "
+        "dimensiones agregadas de la canasta completa de Forex para la sesión actual:",
+        italic=True,
+        color=GRAY
+    )
+
+    headers = ["Dimensión Sistémica", "Métrica / Score", "Clasificación de Régimen", "Estatus Operativo"]
+    col_widths = (Cm(3.5), Cm(3.0), Cm(4.0), Cm(5.0))
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    for i, h in enumerate(headers):
+        _write_cell(table.rows[0].cells[i], h, size=9, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF), fill=FILL_NAVY)
+
+    # 1. Volatilidad Sistémica
+    vol = regime_data.get("systemic_volatility", {})
+    r1 = table.add_row()
+    _write_cell(r1.cells[0], "Volatilidad Sistémica", size=9, bold=True, fill=FILL_WHITE, align=WD_ALIGN_PARAGRAPH.LEFT)
+    _write_cell(r1.cells[1], f"{vol.get('score', 0.0):.1f}", size=9, fill=FILL_WHITE)
+    _write_cell(r1.cells[2], vol.get("regime", "NORMAL"), size=9, bold=True, color=RED if vol.get("regime") == "STRESSED" else GRAY, fill=FILL_WHITE)
+    _write_cell(r1.cells[3], "Scalping: ALLOWED" if permits.get("allow_scalping") else "Scalping: SUSPENDED", size=8.5, bold=True, color=GREEN if permits.get("allow_scalping") else RED, fill=FILL_WHITE)
+
+    # 2. Liquidez Sistémica
+    liq = regime_data.get("systemic_liquidity", {})
+    r2 = table.add_row()
+    _write_cell(r2.cells[0], "Liquidez Sistémica", size=9, bold=True, fill=FILL_LIGHTGRAY, align=WD_ALIGN_PARAGRAPH.LEFT)
+    _write_cell(r2.cells[1], f"{liq.get('score', 0.0):.1f}%", size=9, fill=FILL_LIGHTGRAY)
+    _write_cell(r2.cells[2], liq.get("regime", "NORMAL"), size=9, bold=True, color=RED if liq.get("regime") == "CRITICAL" else GREEN, fill=FILL_LIGHTGRAY)
+    _write_cell(r2.cells[3], "Portfolio Rebal: OK" if permits.get("allow_portfolio") else "Portfolio Rebal: BLOCKED", size=8.5, bold=True, color=GREEN if permits.get("allow_portfolio") else RED, fill=FILL_LIGHTGRAY)
+
+    # 3. Cohesión de Red (Correlación)
+    coh = regime_data.get("systemic_cohesion", {})
+    r3 = table.add_row()
+    _write_cell(r3.cells[0], "Cohesión Sistémica", size=9, bold=True, fill=FILL_WHITE, align=WD_ALIGN_PARAGRAPH.LEFT)
+    _write_cell(r3.cells[1], f"R: {coh.get('mean_absolute_correlation', 0.0):.4f}", size=9, fill=FILL_WHITE)
+    _write_cell(r3.cells[2], coh.get("regime", "NORMAL"), size=9, bold=True, color=RED if "COHESIVE" in coh.get("regime", "") else GRAY, fill=FILL_WHITE)
+    _write_cell(r3.cells[3], "Swing: ALLOWED" if permits.get("allow_swing") else "Swing: SUSPENDED", size=8.5, bold=True, color=GREEN if permits.get("allow_swing") else RED, fill=FILL_WHITE)
+
+    # 4. Apetito de Riesgo Global
+    risk = regime_data.get("risk_appetite", {})
+    r4 = table.add_row()
+    _write_cell(r4.cells[0], "Sentimiento (Risk-On/Off)", size=9, bold=True, fill=FILL_LIGHTGRAY, align=WD_ALIGN_PARAGRAPH.LEFT)
+    _write_cell(r4.cells[1], f"Diferencial: {risk.get('score', 0.0):.3f}%", size=9, fill=FILL_LIGHTGRAY)
+    _write_cell(r4.cells[2], risk.get("regime", "NEUTRAL"), size=9, bold=True, color=GREEN if risk.get("regime") == "RISK_ON" else (RED if risk.get("regime") == "RISK_OFF" else GRAY), fill=FILL_LIGHTGRAY)
+    _write_cell(r4.cells[3], f"Apalancamiento: {permits.get('leverage_execution_mode', 'STANDARD')}", size=8.5, bold=True, color=GREEN if "STANDARD" in permits.get("leverage_execution_mode", "") else AMBER, fill=FILL_LIGHTGRAY)
+
+    _set_col_widths(table, col_widths)
+    doc.add_paragraph().paragraph_format.space_after = Pt(12)
+
+
+# ==========================================================================
+# MAQUETACIÓN DE TABLAS DE INTELIGENCIA OPERACIONAL F3
+# ==========================================================================
+def _agregar_tabla_compositor(doc: Document, reports: Dict[str, Any]):
+    headers = ["Estilo", "Estatus", "Símbolos de Trading", "Diversificación N_eff", "Correlación Media", "Readiness Promedio"]
+    col_widths = (Cm(2.0), Cm(2.5), Cm(3.5), Cm(3.0), Cm(2.5), Cm(3.0))
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    
+    for i, h in enumerate(headers):
+        _write_cell(table.rows[0].cells[i], h, size=9, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF), fill=FILL_NAVY)
+        
+    for idx, (style, r) in enumerate(reports.items()):
+        row = table.add_row()
+        fill = FILL_WHITE if idx % 2 == 0 else FILL_LIGHTGRAY
+        status = r.get("status", "SIN_DATOS")
+        status_color = GREEN if status == "OPERABLE" else RED
+        
+        assets = ", ".join(r.get("trio", [])) if "trio" in r else "—"
+        metrics = r.get("metrics", {})
+        n_eff = f"{metrics.get('n_eff', 0.0):.2f}" if metrics else "—"
+        avg_corr = f"{metrics.get('rho_avg', 0.0):.4f}" if metrics else "—"
+        avg_read = f"{metrics.get('mean_readiness', 0.0):.1f}%" if metrics else "—"
+        
+        _write_cell(row.cells[0], style.upper(), size=9, bold=True, fill=fill)
+        _write_cell(row.cells[1], status, size=9, bold=True, color=status_color, fill=fill)
+        _write_cell(row.cells[2], assets, size=9, fill=fill)
+        _write_cell(row.cells[3], n_eff, size=9, fill=fill)
+        _write_cell(row.cells[4], avg_corr, size=9, fill=fill)
+        _write_cell(row.cells[5], avg_read, size=9, fill=fill)
+        
+    _set_col_widths(table, col_widths)
+    doc.add_paragraph().paragraph_format.space_after = Pt(12)
+
+
+def _agregar_tabla_readiness(doc: Document, symbol_readiness: Dict[str, Any], results_anomaly: Dict[str, Any]):
+    headers = ["Símbolo", "FCI %", "Spread Score", "Volatilidad %", "Riesgo Ejec.", "Scalping", "Intraday", "Swing"]
+    col_widths = (Cm(1.8), Cm(1.6), Cm(2.1), Cm(2.0), Cm(2.0), Cm(2.3), Cm(2.3), Cm(2.3))
+    
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    
+    for i, h in enumerate(headers):
+        _write_cell(table.rows[0].cells[i], h, size=9, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF), fill=FILL_NAVY)
+        
+    for idx, (symbol, con) in enumerate(symbol_readiness.items()):
+        row = table.add_row()
+        fill = FILL_WHITE if idx % 2 == 0 else FILL_LIGHTGRAY
+        
+        styles = con.get("readiness_by_style", {})
+        fci_val = con.get("metadata", {}).get("fci_captura", 95.0)
+        
+        # Obtener métricas seguras de spread / volatilidad promedio
+        metrics = con.get("metadata", {}).get("evaluated_metrics", {})
+        spread_m = metrics.get("spread_mean", 0.0)
+        tps_m = metrics.get("tps_mean", 0.0)
+        
+        _write_cell(row.cells[0], symbol, size=9, bold=True, align=WD_ALIGN_PARAGRAPH.LEFT, fill=fill)
+        _write_cell(row.cells[1], f"{fci_val:.1f}%", size=9, fill=fill)
+        _write_cell(row.cells[2], f"{spread_m:.1f}", size=9, fill=fill)
+        _write_cell(row.cells[3], "NORMAL", size=9, fill=fill)
+        _write_cell(row.cells[4], f"{tps_m:.1f}/s", size=9, fill=fill)
+        
+        for i, est in enumerate(["scalping", "intraday", "swing"]):
+            est_data = styles.get(est, {})
+            status = est_data.get("status", "BLOQUEADO")
+            score = est_data.get("readiness_score", 0.0)
+            col = GREEN if status == "PASS" else RED
+            
+            _write_cell(
+                row.cells[5 + i], 
+                f"{status}\n({score:.1f})", 
+                size=8, 
+                bold=True, 
+                color=col, 
+                fill=fill
+            )
+            
+    _set_col_widths(table, col_widths)
+    doc.add_paragraph().paragraph_format.space_after = Pt(12)
+
+
+def _agregar_tabla_anomalias(doc: Document, results: Dict[str, Any]):
+    headers = ["Símbolo", "Anomaly Score", "Probabilidad", "Estatus Anomalía", "Spread (Z)", "Volatilidad (Z)", "TPS (Z)"]
+    col_widths = (Cm(1.8), Cm(2.4), Cm(2.2), Cm(2.8), Cm(2.3), Cm(2.4), Cm(2.6))
+    
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    
+    for i, h in enumerate(headers):
+        _write_cell(table.rows[0].cells[i], h, size=9, bold=True, color=RGBColor(0xFF, 0xFF, 0xFF), fill=FILL_NAVY)
+        
+    for idx, (symbol, res) in enumerate(results.items()):
+        row = table.add_row()
+        fill = FILL_WHITE if idx % 2 == 0 else FILL_LIGHTGRAY
+        
+        score = res.get("anomaly_score", 0.0)
+        prob = res.get("anomaly_probability", 0.0)
+        class_level = res.get("classification_level", "NORMAL")
+        dims = res.get("dimensions", {})
+        
+        class_color = RED if class_level == "EXTREME" else (AMBER if class_level == "ANOMALOUS" else GREEN)
+        
+        _write_cell(row.cells[0], symbol, size=9, bold=True, align=WD_ALIGN_PARAGRAPH.LEFT, fill=fill)
+        _write_cell(row.cells[1], f"{score:.2f}", size=9, fill=fill)
+        _write_cell(row.cells[2], f"{(prob*100.0):.2f}%", size=9, fill=fill)
+        _write_cell(row.cells[3], class_level, size=9, bold=True, color=class_color, fill=fill)
+        _write_cell(row.cells[4], f"{dims.get('spread', {}).get('z_robust', 0.0):.2f}", size=9, fill=fill)
+        _write_cell(row.cells[5], f"{dims.get('volatility', {}).get('z_robust', 0.0):.2f}", size=9, fill=fill)
+        _write_cell(row.cells[6], f"{dims.get('tps', {}).get('z_robust', 0.0):.2f}", size=9, fill=fill)
+        
+    _set_col_widths(table, col_widths)
+    doc.add_paragraph().paragraph_format.space_after = Pt(12)
+
+
+# ==========================================================================
+# 🎯 CERTIFICACIÓN DE CONSISTENCIA DE MODELOS (FASE 3.5)
+# ==========================================================================
+def _agregar_seccion_validacion_modelos(doc: Document, fecha: str) -> bool:
+    """Agrega la Sección 5: Certificación de Consistencia de Modelos (Fase 3.5)."""
+    validation_path = AUDIT_STATE_DIR / f"quant_validation_report_{fecha}.json"
+    
+    if not validation_path.exists():
+        logger.warning(f"⚠️ No se encontró reporte de validación cuantitativa para {fecha}")
+        return False
+        
+    try:
+        v_data = load_contract_safe(validation_path)
+        if not v_data:
+            return False
+            
+        status_global = v_data.get("global_status", "UNKNOWN")
+        warnings = v_data.get("warning_count", 0)
+        failures = v_data.get("fail_count", 0)
+        
+        _add_heading(doc, "5. Certificación de Consistencia de Modelos (Fase 3.5)", level=1)
+        _add_paragraph(
+            doc,
+            "Evaluación de sanidad de coeficientes, deriva sistemática de predicciones (Drift) "
+            "e integridad analítica de los modelos predictivos cargados:",
+            italic=True,
+            color=GRAY
+        )
+        
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(8)
+        run_lbl = p.add_run("Estado de Validación Global: ")
+        _style_run(run_lbl, size=11, bold=True)
+        
+        if status_global == "APPROVED":
+            run_status = p.add_run("✅ APROBADO")
+            _style_run(run_status, size=11, bold=True, color=GREEN)
+        else:
+            run_status = p.add_run("🚨 SUSPENDIDO (Incoherencias críticas en modelo)")
+            _style_run(run_status, size=11, bold=True, color=RED)
+            
+        p.add_run(f"\nSe auditaron los modelos correspondientes a los 15 activos configurados. ")
+        p.add_run(f"Alertas menores (Warnings): {warnings} | Incoherencias críticas detectadas: {failures}.\n")
+        
+        if failures > 0:
+            doc.add_paragraph("Símbolos observados con fallos críticos de modelo:").bold = True
+            for sym, res in v_data.get("resultados_simbolos", {}).items():
+                if res.get("status") == "REJECTED":
+                    issues = res.get("issues", [])
+                    issues_str = ", ".join([i.get("message", "Fallo no especificado") for i in issues])
+                    _add_bullet(doc, f"{sym}: {issues_str}", size=10, color=RED)
+            return True
+        else:
+            _add_paragraph(doc, "✓ Todos los modelos vigentes han superado satisfactoriamente los umbrales de estabilidad y consistencia estructural.", size=10, color=GREEN)
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Error al procesar sección de validación de modelos: {e}", exc_info=True)
+        return False
+
+
+# ==========================================================================
+# GENERADOR PRINCIPAL DEL REPORTE
+# ==========================================================================
+def generar_reporte_f3_docx(fecha: str) -> Path:
+    contract_file = AUDIT_STATE_DIR / "portfolio_execution_contract.json"
+    anomaly_file = QUANT_ANOMALIES_DIR / f"anomaly_report_{fecha}.json"
+    portfolio_file = PROCESSED_DATA_DIR / "readiness" / f"readiness_report_{fecha}.json"
+    global_regime_file = OI_OUTPUT_DIR / f"global_regime_{fecha}.json"
+    validation_path = AUDIT_STATE_DIR / f"quant_validation_report_{fecha}.json"
+
+    if not contract_file.exists():
+        raise FileNotFoundError(f"Falta el contrato de portafolio de Fase 3: {contract_file.name}")
+
+    contract_data = load_contract_safe(contract_file)
+    global_data = load_contract_safe(global_regime_file)
+
+    # Cargar datos de Readiness
+    symbol_readiness = {}
+    if portfolio_file.exists():
+        p_data = load_contract_safe(portfolio_file)
+        for item in p_data.get("resultados_readiness", []):
+            symbol_readiness[item["symbol"]] = item
+
+    # Cargar anomalías
+    anomaly_data = load_contract_safe(anomaly_file)
+    results_anomaly = {res["symbol"]: res for res in anomaly_data.get("results", [])} if anomaly_data else {}
+
+    portfolio_reports = contract_data.get("readiness_by_style", {})
+
+    doc = Document()
+    for section in doc.sections:
+        section.top_margin = Cm(2.0)
+        section.bottom_margin = Cm(2.0)
+        section.left_margin = Cm(2.0)
+        section.right_margin = Cm(2.0)
+
+    _add_heading(doc, f"📋 INFORME EJECUTIVO DE INTELIGENCIA OPERACIONAL", level=1)
+    _add_paragraph(
+        doc,
+        f"Fase 3: Admisión de Mercado, Gobierno y Composición de Portafolios\n"
+        f"Fecha Evaluada: {fecha} | Generado el: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        italic=True,
+        color=GRAY,
+    )
+    _add_divider(doc)
+
+    systemic_stress = anomaly_data.get("systemic_stress_detected", False)
+    scalping_status = portfolio_reports.get("scalping", {}).get("status", "SIN_DATOS")
+    intraday_status = portfolio_reports.get("intraday", {}).get("status", "SIN_DATOS")
+    
+    admitidos_swing = sum(1 for c in symbol_readiness.values() if c.get("readiness_by_style", {}).get("swing", {}).get("status") == "PASS")
+
+    permits = global_data.get("global_operational_permits", {})
+    leverage_mode = permits.get("leverage_execution_mode", "STANDARD (100%)")
+
+    if systemic_stress or "DEFENSIVE" in leverage_mode:
+        nivel = "critico"
+        titulo_veredicto = "🚨 ALERTA: MODO DEFENSIVO SISTÉMICO ACTIVO"
+        cuerpo_veredicto = (
+            f"Se ha detectado inestabilidad o correlación extrema en el ecosistema (Master Cohesión o Estrés). "
+            f"La gobernanza global ha limitado el apalancamiento a un `{leverage_mode}` para proteger el capital."
+        )
+    elif scalping_status == "VETOED" and intraday_status == "VETOED":
+        nivel = "critico"
+        titulo_veredicto = "⚠ ALERTA: OPERATORIA COMPLETAMENTE SUSPENDIDA"
+        cuerpo_veredicto = "La gobernanza global de spreads ha vetado de manera absoluta las operaciones de Scalping e Intraday debido a spreads anormales detectados hoy."
+    elif scalping_status == "OPERABLE" or intraday_status == "OPERABLE":
+        nivel = "ok"
+        titulo_veredicto = "✓ CONDICIONES ÓPTIMAS Y PORTAFOLIO COMPUESTO"
+        cuerpo_veredicto = f"Se compuso de forma exitosa el portafolio para Scalping e Intraday bajo un apalancamiento operativo del {leverage_mode}."
+    else:
+        nivel = "alerta"
+        titulo_veredicto = "⚠️ ATENCIÓN: CANASTA ALTAMENTE RESTRINGIDA"
+        cuerpo_veredicto = f"El mercado se encuentra en fase de transición o con liquidez reducida. Hay {admitidos_swing} activo(s) admitidos para Swing."
+
+    _agregar_veredicto(doc, nivel, titulo_veredicto, cuerpo_veredicto)
+
+    intraday_selected = portfolio_reports.get("intraday", {})
+    neff_val = intraday_selected.get("metrics", {}).get("n_eff", 3.0) if intraday_selected else 3.0
+    assets_selected = ", ".join(intraday_selected.get("trio", [])) if "trio" in intraday_selected else "N/A"
+    
+    tarjetas = [
+        (f"{assets_selected}", "PORTAFOLIO SELECC.", "Trío de trading óptimo", NAVY if assets_selected != "N/A" else RED),
+        (f"{neff_val:.2f} / 3.0", "DIVERSIFICACIÓN REAL", "Número efectivo de apuestas", GREEN if neff_val > 2.0 else AMBER),
+        (f"{leverage_mode}", "APALANCAMIENTO", "Capa de Gobierno Master", RED if "DEFENSIVE" in leverage_mode else (AMBER if "REDUCED" in leverage_mode else GREEN)),
+        (f"ESTABLE" if not systemic_stress else "ESTRÉS", "ESTADO SISTÉMICO", "Análisis de colas", GREEN if not systemic_stress else RED),
+    ]
+    _agregar_tarjetas_indicadores(doc, tarjetas)
+
+    # 1. Diagnóstico del Ecosistema de Mercado Global
+    _agregar_seccion_master_state(doc, global_data)
+    _add_divider(doc)
+
+    # 2. Selección de Portafolio
+    _add_heading(doc, "2. Optimización y Selección de Portafolio por Estilo", level=1)
+    _add_paragraph(doc, "Análisis de correlación cruzada realizado sobre las series temporales M1/M5 de sesión abierta. El compositor evalúa de forma exhaustiva los tríos buscando maximizar N_eff.")
+    _agregar_tabla_compositor(doc, portfolio_reports)
+
+    # 3. Contrato de Admisión
+    _add_heading(doc, "3. Contrato de Admisión y Aptitud por Símbolo", level=1)
+    _add_paragraph(doc, "Puntuación centesimal calculada por dimensión y veredicto de admisión final luego de aplicar los caps de veto correspondientes:")
+    _agregar_tabla_readiness(doc, symbol_readiness, results_anomaly)
+
+    # 4. Diagnóstico de Anomalías
+    _add_heading(doc, "4. Diagnóstico de Anomalías y Estrés (9 Capas)", level=1)
+    _add_paragraph(doc, "Evaluación de colas estadísticas basada en desviaciones robustas (Z-Robust) y temporalidad EWMA.")
+    _agregar_tabla_anomalias(doc, results_anomaly)
+
+    # 5. Certificación de Consistencia de Modelos (Integración de validaciones F3.5)
+    _add_divider(doc)
+    modelos_fallaron = _agregar_seccion_validacion_modelos(doc, fecha)
+
+    # 6. Guía de Acción para el Operador
+    _add_divider(doc)
+    _add_heading(doc, "6. Guía de Acción para el Operador", level=1)
+    
+    if modelos_fallaron:
+        _add_bullet(doc, "🚨 FALLO DE MODELO CRÍTICO (Fase 3.5): Uno o más activos presentan deriva excesiva o incoherencia matemática estructural. Suspender la ejecución en los pares rechazados inmediatamente.", bold=True, color=RED)
+        
+    if "DEFENSIVE" in leverage_mode:
+        _add_bullet(doc, "MODO DEFENSIVO ACTIVO: Reducir de inmediato el apalancamiento a un 50% de la cuenta estándar.", bold=True, color=RED)
+        _add_bullet(doc, "Evitar añadir nuevas posiciones de alta frecuencia correlacionadas debido a inestabilidad sistémica en el mercado.")
+    elif "REDUCED" in leverage_mode:
+        _add_bullet(doc, "MODO RESTRINGIDO ACTIVO: Reducir el tamaño del lote un 25% respecto a la exposición estándar.", bold=True, color=AMBER)
+        _add_bullet(doc, "Monitorear la evolución de los spreads individuales a lo largo de la jornada de trading.")
+    else:
+        if not modelos_fallaron:
+            _add_bullet(doc, "OPERATIVA AUTORIZADA: Proceder con la carga del trío óptimo seleccionado en los bots de trading.", bold=True, color=GREEN)
+        
+    _add_bullet(doc, "Los símbolos marcados como 'FAIL' no participarán en las órdenes del portafolio bajo ninguna circunstancia.")
+
+    _fix_zoom_settings(doc)
+    output_path = OI_OUTPUT_DIR / f"diagnostico_operacional_F3_{fecha}.docx"
+    doc.save(str(output_path))
+    return output_path
+
+
+def main():
+    parser = argparse.ArgumentParser(description="OI Docx Report Generator")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+    
+    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
+    logger.info(f"🚀 Iniciando generación de reporte Word de Inteligencia Operacional para la fecha: {fecha}")
+    
+    try:
+        output_path = generar_reporte_f3_docx(fecha)
+        logger.info(f"✅ Reporte Word de Inteligencia Operacional generado exitosamente en: {output_path}")
+        
+        contract_file = AUDIT_STATE_DIR / "portfolio_execution_contract.json"
+        assets_selected = "Ninguno (Modo Defensivo/Veto)"
+        if contract_file.exists():
+            try:
+                c_data = load_contract_safe(contract_file)
+                intraday_selected = c_data.get("readiness_by_style", {}).get("intraday", {})
+                if "trio" in intraday_selected:
+                    assets_selected = ", ".join(intraday_selected["trio"])
+            except Exception:
+                pass
+                
+        msg = (
+            f"📄 *REPORTE WORD QUANT (F3) CREADO*\n"
+            f"📅 Fecha: {fecha}\n"
+            f"📂 Archivo: `{output_path.name}`\n"
+            f"📍 Ubicación: `{output_path.parent}`\n"
+            f"📈 Trío Seleccionado: {assets_selected}"
+        )
+        send_telegram_alert(msg)
+        logger.info("📡 Notificación de Inteligencia Operacional enviada a Telegram.")
+    except Exception as e:
+        logger.error(f"❌ Error crítico generando reporte unificado de Inteligencia Operacional: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    main()

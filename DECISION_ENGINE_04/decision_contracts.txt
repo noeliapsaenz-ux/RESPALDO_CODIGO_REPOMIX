@@ -1,0 +1,78 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+DECISION_CONTRACTS - Puente de contratos canónicos de decisión
+==========================================================================
+Ubicación: DECISION_ENGINE_04/decision_contracts.py
+Dependencias: decision_config, system_canonical
+Responsabilidad: Definir y validar la firma de los contratos ejecutivos
+                 de decisión (ALLOW/DENY/VETO) garantizando la adherencia
+                 estructural a los enums canónicos del sistema.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+current_dir = Path(__file__).resolve().parent
+if str(current_dir) not in sys.path:
+    sys.path.insert(0, str(current_dir))
+
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
+
+from decision_config import (
+    DecisionStatus, ContractType, MetadataEnvelope, 
+    validate_canonical_enum, SCHEMA_VERSION_DECISION, PRODUCER_DECISION
+)
+
+def create_decision_symbol_entry(
+    symbol: str,
+    decision_status: str,
+    execution_feasibility_score: float,
+    hypothesis_significance: float,
+    decision_confidence_score: float,
+    veto_reasons: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    if not validate_canonical_enum(decision_status, DecisionStatus):
+        raise ValueError(f"decision_status invalido: {decision_status}")
+
+    return {
+        "symbol": symbol.upper(),
+        "decision_status": decision_status,
+        "execution_feasibility_score": round(float(execution_feasibility_score), 4),
+        "hypothesis_significance": round(float(hypothesis_significance), 4),
+        "decision_confidence_score": round(float(decision_confidence_score), 4),
+        "veto_reasons": veto_reasons or []
+    }
+
+def create_canonical_execution_contract(
+    fecha: str,
+    decisions: List[Dict[str, Any]],
+    global_veto_active: bool = False
+) -> Dict[str, Any]:
+    envelope = MetadataEnvelope(
+        schema_version=SCHEMA_VERSION_DECISION,
+        contract_type=ContractType.DECISION_CONTRACT,
+        producer_identity=PRODUCER_DECISION,
+        timestamp_emission=datetime.now(timezone.utc).isoformat()
+    )
+
+    return {
+        **envelope.to_dict(),
+        "fecha": fecha,
+        "global_veto_active": global_veto_active,
+        "decisions": decisions
+    }
+
+def validate_execution_contract(contract: Dict[str, Any]) -> bool:
+    required = {"schema_version", "contract_type", "producer_identity",
+                "timestamp_emission", "fecha", "decisions"}
+    if not required.issubset(contract.keys()):
+        return False
+    if contract.get("contract_type") != ContractType.DECISION_CONTRACT.value:
+        return False
+    return True

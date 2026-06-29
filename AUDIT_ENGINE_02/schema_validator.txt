@@ -1,0 +1,125 @@
+"""
+==========================================================================
+SCHEMA VALIDATOR - VERIFICACIÓN DE ESQUEMAS E INTEGRIDAD ESTRUCTURAL
+==========================================================================
+Ubicación: AUDIT_ENGINE_02
+Dependencias: audit_config (paths, symbols, logging, validation)
+Responsabilidad: Validar la integridad estructural de los Parquets Maestro
+                 y Gold, verificando la presencia de columnas requeridas
+                 y la consistencia de los datos.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección de ruta raíz
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+import argparse
+from datetime import datetime, timezone
+from typing import Dict, Any
+import pandas as pd
+
+# Importación desde audit_config
+from audit_config import (
+    AUDIT_REPORTES_DIR,
+    AUDIT_STATE_DIR,
+    AUDIT_MAESTROS_DIR,
+    AUDIT_GOLD_DIR,
+    SYMBOLS_TO_AUDIT,
+    get_fecha_broker_str,
+    STRUCTURE_VALIDATION,
+    init_audit_logging,
+    AUDIT_VERSION
+)
+
+# Importación desde audit_contracts
+from audit_contracts import resolve_target_date
+
+# Inicializar logger
+logger = init_audit_logging("schema_validator", "02_AUDIT")
+
+COLUMNAS_REQUERIDAS_MAESTRO = STRUCTURE_VALIDATION.get("parquet_required_columns")
+
+
+def verificar_parquet_completo(symbol: str, fecha: str) -> Dict[str, Any]:
+    """
+    Verifica la integridad estructural de los Parquets para un símbolo.
+
+    Args:
+        symbol: Símbolo
+        fecha: Fecha en formato YYYYMMDD
+
+    Returns:
+        Dict[str, Any]: Resultado de la verificación
+    """
+    resultado = {
+        'symbol': symbol,
+        'maestro_existe': False,
+        'maestro_filas': 0,
+        'gold_existe': False,
+        'gold_filas': 0,
+        'gold_percent': 0.0,
+        'estructura_ok': False,
+        'columnas_faltantes': [],
+        'avg_quality_gold': "N/A",
+        'errores': []
+    }
+
+    maestro_path = AUDIT_MAESTROS_DIR / f"ticks_maestro_{symbol}_{fecha}.parquet"
+    if not maestro_path.exists():
+        resultado['errores'].append("Archivo Maestro Parquet ausente en disco.")
+        return resultado
+
+    resultado['maestro_existe'] = True
+    try:
+        df_maestro = pd.read_parquet(maestro_path)
+        resultado['maestro_filas'] = len(df_maestro)
+        resultado['columnas_faltantes'] = [col for col in COLUMNAS_REQUERIDAS_MAESTRO if col not in df_maestro.columns]
+        resultado['estructura_ok'] = len(resultado['columnas_faltantes']) == 0
+    except Exception as e:
+        resultado['errores'].append(f"Error de lectura en Maestro Parquet: {str(e)}")
+        return resultado
+
+    gold_path = AUDIT_GOLD_DIR / f"{symbol}_{fecha}_gold.parquet"
+    if gold_path.exists():
+        resultado['gold_existe'] = True
+        try:
+            df_gold = pd.read_parquet(gold_path)
+            resultado['gold_filas'] = len(df_gold)
+            if resultado['maestro_filas'] > 0:
+                resultado['gold_percent'] = round((resultado['gold_filas'] / resultado['maestro_filas']) * 100, 1)
+
+            # Calcular calidad promedio del Gold
+            if 'quality_score' in df_gold.columns:
+                resultado['avg_quality_gold'] = round(float(df_gold['quality_score'].mean()), 2)
+        except Exception as e:
+            resultado['errores'].append(f"Error de lectura en Gold Parquet: {str(e)}")
+
+    return resultado
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Schema Validator")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+
+    fecha = resolve_target_date(args.date, AUDIT_STATE_DIR, get_fecha_broker_str)
+    logger.info(f"📋 VERIFICACIÓN ESTRUCTURAL DE PARQUETS (VER. {AUDIT_VERSION}) - FECHA: {fecha}")
+
+    correctos = 0
+    for symbol in SYMBOLS_TO_AUDIT:
+        res = verificar_parquet_completo(symbol, fecha)
+        if res['maestro_existe'] and res['estructura_ok']:
+            correctos += 1
+            logger.info(f"  • {symbol:8} | Maestro: {res['maestro_filas']:9,} | Gold: {res['gold_filas']:9,} ({res['gold_percent']}%) | Estructura: OK | Avg Quality: {res['avg_quality_gold']}")
+        else:
+            logger.warning(f"  ❌ {symbol:8} | Errores detectados: {res['errores']}")
+
+    logger.info(f"\n📊 Esquemas correctos: {correctos}/{len(SYMBOLS_TO_AUDIT)} archivos.")
+
+
+if __name__ == "__main__":
+    main()

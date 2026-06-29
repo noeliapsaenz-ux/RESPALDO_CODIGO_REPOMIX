@@ -1,0 +1,279 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+QUANT VALIDATOR - CERTIFICADOR DE COHERENCIA DE MODELOS (FASE 3.5)
+==========================================================================
+Ubicación: QUANT_ENGINE_03
+Dependencias: quant_config (paths, logging, symbols, settings, contracts)
+Responsabilidad: Analizar pasivamente los outputs numéricos de la Fase 3,
+                 verificar que no contengan anomalías matemáticas (NaN, Inf)
+                 ni contradicciones lógicas entre modelos (Cross-Check), y
+                 firmar el reporte de validación necesario para la Fase 4.
+==========================================================================
+"""
+import sys
+import math
+import argparse
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
+import numpy as np
+
+# Inyección dinámica de la raíz del proyecto
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+# Importación desde quant_config
+from quant_config import (
+    AUDIT_STATE_DIR,
+    AUDIT_REPORTES_DIR,
+    PROCESSED_DATA_DIR,
+    QUANT_ANOMALIES_DIR,
+    OI_OUTPUT_DIR,
+    SYMBOLS_TO_QUANT,
+    get_fecha_broker_str,
+    BROKER_TZ,
+    init_quant_logging,
+    save_contract_atomic,
+    load_contract_safe
+)
+
+logger = init_quant_logging("quant_validator", "03_QUANT")
+
+
+class QuantValidator:
+    def __init__(self, fecha: str):
+        self.fecha = fecha
+        self.readiness_path = PROCESSED_DATA_DIR / "readiness" / f"readiness_report_{fecha}.json"
+        self.anomaly_path = QUANT_ANOMALIES_DIR / f"anomaly_report_{fecha}.json"
+        self.output_path = AUDIT_STATE_DIR / f"quant_validation_report_{fecha}.json"
+        
+        self.reporte_final = {
+            "fecha": fecha,
+            "timestamp_evaluacion": datetime.now(timezone.utc).isoformat(),
+            "global_status": "APPROVED",
+            "fail_count": 0,
+            "warning_count": 0,
+            "resultados_simbolos": {}
+        }
+
+    def _es_valor_invalido(self, val: Any) -> bool:
+        """Determina de forma segura si un valor es NaN, Inf o nulo."""
+        if val is None:
+            return True
+        if isinstance(val, (int, float)):
+            return math.isnan(val) or math.isinf(val)
+        return False
+
+    def load_json_safe(self, filepath: Path) -> Dict[str, Any]:
+        """Carga JSON de forma segura usando load_contract_safe."""
+        return load_contract_safe(filepath)
+
+    def validar_simbolo(self, symbol: str, readiness_data: Dict, anomaly_data: Dict) -> Dict[str, Any]:
+        symbol = symbol.upper()
+        issues = []
+        status = "APPROVED"
+        
+        # 1. Extracción segura de métricas de Readiness (Gobernanza)
+        readiness_entry = {}
+        for item in readiness_data.get("resultados_readiness", []):
+            if item.get("symbol") == symbol:
+                readiness_entry = item
+                break
+                
+        # 2. Extracción segura de métricas de Anomalía
+        anomaly_entry = {}
+        an_list = anomaly_data.get("results", anomaly_data.get("resultados", []))
+        for item in an_list:
+            if item.get("symbol") == symbol:
+                anomaly_entry = item
+                break
+
+        # ==============================================================================
+        # 🔬 REGLA 1: MATH SANITY (NaN, Inf, Range checks)
+        # ==============================================================================
+        scores_a_verificar = {}
+        
+        styles = readiness_entry.get("readiness_by_style", {})
+        for style in ["scalping", "intraday", "swing"]:
+            score_style = styles.get(style, {}).get("readiness_score")
+            if score_style is not None:
+                scores_a_verificar[f"readiness_{style}"] = score_style
+
+        an_score = anomaly_entry.get("anomaly_score")
+        if an_score is not None:
+            scores_a_verificar["anomaly_score"] = an_score
+
+        # Ejecución del barrido numérico
+        for nombre_score, valor in scores_a_verificar.items():
+            if self._es_valor_invalido(valor):
+                issues.append({
+                    "severity": "CRITICAL_FAIL",
+                    "code": "MATH_CORRUPTION",
+                    "message": f"Métrica '{nombre_score}' presenta un valor numérico corrupto (NaN o Inf)."
+                })
+            elif not (0.0 <= float(valor) <= 100.0):
+                issues.append({
+                    "severity": "CRITICAL_FAIL",
+                    "code": "OUT_OF_BOUNDS",
+                    "message": f"Métrica '{nombre_score}' ({valor}) se encuentra fuera del límite canónico [0, 100]."
+                })
+
+        # ==============================================================================
+        # 🔬 REGLA 2: COHERENCIA DE ANOMALÍAS
+        # ==============================================================================
+        an_level = anomaly_entry.get("classification_level", "NORMAL")
+        if an_score is not None:
+            if an_level == "EXTREME" and an_score < 50.0:
+                issues.append({
+                    "severity": "CRITICAL_FAIL",
+                    "code": "ANOMALY_LOGIC_CONFLICT",
+                    "message": f"Conflicto de modelo: Clasificación EXTREME con un score de anomalía inconsistente ({an_score:.1f})."
+                })
+
+        # ==============================================================================
+        # 🔬 REGLA 3: COHERENCIA DE FLUJO Y LIQUIDEZ (Vetos por flujo fantasma)
+        # ==============================================================================
+        evaluated_metrics = readiness_entry.get("metadata", {}).get("evaluated_metrics", {})
+        tps_mean = evaluated_metrics.get("tps_mean")
+        readiness_scalping = styles.get("scalping", {}).get("readiness_score", 0.0)
+        
+        if tps_mean is not None:
+            if tps_mean == 0.0 and readiness_scalping > 50.0:
+                issues.append({
+                    "severity": "CRITICAL_FAIL",
+                    "code": "PHANTOM_LIQUIDITY",
+                    "message": f"Incoherencia de flujo: Readiness de Scalping alto ({readiness_scalping:.1f}) con promedio de ticks (TPS) en cero."
+                })
+
+        # ==============================================================================
+        # 🔬 REGLA 4: COHERENCIA DE NETWORKING
+        # ==============================================================================
+        jitter_mean = evaluated_metrics.get("jitter_mean_ms", 0.0)
+        if tps_mean is not None and tps_mean > 5.0 and jitter_mean < 0.01:
+            issues.append({
+                "severity": "WARNING",
+                "code": "SUSPICIOUS_LOW_JITTER",
+                "message": f"Jitter excesivamente bajo ({jitter_mean:.3f} ms) para una tasa activa de ticks ({tps_mean:.1f}/s)."
+            })
+
+        # Determinar estatus final del símbolo
+        has_critical = any(item["severity"] == "CRITICAL_FAIL" for item in issues)
+        if has_critical:
+            status = "REJECTED"
+        elif any(item["severity"] == "WARNING" for item in issues):
+            status = "WARNING"
+
+        return {
+            "status": status,
+            "issues": issues,
+            "metrics_checked_count": len(scores_a_verificar)
+        }
+
+    def ejecutar_certificacion(self) -> bool:
+        logger.info("🔍 Cargando certificados canónicos F3 para validación cruzada...")
+        
+        # Carga del Quant Certificate unificado diario
+        quant_cert_path = OI_OUTPUT_DIR / f"quant_certificate_{self.fecha}.json"
+        quant_cert = self.load_json_safe(quant_cert_path)
+        
+        readiness_data = {}
+        if not quant_cert or not quant_cert.get("symbols"):
+            logger.warning("⚠️ Quant Certificate canónico ausente. Usando fallback directo de reporte.")
+            readiness_data = self.load_json_safe(self.readiness_path)
+        else:
+            # Reestructurar el certificado canónico al formato procesable por validar_simbolo
+            readiness_data = {"resultados_readiness": []}
+            raw_readiness = self.load_json_safe(self.readiness_path)
+            if raw_readiness:
+                readiness_data = raw_readiness
+
+        if not readiness_data or not readiness_data.get("resultados_readiness"):
+            logger.critical("❌ Sin datos de Readiness. Cancelando Certificación.")
+            self.reporte_final["global_status"] = "SUSPENDED"
+            self.reporte_final["resultados_simbolos"]["SYSTEM"] = {
+                "status": "REJECTED",
+                "issues": [{
+                    "severity": "CRITICAL_FAIL",
+                    "code": "MISSING_QUANT_INPUTS",
+                    "message": "Faltan archivos de análisis de preparación cuantitativa (Readiness) para certificar."
+                }]
+            }
+            self.guardar_reporte()
+            return False
+
+        # Cargar reporte de anomalías
+        anomaly_data = self.load_json_safe(self.anomaly_path)
+        if not anomaly_data:
+            logger.critical("❌ Sin datos de Anomalía. Cancelando Certificación.")
+            self.reporte_final["global_status"] = "SUSPENDED"
+            self.reporte_final["resultados_simbolos"]["SYSTEM"] = {
+                "status": "REJECTED",
+                "issues": [{
+                    "severity": "CRITICAL_FAIL",
+                    "code": "MISSING_QUANT_INPUTS",
+                    "message": "Faltan archivos de anomalías para certificar."
+                }]
+            }
+            self.guardar_reporte()
+            return False
+
+        critical_total = 0
+        warning_total = 0
+
+        for symbol in SYMBOLS_TO_QUANT:
+            res = self.validar_simbolo(symbol, readiness_data, anomaly_data)
+            self.reporte_final["resultados_simbolos"][symbol] = res
+            
+            if res["status"] == "REJECTED":
+                critical_total += 1
+                logger.warning(f"❌ {symbol:8} : RECHAZADO por inconsistencias en los modelos de Quant.")
+                for issue in res["issues"]:
+                    logger.warning(f"   • [{issue['severity']}] {issue['message']}")
+            elif res["status"] == "WARNING":
+                warning_total += 1
+                logger.info(f"⚠️ {symbol:8} : APROBADO con observaciones menores.")
+            else:
+                logger.info(f"✅ {symbol:8} : CERTIFICADO (Modelos estables y consistentes).")
+
+        self.reporte_final["fail_count"] = critical_total
+        self.reporte_final["warning_count"] = warning_total
+
+        # Regla de Gobernanza: Si el 40% o más de los símbolos fallan, se suspende la operatividad global
+        limite_fallas = len(SYMBOLS_TO_QUANT) * 0.40
+        if critical_total >= limite_fallas:
+            self.reporte_final["global_status"] = "SUSPENDED"
+            logger.critical(f"🛑 GOBERNANZA: {critical_total} símbolos fallaron. Suspendiendo pipeline operativo global.")
+        else:
+            self.reporte_final["global_status"] = "APPROVED"
+
+        self.guardar_reporte()
+        return self.reporte_final["global_status"] == "APPROVED"
+
+    def guardar_reporte(self):
+        try:
+            AUDIT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+            save_contract_atomic(self.reporte_final, self.output_path)
+            logger.info(f"💾 Reporte unificado de validación de modelos guardado en: {self.output_path.name}")
+        except Exception as e:
+            logger.error(f"No se pudo escribir el reporte de validación: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Quant Validator V1.0")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+
+    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
+    logger.info("=" * 80)
+    logger.info(f"⚖️ INICIANDO VALIDACIÓN DE MODELOS CUANTITATIVOS - FECHA: {fecha}")
+    logger.info("=" * 80)
+
+    validator = QuantValidator(fecha)
+    validator.ejecutar_certificacion()
+
+
+if __name__ == "__main__":
+    main()

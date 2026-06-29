@@ -1,0 +1,180 @@
+"""
+==========================================================================
+MT5_GATEWAY - Conector singleton con MetaTrader 5
+==========================================================================
+Ubicación: CAPTURE_ENGINE_01
+Dependencias: settings (MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH)
+Responsabilidad: Mantener una conexión única y reutilizable con la terminal
+                 MT5, gestionar inicialización, login, shutdown, y
+                 proporcionar acceso a símbolos y ticks.
+==========================================================================
+"""
+import time
+import logging
+from pathlib import Path
+from typing import Optional, Any
+
+logger = logging.getLogger("mt5_wrapper")
+
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    logger.error("❌ Librería MetaTrader5 no se encuentra instalada.")
+    MT5_AVAILABLE = False
+
+
+class MT5Connection:
+    """Singleton para manejar la conexión global a MT5 con credenciales dinámicas."""
+    _instance = None
+    _initialized = False
+    _connected = False
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if MT5Connection._initialized:
+            return
+        MT5Connection._initialized = True
+        self._connection_count = 0
+        self._last_error = None
+        logger.info("✅ MT5Connection singleton creado")
+
+    def initialize(self) -> bool:
+        """Inicializa la conexión de MT5 usando credenciales de settings.py."""
+        if not MT5_AVAILABLE:
+            logger.error("❌ Librería MetaTrader5 no disponible.")
+            return False
+
+        if MT5Connection._connected:
+            self._connection_count += 1
+            return True
+
+        try:
+            from settings import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH
+            
+            # FORZAR LA RUTA CORRECTA
+            mt5_path = str(MT5_PATH) if MT5_PATH else None
+            
+            logger.info(f"🔌 Inicializando MT5 con ruta: {mt5_path}")
+            
+            # Intentar inicializar con la ruta
+            if mt5_path:
+                success = mt5.initialize(path=mt5_path)
+            else:
+                success = mt5.initialize()
+
+            if not success:
+                self._last_error = mt5.last_error()
+                logger.error(f"❌ Error inicializando terminal MT5: {self._last_error}")
+                return False
+
+            # Validar logueo si existen parámetros definidos
+            if MT5_LOGIN and MT5_PASSWORD:
+                login_success = mt5.login(
+                    login=int(MT5_LOGIN),
+                    password=str(MT5_PASSWORD),
+                    server=str(MT5_SERVER)
+                )
+                if not login_success:
+                    self._last_error = mt5.last_error()
+                    logger.error(f"❌ Error de inicio de sesión: {self._last_error}")
+                    mt5.shutdown()
+                    return False
+
+            MT5Connection._connected = True
+            self._connection_count = 1
+            logger.info("✅ Conexión programática a MT5 establecida")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Error crítico inicializando MT5: {e}")
+            MT5Connection._connected = False
+            return False
+
+    def shutdown(self):
+        self._connection_count = max(0, self._connection_count - 1)
+        if self._connection_count == 0 and MT5Connection._connected:
+            try:
+                mt5.shutdown()
+                MT5Connection._connected = False
+                logger.info("🔌 Conexión global a MT5 liberada")
+            except Exception as e:
+                logger.error(f"❌ Error durante shutdown de MT5: {e}")
+
+    def is_connected(self) -> bool:
+        return MT5Connection._connected and MT5_AVAILABLE
+
+    def get_connection(self):
+        return mt5 if MT5_AVAILABLE else None
+
+    def get_error(self):
+        return self._last_error
+
+
+_mt5_connection = MT5Connection()
+
+def get_mt5_connection() -> MT5Connection:
+    return _mt5_connection
+
+
+class MT5Wrapper:
+    def __init__(self, symbol: str, filtro_horario: bool = True, low_liquidity_mode: bool = False):
+        self.symbol = symbol.upper()
+        self.filtro_horario = filtro_horario
+        self.low_liquidity_mode = low_liquidity_mode
+
+        # Importar SPREAD_LIMITS desde capture_config
+        try:
+            from capture_config import SPREAD_LIMITS
+        except ImportError:
+            SPREAD_LIMITS = {'DEFAULT': 25.0}
+            
+        base_limit = SPREAD_LIMITS.get(self.symbol, SPREAD_LIMITS.get('DEFAULT', 25.0))
+        self.spread_limit_pips = base_limit * 1.5 if low_liquidity_mode else base_limit
+
+        self._last_tick = None
+        self._last_tick_time = 0
+        self._connection = get_mt5_connection()
+
+    def set_connection(self, connection: MT5Connection):
+        self._connection = connection
+
+    def initialize_connection(self) -> bool:
+        """Inicializa la conexión con MT5."""
+        return self._connection.initialize()
+
+    def check_connection(self) -> bool:
+        if not self._connection.is_connected() or not MT5_AVAILABLE:
+            return False
+        try:
+            info = mt5.symbol_info(self.symbol)
+            if info is None:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def get_next_tick(self) -> Optional[Any]:
+        if not self._connection.is_connected() or not MT5_AVAILABLE:
+            return None
+        try:
+            tick = mt5.symbol_info_tick(self.symbol)
+            if tick is None or not hasattr(tick, 'time_msc'):
+                return None
+            if tick.bid <= 0 or tick.ask <= 0:
+                return None
+            if tick.time_msc <= self._last_tick_time:
+                return None
+
+            self._last_tick = tick
+            self._last_tick_time = tick.time_msc
+            return tick
+        except Exception:
+            return None
+
+    def shutdown(self):
+        self._connection.shutdown()

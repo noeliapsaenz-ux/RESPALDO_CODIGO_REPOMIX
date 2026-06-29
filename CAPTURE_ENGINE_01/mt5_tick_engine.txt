@@ -1,0 +1,566 @@
+"""
+==========================================================================
+MT5_TICK_ENGINE - Capturador de ticks de alta frecuencia
+==========================================================================
+Ubicación: CAPTURE_ENGINE_01
+Dependencias: common_logger, settings, paths, capture_config,
+              mt5_gateway, state_persistence, disk_persistence_ledger,
+              backpressure_controller, buffer_slope_monitor, alert_engine
+Responsabilidad: Obtener ticks de MT5, normalizarlos, aplicar control de
+                 flujo (backpressure), asignar secuencia (SEQ), persistirlos
+                 en disco y gestionar el apagado seguro mediante señales
+                 físicas en disco (shutdown.signal).
+==========================================================================
+"""
+import gc
+import io
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# ==============================================================================
+# CONFIGURACIÓN DE ENTORNO Y PATH (Previo a importaciones locales)
+# ==============================================================================
+raiz_proyecto = Path(__file__).parent.parent.resolve()
+if str(raiz_proyecto) not in sys.path:
+    sys.path.insert(0, str(raiz_proyecto))
+
+# Forzar codificación UTF-8 en flujos estándar
+def _force_utf8_streams():
+    try:
+        if hasattr(sys.stdout, "buffer") and sys.stdout.encoding.lower() != "utf-8":
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
+        if hasattr(sys.stderr, "buffer") and sys.stderr.encoding.lower() != "utf-8":
+            sys.stderr = io.TextIOWrapper(
+                sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
+    except Exception:
+        pass
+
+_force_utf8_streams()
+
+# ==============================================================================
+# IMPORTACIONES LOCALES - SIN FALLBACK A CONFIG.PY
+# ==============================================================================
+from common_logger import get_logger as init_logging
+from settings import set_windows_clock_resolution, OPTIMIZACION, BROKER_TZ
+from paths import STATE_DIR, ACTIVE_DATA_DIR
+from capture_config import SYMBOL_CONFIG, get_optimized_gc_interval
+
+# Importaciones de otros módulos del motor de captura
+from mt5_gateway import MT5Wrapper, get_mt5_connection
+from state_persistence import StateManager, read_last_valid_seq
+from disk_persistence_ledger import TickLedger
+from backpressure_controller import StateMachine
+from buffer_slope_monitor import SlopeMonitor
+from alert_engine import AlertEngine
+
+
+class TickCapturerV2:
+    """
+    Controlador de captura y normalización de ticks de alta velocidad para MT5.
+    Implementa la arquitectura de apagado seguro coordinada por señal de disco sin WAL.
+    """
+    def __init__(self, symbol: str):
+        self.symbol = symbol.upper()
+        self.running = True
+        self.logger = init_logging(f"capturer.{self.symbol}", "capturers")
+        self.heartbeat_file = STATE_DIR / f"{self.symbol}.heartbeat"
+        self._last_heartbeat = 0
+        self._heartbeat_interval = 30
+        
+        self.decimals = 3 if "JPY" in self.symbol else 5
+        self.multiplier = 100.0 if "JPY" in self.symbol else 10000.0
+        
+        gc.set_threshold(70000, 10, 5)
+        self.last_gc_collect = time.time()
+        self.gc_interval = get_optimized_gc_interval()
+        
+        self.last_tick_msc = 0
+        self._total_ticks_accepted = 0
+        self._total_ticks_received = 0
+        self._ticks_with_high_spread = 0
+        self._queue_overflows = 0
+        
+        self._last_tps_calc_time = time.time()
+        self._last_tps_tick_count = 0
+        self._current_tps = 0.0
+        self._peak_tps = 0.0
+        
+        self.min_sleep = 0.002
+        self.max_sleep = 0.050
+        self.current_sleep = self.min_sleep
+        self.backoff_multiplier = 1.5
+        self.ticks_since_last_sleep_adjust = 0
+        
+        self._consecutive_connection_failures = 0
+        self._max_failures_before_reinit = 15
+        self._last_reinit_attempt = 0
+        self._reinit_cooldown = 60
+        self._disconnect_start_time = 0
+        self._estimated_ticks_lost = 0
+        self._total_estimated_loss = 0
+        
+        try:
+            signal.signal(signal.SIGINT, self.signal_handler)
+            signal.signal(signal.SIGTERM, self.signal_handler)
+        except ValueError:
+            pass
+            
+        self.logger.info(f"=== INICIANDO CAPTURADOR V2 (PURE MODE) PARA {self.symbol} ===")
+        
+        self.wrapper = MT5Wrapper(self.symbol)
+        self.wrapper.set_connection(get_mt5_connection())
+        self.state_manager = StateManager()
+        
+        self._seq_counter = self._reconcile_seq()
+        
+        previous_state = self.state_manager.load_symbol_state(self.symbol)
+        if previous_state:
+            self._total_ticks_accepted = previous_state.get("total_ticks_accepted", 0)
+            self._total_ticks_received = previous_state.get("total_ticks_received", 0)
+            self.last_tick_msc = previous_state.get("last_tick_msc", 0)
+            self._ticks_with_high_spread = previous_state.get("ticks_with_high_spread", 0)
+            self._queue_overflows = previous_state.get("queue_overflows", 0)
+            self.logger.info(f"Contadores restaurados | Ticks: {self._total_ticks_accepted:,}")
+        else:
+            self.logger.info("Sin histórico de contadores métricos para este símbolo. Iniciando contadores en cero.")
+            
+        _dynamic_buffer = SYMBOL_CONFIG.get(self.symbol, SYMBOL_CONFIG['DEFAULT'])['buffer_size']
+        self.ledger = TickLedger(self.symbol, max_buffer_size=_dynamic_buffer)
+        
+        self.state_machine = StateMachine(self.symbol)
+        self.slope_monitor = SlopeMonitor(self.symbol)
+        self.alert_engine = AlertEngine(self.symbol)
+        
+        self._last_overflow_check = time.time()
+        self._overflow_count_window = 0
+        self._last_state_update = time.time()
+        self._state_update_interval = 1.0
+        self._last_tick_time = 0
+
+    def _recover_last_seq_from_jsonl(self) -> Optional[int]:
+        symbol_dir = ACTIVE_DATA_DIR / self.symbol
+        if not symbol_dir.exists():
+            return None
+            
+        jsonl_files = []
+        for date_dir in symbol_dir.iterdir():
+            if date_dir.is_dir():
+                jsonl_files.extend(date_dir.glob("*.jsonl"))
+                
+        if not jsonl_files:
+            return None
+            
+        jsonl_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        
+        for jsonl_file in jsonl_files[:3]:
+            try:
+                last_seq = read_last_valid_seq(jsonl_file)
+                if last_seq is not None:
+                    return last_seq
+            except Exception as e:
+                self.logger.debug(f"Error extrayendo secuencia desde archivo {jsonl_file.name}: {e}")
+                continue
+        return None
+
+    def _reconcile_seq(self) -> int:
+        seq_jsonl = self._recover_last_seq_from_jsonl()
+        
+        state_file = STATE_DIR / f"{self.symbol}_state.json"
+        seq_state = None
+        if state_file.exists():
+            try:
+                with open(state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        seq_state = data.get("last_sequence")
+            except Exception:
+                pass
+                
+        sources = []
+        if seq_jsonl is not None:
+            sources.append(("JSONL_DATA", seq_jsonl))
+        if seq_state is not None and seq_state > 0:
+            sources.append(("STATE_JSON", seq_state))
+            
+        if not sources:
+            self.logger.info("No se encontraron registros de secuencia previos. Iniciando SEQ en cero.")
+            return 0
+            
+        if seq_jsonl is not None:
+            if seq_state is not None and seq_state > seq_jsonl:
+                self.logger.warning(
+                    f"⚠️ DISCREPANCIA DETECTADA al arrancar en {self.symbol}: "
+                    f"StateManager reporta un SEQ mayor ({seq_state}) que el JSONL físico ({seq_jsonl}). "
+                    f"Se revierte la secuencia a {seq_jsonl} para mantener la continuidad física (evitando gaps)."
+                )
+                self._write_recovery_log(sources, seq_jsonl, "JSONL_DATA")
+            else:
+                self.logger.info(f"Consistencia de secuencia de arranque validada desde JSONL: {seq_jsonl}")
+            return seq_jsonl
+            
+        if seq_state is not None and seq_state > 0:
+            self.logger.info(f"Iniciando secuencia en frío desde caché del StateManager: {seq_state}")
+            return seq_state
+            
+        return 0
+
+    def _write_recovery_log(self, sources: list, selected_seq: int, selected_source: str):
+        try:
+            from paths import LOGS_UNIFIED_DIR
+            recovery_dir = LOGS_UNIFIED_DIR / "recovery"
+            recovery_dir.mkdir(parents=True, exist_ok=True)
+            
+            log_data = {
+                "timestamp": datetime.now(BROKER_TZ).isoformat(),
+                "symbol": self.symbol,
+                "selected_seq": selected_seq,
+                "selected_source": selected_source,
+                "detected_values": {name: val for name, val in sources},
+                "pid": os.getpid()
+            }
+            
+            json_log = recovery_dir / f"{self.symbol}_recovery_audit.json"
+            with open(json_log, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_data) + "\n")
+                
+            txt_log = recovery_dir / f"{self.symbol}_recovery_audit.txt"
+            with open(txt_log, "a", encoding="utf-8") as f:
+                f.write(
+                    f"[{log_data['timestamp']}] RECOVERY REPORT - Symbol: {self.symbol}\n"
+                    f"  Selected SEQ: {selected_seq} via [{selected_source}]\n"
+                    f"  Discrepancy Matrix: {log_data['detected_values']}\n"
+                    f"{'-'*80}\n"
+                )
+        except Exception as e:
+            self.logger.error(f"No se pudo guardar la auditoría forense de recuperación: {e}")
+
+    def signal_handler(self, signum, frame):
+        self.logger.info(f"Señal de interrupción {signum} capturada por fallback. Iniciando shutdown seguro...")
+        self.running = False
+
+    def _write_heartbeat(self):
+        try:
+            now = time.time()
+            if now - self._last_heartbeat >= self._heartbeat_interval:
+                with open(self.heartbeat_file, "w", encoding="utf-8") as f:
+                    f.write(f"{int(now)}\n{self.symbol}\n{self._total_ticks_accepted}")
+                self._last_heartbeat = now
+        except Exception as e:
+            self.logger.debug(f"Error de latido (heartbeat): {e}")
+
+    def _calculate_tps(self, tick_count: int, elapsed: float) -> float:
+        if elapsed > 0:
+            instant_tps = tick_count / elapsed
+            self._current_tps = 0.7 * self._current_tps + 0.3 * instant_tps
+            if self._current_tps > self._peak_tps:
+                self._peak_tps = self._current_tps
+            return self._current_tps
+        return 0.0
+
+    def _save_state(self):
+        try:
+            memory_mb = 0.0
+            if sys.platform == "win32":
+                try:
+                    import ctypes
+                    class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                        _fields_ = [
+                            ('cb', ctypes.c_ulong),
+                            ('PageFaultCount', ctypes.c_ulong),
+                            ('PeakWorkingSetSize', ctypes.c_size_t),
+                            ('WorkingSetSize', ctypes.c_size_t),
+                            ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                            ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                            ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                            ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                            ('PagefileUsage', ctypes.c_size_t),
+                            ('PeakPagefileUsage', ctypes.c_size_t)
+                        ]
+                    handle = ctypes.windll.kernel32.GetCurrentProcess()
+                    counters = PROCESS_MEMORY_COUNTERS()
+                    if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), ctypes.sizeof(counters)):
+                        memory_mb = round(counters.WorkingSetSize / (1024 * 1024), 2)
+                except Exception:
+                    pass
+
+            state = {
+                "symbol": self.symbol,
+                "last_sequence": self._seq_counter,
+                "total_ticks_accepted": self._total_ticks_accepted,
+                "total_ticks_received": self._total_ticks_received,
+                "last_tick_msc": self.last_tick_msc,
+                "ticks_with_high_spread": self._ticks_with_high_spread,
+                "queue_overflows": self._queue_overflows,
+                "peak_tps": self._peak_tps,
+                "timestamp": time.time(),
+                "estimated_ticks_lost": self._total_estimated_loss,
+                "windows_performance": {
+                    "allocated_ram_mb": memory_mb,
+                    "process_cpu_time_sec": round(time.process_time(), 2),
+                    "gc_thresholds": gc.get_threshold()
+                }
+            }
+            self.state_manager.save_symbol_state(self.symbol, state)
+            self.logger.debug(f"Contadores de estado persistidos | SEQ: {self._seq_counter:,}")
+        except Exception as e:
+            self.logger.error(f"Error al escribir el estado de sesión: {e}")
+
+    def start_capture_loop(self):
+        self.logger.info(f"Motor de adquisición HFT activo para el símbolo {self.symbol}...")
+        
+        if not self.wrapper.initialize_connection():
+            self.logger.error("Error crítico de inicialización de conexión contra la terminal de MT5.")
+            return 1
+            
+        self.last_gc_collect = time.time()
+        tick_count_since_log = 0
+        last_log_time = time.time()
+        last_state_save = time.time()
+        
+        while self.running:
+            try:
+                now = time.time()
+                self._write_heartbeat()
+                
+                signal_file = STATE_DIR / "shutdown.signal"
+                symbol_signal_file = STATE_DIR / f"{self.symbol}.shutdown_signal"
+                
+                if signal_file.exists() or symbol_signal_file.exists():
+                    self.logger.info(f"🛑 Señal de parada física detectada para {self.symbol}. Saliendo del loop de captura...")
+                    self.running = False
+                    break
+                
+                if now - self.last_gc_collect >= self.gc_interval:
+                    collected = gc.collect()
+                    if collected > 0:
+                        self.logger.debug(f"Recolección asíncrona de recursos completada. Liberados: {collected:,} objetos.")
+                    self.last_gc_collect = now
+                    
+                if not self.wrapper.check_connection():
+                    if self._disconnect_start_time == 0:
+                        self._disconnect_start_time = now
+                    self.logger.warning("Conexión de mercado perdida. Iniciando secuencia de reconexión.")
+                    self._consecutive_connection_failures += 1
+                    
+                    wait_time = min(2 * self._consecutive_connection_failures, 30)
+                    self.logger.warning(f"Temporizador de reconexión activo. Esperando {wait_time:.0f} segundos...")
+                    
+                    if self._current_tps > 0:
+                        estimated_lost = int(self._current_tps * wait_time)
+                        self._estimated_ticks_lost += estimated_lost
+                        self._total_estimated_loss += estimated_lost
+                        self.logger.warning(f"Pérdida de ráfaga de datos calculada: {estimated_lost} ticks (TPS: {self._current_tps:.1f})")
+                        
+                    time.sleep(wait_time)
+                    
+                    if (self._consecutive_connection_failures >= self._max_failures_before_reinit and 
+                        now - self._last_reinit_attempt >= self._reinit_cooldown):
+                        self.logger.warning("Límite de reintentos sobrepasado. Forzando re-inicialización del API de MT5.")
+                        self._last_reinit_attempt = now
+                        self.wrapper.shutdown()
+                        time.sleep(5)
+                        if self.wrapper.initialize_connection():
+                            self.logger.info("Terminal MT5 re-inicializada de forma exitosa.")
+                            self._consecutive_connection_failures = 0
+                            self._disconnect_start_time = 0
+                        else:
+                            self.logger.error("Fallo de restauración de terminal.")
+                        continue
+                    continue
+                    
+                if self._consecutive_connection_failures > 0:
+                    self.logger.info("Conexión con terminal de MetaTrader reestablecida.")
+                    self._consecutive_connection_failures = 0
+                    self._disconnect_start_time = 0
+                    self._total_estimated_loss = 0
+                    
+                tick = self.wrapper.get_next_tick()
+                if not tick:
+                    self.ticks_since_last_sleep_adjust += 1
+                    if self.ticks_since_last_sleep_adjust > 1000:
+                        self.current_sleep = min(self.max_sleep, self.current_sleep * self.backoff_multiplier)
+                        self.ticks_since_last_sleep_adjust = 0
+                    time.sleep(self.current_sleep)
+                    continue
+                    
+                self.current_sleep = self.min_sleep
+                self.ticks_since_last_sleep_adjust = 0
+                self._total_ticks_received += 1
+                tick_count_since_log += 1
+                
+                if tick.time_msc <= self.last_tick_msc:
+                    continue
+                    
+                if tick.bid <= 0 or tick.ask <= 0 or tick.bid >= tick.ask:
+                    continue
+                    
+                raw_spread = tick.ask - tick.bid
+                spread_pips = round(raw_spread * self.multiplier, 1)
+                mid_price = (tick.bid + tick.ask) * 0.5
+                
+                is_spread_high = spread_pips > self.wrapper.spread_limit_pips
+                if is_spread_high:
+                    self._ticks_with_high_spread += 1
+                    
+                seq_candidate = self._seq_counter + 1
+                self._last_tick_time = tick.time_msc
+                
+                tick_data = {
+                    "tm": int(tick.time_msc),
+                    "b": round(float(tick.bid), self.decimals),
+                    "a": round(float(tick.ask), self.decimals),
+                    "sp": spread_pips,
+                    "rs": round(raw_spread, self.decimals + 1),
+                    "mp": round(mid_price, self.decimals),
+                    "l": round(float(tick.last), self.decimals) if hasattr(tick, "last") and tick.last > 0 else None,
+                    "v": int(tick.volume_real) if hasattr(tick, "volume_real") else None,
+                    "f": int(tick.flags) if hasattr(tick, "flags") else 0,
+                    "seq": seq_candidate,
+                    "recv_ts": int(time.time() * 1000)
+                }
+                
+                if is_spread_high:
+                    tick_data["sf"] = True
+                    
+                if not self.ledger.append(tick_data):
+                    self._queue_overflows += 1
+                    self._overflow_count_window += 1
+                    if self._overflow_count_window > 10:
+                        self.current_sleep = min(self.max_sleep, self.current_sleep * 1.5)
+                        self._overflow_count_window = 0
+                    self.logger.warning(f"Backpressure activa para {self.symbol} - Buffer de ledger saturado. Tick descartado sin avanzar SEQ.")
+                    continue
+                    
+                self._seq_counter = seq_candidate
+                self._total_ticks_accepted += 1
+                self.last_tick_msc = tick.time_msc
+                    
+                now_sec = time.time()
+                if now_sec - self._last_state_update >= self._state_update_interval:
+                    ledger_status = self.ledger.get_status()
+                    buffer_pct = ledger_status["buffer_pct"]
+                    overflow_rate = self._overflow_count_window / (now_sec - self._last_overflow_check)
+                    
+                    self._overflow_count_window = 0
+                    self._last_overflow_check = now_sec
+                    
+                    self.slope_monitor.add_measurement(ledger_status["buffer_size"])
+                    slope = self.slope_monitor.get_slope()
+                    acceleration = self.slope_monitor.get_acceleration()
+                    
+                    loss_rate = self._queue_overflows / max(1, self._total_ticks_received)
+                    
+                    state = self.state_machine.update(
+                        buffer_pct=buffer_pct,
+                        overflow_rate=overflow_rate,
+                        slope=slope,
+                        loss_rate=loss_rate
+                    )
+                    
+                    speed = self.state_machine.get_speed()
+                    self.current_sleep = self.min_sleep + (1 - speed) * (self.max_sleep - self.min_sleep)
+                    last_tick_time_sec = (self._last_tick_time / 1000) if self._last_tick_time else now_sec
+                    
+                    ledger_status = self.ledger.get_status()
+                    self.state_manager.save_system_state(
+                        self.symbol, 
+                        state.value, 
+                        {
+                            **self.state_machine.get_metrics(),
+                            "loss_rate": loss_rate,
+                            "overflow_rate": overflow_rate,
+                            "buffer_pct": buffer_pct,
+                            "slope": slope,
+                            "dual_write_active": ledger_status.get("dual_write_active", False),
+                            "write_failures": ledger_status.get("write_failures", 0),
+                            "circuit_breaker": ledger_status.get("circuit_breaker", False)
+                        }
+                    )
+                    
+                    self.alert_engine.evaluate(
+                        state=state.value,
+                        last_tick_time=last_tick_time_sec,
+                        overflow_rate=overflow_rate,
+                        loss_rate=loss_rate,
+                        slope=slope,
+                        acceleration=acceleration,
+                        buffer_pct=buffer_pct
+                    )
+                    self._last_state_update = now_sec
+                    
+                if tick_count_since_log >= 1000 or (now_sec - last_log_time) >= 10:
+                    tps = self._calculate_tps(tick_count_since_log, now_sec - last_log_time)
+                    ledger_status = self.ledger.get_status()
+                    queue_util_pct = ledger_status["buffer_pct"]
+                    high_spread_ratio = (self._ticks_with_high_spread / max(1, self._total_ticks_accepted)) * 100
+                    
+                    self.logger.info(
+                        f"📊 {self.symbol}: {tps:.1f} tps | "
+                        f"Ledger Buffer: {queue_util_pct:.1f}% | "
+                        f"Overflows: {self._queue_overflows:,} | "
+                        f"High-spread: {high_spread_ratio:.2f}% | "
+                        f"Total Ticks: {self._total_ticks_accepted:,} | "
+                        f"Last SEQ: {self._seq_counter:,}"
+                    )
+                    tick_count_since_log = 0
+                    last_log_time = now_sec
+                    
+                if now_sec - last_state_save >= 60:
+                    self._save_state()
+                    last_state_save = now_sec
+                    
+            except KeyboardInterrupt:
+                self.logger.info("Interrupción por teclado detectada.")
+                break
+            except Exception as e:
+                self.logger.error(f"Fallo no controlado en bucle de captura: {e}", exc_info=True)
+                time.sleep(0.5)
+                
+        self.logger.info(f"Iniciando volcado de estado definitivo para {self.symbol}...")
+        self._save_state()
+        self.logger.info("Deteniendo hilos secundarios de persistencia...")
+        self.ledger.shutdown()
+        self.wrapper.shutdown()
+        gc.enable()
+        
+        try:
+            ok_file = STATE_DIR / f"{self.symbol}.shutdown_ok"
+            with open(ok_file, "w", encoding="utf-8") as f:
+                f.write(f"shutdown_completed_at={time.time()}\npid={os.getpid()}\nticks={self._total_ticks_accepted}\nlast_seq={self._seq_counter}\n")
+            self.logger.info(f"✅ Shutdown confirmado físicamente en disco: {ok_file.name}")
+        except Exception as e:
+            self.logger.error(f"Error escribiendo firma de confirmación de apagado controlado para {self.symbol}: {e}")
+            
+        return 0
+
+    def run(self):
+        return self.start_capture_loop()
+
+
+def main():
+    set_windows_clock_resolution()
+    if len(sys.argv) < 2:
+        print("Uso: python mt5_tick_engine.py <SYMBOL>")
+        sys.exit(1)
+        
+    symbol = sys.argv[1].upper()
+    try:
+        capturer = TickCapturerV2(symbol)
+        sys.exit(capturer.run())
+    except Exception as e:
+        print(f"Error crítico en el inicio del capturador de {symbol}: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

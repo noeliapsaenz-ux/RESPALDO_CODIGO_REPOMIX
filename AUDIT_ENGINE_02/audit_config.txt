@@ -1,0 +1,585 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+AUDIT_CONFIG - Configuración exclusiva del módulo AUDIT_ENGINE_02
+==========================================================================
+Ubicación: AUDIT_ENGINE_02
+Dependencias: system_canonical, paths, settings, common_logger, contract_manager
+Responsabilidad: Proveer un punto de configuración único y desacoplado para
+                 todos los módulos de auditoría (Fase 2). Importa selectivamente
+                 desde los módulos base de la raíz y define constantes
+                 operativas específicas del engine de auditoría.
+==========================================================================
+"""
+
+import sys
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+# ==============================================================================
+# 1. INYECCIÓN DE RUTA RAÍZ PARA RESOLVER DEPENDENCIAS
+# ==============================================================================
+
+# Obtener la ruta raíz del proyecto (PYTHON_MT5)
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+
+# ==============================================================================
+# 2. IMPORTACIONES DESDE MÓDULOS BASE
+# ==============================================================================
+
+# 2.1. Ontología Canónica del Sistema
+from system_canonical import (
+    SymbolCaptureStatus,
+    DataIntegrity,
+    AuditSeverityLevel,
+    MarketRegime,
+    MarketActivityState,
+    MarketReadinessStatus,
+    DecisionStatus,
+    ContractType,
+    MetadataEnvelope,
+    validate_canonical_enum,
+    get_ontology_version
+)
+
+# 2.2. Rutas del Sistema (Todas las zonas de almacenamiento)
+from paths import (
+    BASE_DIR,
+    RAMDISK_PATH,
+    HOT_RAM_DIR,
+    SSD_EVIDENCE_DIR,
+    MASTER_ARCHIVE_DIR,
+    ARCHIVE_SAFE_DIR,
+    ARCHIVE_QUARANTINE_DIR,
+    AUDIT_WORKSPACE_DIR,
+    AUDIT_MAESTROS_DIR,
+    AUDIT_GOLD_DIR,
+    AUDIT_REPORTES_DIR,
+    AUDIT_STATE_DIR,
+    AUDIT_FLOW_DIR,
+    AUDIT_RECOVERY_DIR,
+    AUDIT_LINEAGE_DIR,
+    OPS_INTEL_DIR,
+    OI_OUTPUT_DIR,
+    OI_HISTORICAL_DIR,
+    OI_CONFIG_DIR,
+    OI_FEEDBACK_DIR,
+    DYNAMIC_SYMBOL_CONFIG_PATH,
+    OI_LOCK_FILE,
+    DECISION_WORKSPACE_DIR,
+    STATE_DIR,
+    LOGS_MASTER_DIR,
+    LOGS_CRITICAL_DIR,
+    ACTIVE_DATA_DIR,
+    SSD_BACKUP_DIR,
+    LOGS_UNIFIED_DIR,
+    PROCESSED_DATA_DIR,
+    create_directories
+)
+
+# 2.3. Configuración Base y Utilidades del Sistema
+from settings import (
+    BROKER_TZ,
+    ENTORNO_ACTUAL,
+    USAR_RAMDISK,
+    OPTIMIZACION,
+    MT5_LOGIN,
+    MT5_PASSWORD,
+    MT5_SERVER,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    send_telegram_alert,
+    send_telegram_async,
+    set_windows_clock_resolution
+)
+
+# 2.4. Sistema de Logging Centralizado
+from common_logger import (
+    get_logger,
+    get_system_logger,
+    get_audit_logger,
+    get_ops_logger,
+    get_capturer_logger,
+    get_log_manager,
+    LogManager
+)
+
+# 2.5. Gestión de Contratos y Serialización
+from contract_manager import (
+    NumpySafeEncoder,
+    load_contract_safe,
+    save_contract_atomic,
+    create_audit_contract_template,
+    create_portfolio_contract_template,
+    validate_contract_schema,
+    safe_json_dump
+)
+
+
+# ==============================================================================
+# 3. CONSTANTES DE VERSIÓN Y PRODUCTOR
+# ==============================================================================
+
+SCHEMA_VERSION_AUDIT = "2.0.0"
+PRODUCER_AUDIT = "AUDIT_ENGINE_02"
+AUDIT_VERSION = "2.0.0"
+
+
+# ==============================================================================
+# 4. LISTA DE SÍMBOLOS A AUDITAR
+# ==============================================================================
+
+# NOTA: Estos símbolos deben coincidir con los definidos en CAPTURE_ENGINE_01/capture_config.py
+# Para evitar dependencias circulares, se definen explícitamente aquí.
+# Si se modifica la lista en capture_config, debe actualizarse manualmente esta lista.
+SYMBOLS_TO_AUDIT = [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "EURGBP",
+    "EURJPY",
+    "GBPJPY",
+    "AUDUSD",
+    "USDCAD",
+    "NZDUSD",
+    "USDCHF",
+    "EURCHF",
+    "AUDJPY",
+    "NZDJPY",
+    "GBPCHF",
+    "CADJPY"
+]
+
+
+# ==============================================================================
+# 5. CONSTANTES OPERATIVAS DE AUDITORÍA
+# ==============================================================================
+
+# 5.1. Límites de Spread por Símbolo (en pips)
+SPREAD_LIMITS = {
+    "EURUSD": 3.0,
+    "GBPUSD": 3.5,
+    "USDJPY": 3.0,
+    "EURGBP": 3.5,
+    "EURJPY": 4.0,
+    "GBPJPY": 5.0,
+    "AUDUSD": 4.0,
+    "USDCAD": 4.0,
+    "NZDUSD": 4.5,
+    "USDCHF": 3.5,
+    "EURCHF": 4.0,
+    "AUDJPY": 4.5,
+    "NZDJPY": 5.0,
+    "GBPCHF": 5.0,
+    "CADJPY": 5.0,
+    "DEFAULT": 30.0
+}
+
+# 5.2. Umbrales de Veto H-03
+VETO_FCI_THRESHOLD = 70.0          # Por debajo de este FCI, el símbolo es NO_CONFIABLE
+VETO_QUALITY_THRESHOLD = 50.0      # Umbral mínimo de calidad para ser considerado confiable
+
+# 5.3. Pesos para Cálculo de Confianza Consolidada
+CONFIDENCE_WEIGHTS = {
+    "fci": 0.60,           # Peso del Feed Confidence Index
+    "profile": 0.40,       # Peso del perfil de mercado
+    "lineage": 0.30,       # Peso de la trazabilidad criptográfica
+    "flow": 0.15,          # Peso del flujo de captura
+    "audit": 0.30,         # Peso de auditoría forense
+    "metrics": 0.35,       # Peso de métricas descriptivas
+    "overall": 0.20        # Peso de confianza global
+}
+
+# 5.4. Umbrales de Auditoría Forense
+AUDIT_THRESHOLDS = {
+    "max_loss_rate_pct": 0.5,          # Tasa máxima de pérdida de secuencias
+    "max_seq_gap": 10,                 # Gap máximo permitido entre secuencias
+    "max_heartbeat_age_sec": 120,      # Edad máxima del heartbeat (segundos)
+    "min_gold_percentage": 5.0,        # Porcentaje mínimo de datos Gold vs Maestro
+    "max_gold_percentage": 100.0,      # Porcentaje máximo de datos Gold vs Maestro
+    "completitud_minima": 70.0,        # Completitud mínima requerida (%)
+    "fci_minima": 70.0,                # FCI mínimo para considerar confiable
+    "confidence_minima": 40.0          # Confianza mínima para considerar operativo
+}
+
+# 5.5. Validación de Estructura de Parquets
+STRUCTURE_VALIDATION = {
+    "parquet_required_columns": [
+        "time",
+        "time_msc",
+        "bid",
+        "ask",
+        "spread_pips",
+        "session",
+        "seq"
+    ],
+    "gold_required_columns": [
+        "time",
+        "time_msc",
+        "bid",
+        "ask",
+        "spread_pips",
+        "session",
+        "seq",
+        "quality_score"
+    ],
+    "maestro_schema_v2": [
+        "time", "time_msc", "recv_ts", "bid", "ask", "mid_price",
+        "spread_pips", "raw_spread_pips", "volume", "flags_mt5",
+        "seq", "session", "broker_hour", "utc_hour", "weekday",
+        "tick_interval_ms", "delta_bid", "delta_ask", "delta_mid",
+        "delta_spread", "delta2_spread", "quote_update_type",
+        "duplicate_tick", "duplicate_group", "latency_ms",
+        "clock_sync_issue"
+    ],
+    "gold_schema_v2": [
+        "time", "time_msc", "recv_ts", "bid", "ask", "mid_price",
+        "spread_pips", "raw_spread_pips", "volume", "flags_mt5",
+        "seq", "session", "broker_hour", "utc_hour", "weekday",
+        "tick_interval_ms", "delta_bid", "delta_ask", "delta_mid",
+        "delta_spread", "delta2_spread", "quote_update_type",
+        "duplicate_tick", "duplicate_group", "latency_ms",
+        "clock_sync_issue", "quality_score", "quality_flags"
+    ]
+}
+
+# 5.6. Máscaras de Bits para Quality Flags
+BIT_REVERSED_SPREAD = 0x01    # 1: Spread invertido (bid >= ask)
+BIT_WIDE_SPREAD = 0x02        # 2: Spread excesivamente amplio
+BIT_STALE_TICK = 0x04         # 4: Tick congelado (sin cambios en bid/ask)
+BIT_CLOCK_SYNC = 0x08         # 8: Problema de sincronización de reloj
+BIT_ZERO_SPREAD = 0x10        # 16: Spread igual a cero
+BIT_DUPLICATE_SEQ = 0x20      # 32: Secuencia duplicada
+BIT_QUALITY_MASK = 0x3F       # 63: Máscara completa de 6 bits
+
+# 5.7. Configuración de Sesiones de Mercado
+SESSIONS = {
+    "ASIA": {"hours": (22, 6), "weight": 0.20},
+    "LONDON": {"hours": (6, 14), "weight": 0.30},
+    "OVERLAP": {"hours": (14, 18), "weight": 0.35},
+    "NEW_YORK": {"hours": (18, 22), "weight": 0.25}
+}
+
+# 5.8. Umbrales de Volatilidad para Clasificación de Regímenes
+VOLATILITY_THRESHOLDS = {
+    "QUIET": 0.7,
+    "NORMAL": 1.3,
+    "ACTIVE": 2.0,
+    "EXPLOSIVE": 2.0
+}
+
+# 5.9. Configuración de Anomalías
+ANOMALY_CONFIG = {
+    "windows_days": [7, 30, 90],
+    "ewma_lambda": 0.92,
+    "cold_start_score": 50.0,
+    "defensive_mode_min_assets": 3,
+    "defensive_multiplier": 1.25,
+    "p_value_alpha_limit": 0.05
+}
+
+# 5.10. Umbrales de Recuperación Forense
+RECOVERY_THRESHOLDS = {
+    "gap_warning_seconds": 60,
+    "gap_critical_seconds": 300,
+    "max_seq_jump": 100000,
+    "max_duplicates_per_file": 10
+}
+
+# 5.11. Configuración de Persistencia Histórica
+HISTORY_CONFIG = {
+    "max_history_days": 365,
+    "event_retention_days": 90,
+    "confidence_history_file": "confidence_history.parquet",
+    "audit_events_file": "audit_events.jsonl"
+}
+
+
+# ==============================================================================
+# 6. FUNCIONES DE UTILIDAD ESPECÍFICAS DEL MÓDULO
+# ==============================================================================
+
+def get_fecha_broker_str() -> str:
+    """
+    Obtiene la fecha actual del broker en formato YYYYMMDD.
+    Utiliza la zona horaria definida en settings.py.
+    """
+    return datetime.now(BROKER_TZ).strftime("%Y%m%d")
+
+
+def classify_session(hour: int) -> str:
+    """
+    Clasifica la sesión de mercado según la hora del broker.
+
+    Args:
+        hour: Hora del broker (0-23)
+
+    Returns:
+        str: Nombre de la sesión (ASIA, LONDON, OVERLAP, NEW_YORK, UNKNOWN)
+    """
+    if 22 <= hour or hour < 6:
+        return "ASIA"
+    elif 6 <= hour < 14:
+        return "LONDON"
+    elif 14 <= hour < 18:
+        return "OVERLAP"
+    elif 18 <= hour < 22:
+        return "NEW_YORK"
+    return "UNKNOWN"
+
+
+def get_spread_limit(symbol: str) -> float:
+    """
+    Obtiene el límite de spread para un símbolo específico.
+
+    Args:
+        symbol: Símbolo a consultar (ej: EURUSD)
+
+    Returns:
+        float: Límite de spread en pips
+    """
+    return SPREAD_LIMITS.get(symbol.upper(), SPREAD_LIMITS["DEFAULT"])
+
+
+def is_symbol_in_audit_list(symbol: str) -> bool:
+    """
+    Verifica si un símbolo está en la lista de auditoría.
+
+    Args:
+        symbol: Símbolo a verificar
+
+    Returns:
+        bool: True si está en la lista, False en caso contrario
+    """
+    return symbol.upper() in SYMBOLS_TO_AUDIT
+
+
+def get_audit_symbols() -> List[str]:
+    """
+    Retorna la lista completa de símbolos a auditar.
+
+    Returns:
+        List[str]: Lista de símbolos
+    """
+    return SYMBOLS_TO_AUDIT.copy()
+
+
+# ==============================================================================
+# 7. INICIALIZACIÓN DE DIRECTORIOS
+# ==============================================================================
+
+def init_audit_directories() -> bool:
+    """
+    Inicializa todos los directorios necesarios para el módulo de auditoría.
+
+    Returns:
+        bool: True si todos los directorios se crearon correctamente
+    """
+    try:
+        # Crear directorios base desde paths.py
+        create_directories()
+
+        # Crear directorios específicos de auditoría
+        audit_dirs = [
+            AUDIT_WORKSPACE_DIR,
+            AUDIT_MAESTROS_DIR,
+            AUDIT_GOLD_DIR,
+            AUDIT_REPORTES_DIR,
+            AUDIT_STATE_DIR,
+            AUDIT_FLOW_DIR,
+            AUDIT_RECOVERY_DIR,
+            AUDIT_LINEAGE_DIR
+        ]
+
+        for d in audit_dirs:
+            d.mkdir(parents=True, exist_ok=True)
+
+        return True
+    except Exception:
+        return False
+
+
+# ==============================================================================
+# 8. FUNCIÓN DE INICIALIZACIÓN DE LOGGING
+# ==============================================================================
+
+def init_audit_logging(component: str = "audit_engine", category: str = "02_AUDIT") -> Any:
+    """
+    Inicializa el sistema de logging para el módulo de auditoría.
+
+    Args:
+        component: Nombre del componente (ej: "trust_score_consolidator")
+        category: Categoría de logging (por defecto "02_AUDIT")
+
+    Returns:
+        logging.Logger: Logger configurado
+    """
+    # Asegurar que los directorios existan antes de iniciar logging
+    init_audit_directories()
+
+    # Usar el logger de common_logger con la categoría de auditoría
+    return get_logger(component, category)
+
+
+# ==============================================================================
+# 9. VALIDACIÓN DE CONFIGURACIÓN
+# ==============================================================================
+
+def validate_audit_config() -> bool:
+    """
+    Valida que la configuración del módulo de auditoría sea correcta.
+
+    Returns:
+        bool: True si la configuración es válida
+    """
+    errors = []
+
+    # Verificar que la lista de símbolos no esté vacía
+    if not SYMBOLS_TO_AUDIT:
+        errors.append("SYMBOLS_TO_AUDIT está vacía")
+
+    # Verificar que los umbrales sean válidos
+    if VETO_FCI_THRESHOLD < 0 or VETO_FCI_THRESHOLD > 100:
+        errors.append(f"VETO_FCI_THRESHOLD fuera de rango: {VETO_FCI_THRESHOLD}")
+
+    # Verificar que las rutas existan o puedan crearse
+    required_dirs = [
+        SSD_EVIDENCE_DIR,
+        ARCHIVE_SAFE_DIR,
+        AUDIT_MAESTROS_DIR,
+        AUDIT_GOLD_DIR,
+        AUDIT_REPORTES_DIR,
+        AUDIT_STATE_DIR
+    ]
+
+    for d in required_dirs:
+        if not d.exists():
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                errors.append(f"No se pudo crear el directorio: {d}")
+
+    return len(errors) == 0
+
+
+# ==============================================================================
+# 10. EXPORTACIÓN EXPLÍCITA (PARA CONTROL DE INTERFAZ)
+# ==============================================================================
+
+__all__ = [
+    # Desde system_canonical
+    'SymbolCaptureStatus',
+    'DataIntegrity',
+    'AuditSeverityLevel',
+    'MarketRegime',
+    'MarketActivityState',
+    'MarketReadinessStatus',
+    'DecisionStatus',
+    'ContractType',
+    'MetadataEnvelope',
+    'validate_canonical_enum',
+    'get_ontology_version',
+
+    # Desde paths
+    'BASE_DIR',
+    'RAMDISK_PATH',
+    'HOT_RAM_DIR',
+    'SSD_EVIDENCE_DIR',
+    'MASTER_ARCHIVE_DIR',
+    'ARCHIVE_SAFE_DIR',
+    'ARCHIVE_QUARANTINE_DIR',
+    'AUDIT_WORKSPACE_DIR',
+    'AUDIT_MAESTROS_DIR',
+    'AUDIT_GOLD_DIR',
+    'AUDIT_REPORTES_DIR',
+    'AUDIT_STATE_DIR',
+    'AUDIT_FLOW_DIR',
+    'AUDIT_RECOVERY_DIR',
+    'AUDIT_LINEAGE_DIR',
+    'OPS_INTEL_DIR',
+    'OI_OUTPUT_DIR',
+    'OI_HISTORICAL_DIR',
+    'OI_CONFIG_DIR',
+    'OI_FEEDBACK_DIR',
+    'DYNAMIC_SYMBOL_CONFIG_PATH',
+    'OI_LOCK_FILE',
+    'DECISION_WORKSPACE_DIR',
+    'STATE_DIR',
+    'LOGS_MASTER_DIR',
+    'LOGS_CRITICAL_DIR',
+    'ACTIVE_DATA_DIR',
+    'SSD_BACKUP_DIR',
+    'LOGS_UNIFIED_DIR',
+    'PROCESSED_DATA_DIR',
+    'create_directories',
+
+    # Desde settings
+    'BROKER_TZ',
+    'ENTORNO_ACTUAL',
+    'USAR_RAMDISK',
+    'OPTIMIZACION',
+    'MT5_LOGIN',
+    'MT5_PASSWORD',
+    'MT5_SERVER',
+    'TELEGRAM_BOT_TOKEN',
+    'TELEGRAM_CHAT_ID',
+    'send_telegram_alert',
+    'send_telegram_async',
+    'set_windows_clock_resolution',
+
+    # Desde common_logger
+    'get_logger',
+    'get_system_logger',
+    'get_audit_logger',
+    'get_ops_logger',
+    'get_capturer_logger',
+    'get_log_manager',
+    'LogManager',
+
+    # Desde contract_manager
+    'NumpySafeEncoder',
+    'load_contract_safe',
+    'save_contract_atomic',
+    'create_audit_contract_template',
+    'create_portfolio_contract_template',
+    'validate_contract_schema',
+    'safe_json_dump',
+
+    # Constantes específicas
+    'SCHEMA_VERSION_AUDIT',
+    'PRODUCER_AUDIT',
+    'AUDIT_VERSION',
+    'SYMBOLS_TO_AUDIT',
+    'SPREAD_LIMITS',
+    'VETO_FCI_THRESHOLD',
+    'VETO_QUALITY_THRESHOLD',
+    'CONFIDENCE_WEIGHTS',
+    'AUDIT_THRESHOLDS',
+    'STRUCTURE_VALIDATION',
+    'BIT_REVERSED_SPREAD',
+    'BIT_WIDE_SPREAD',
+    'BIT_STALE_TICK',
+    'BIT_CLOCK_SYNC',
+    'BIT_ZERO_SPREAD',
+    'BIT_DUPLICATE_SEQ',
+    'BIT_QUALITY_MASK',
+    'SESSIONS',
+    'VOLATILITY_THRESHOLDS',
+    'ANOMALY_CONFIG',
+    'RECOVERY_THRESHOLDS',
+    'HISTORY_CONFIG',
+
+    # Funciones de utilidad
+    'get_fecha_broker_str',
+    'classify_session',
+    'get_spread_limit',
+    'is_symbol_in_audit_list',
+    'get_audit_symbols',
+    'init_audit_directories',
+    'init_audit_logging',
+    'validate_audit_config'
+]

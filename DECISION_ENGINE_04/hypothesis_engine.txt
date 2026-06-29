@@ -1,0 +1,276 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+HYPOTHESIS_ENGINE - Generador de hipotesis de mercado
+==========================================================================
+Ubicacion: DECISION_ENGINE_04/hypothesis_engine.py
+Dependencias: decision_config, hypothesis_conditions, contract_manager
+Responsabilidad: Evaluar condiciones y reglas cualitativas de trading sobre
+                 las combinaciones simbolo-estilo que han demostrado "Edge"
+                 cuantitativo, emitiendo hipotesis de comportamiento esperadas.
+==========================================================================
+"""
+import sys
+import traceback
+from pathlib import Path
+
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+current_dir = Path(__file__).resolve().parent
+if str(current_dir) not in sys.path:
+    sys.path.insert(0, str(current_dir))
+
+import argparse
+import json
+import hashlib
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
+
+from decision_config import (
+    BROKER_TZ,
+    init_logging,
+    SYMBOLS_TO_CAPTURE,
+    OPS_INTEL_DIR,
+    HYPOTHESIS_RULES_PATH,
+    EDGE_MIN_THRESHOLD,
+    DECISION_WORKSPACE_DIR,
+)
+
+logger = init_logging("hypothesis_engine", "04_DECISION")
+
+try:
+    from hypothesis_conditions import CONDITION_REGISTRY, get_condition_function
+except Exception as e:
+    error_msg = (
+        f"\n❌ [ERROR CRITICO] Fallo al cargar 'hypothesis_conditions.py'\n"
+        f"Detalle del error: {e}\n"
+        f"{traceback.format_exc()}\n"
+    )
+    sys.stderr.write(error_msg)
+    sys.stderr.flush()
+    sys.exit(1)
+
+def load_feature_vector(symbol: str, fecha: str) -> Optional[Dict[str, Any]]:
+    fv_file = DECISION_WORKSPACE_DIR / "feature_vectors" / f"fv_{symbol}_{fecha}.json"
+    if not fv_file.exists():
+        return None
+    try:
+        with open(fv_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"❌ {symbol}: Error leyendo FeatureVector: {e}")
+        return None
+
+def load_edge_scores(fecha: str) -> Optional[Dict[str, Any]]:
+    edge_file = DECISION_WORKSPACE_DIR / "edge_scores" / f"edge_scores_{fecha}.json"
+    if not edge_file.exists():
+        logger.warning(f"⚠️ Edge Scores ausentes para {fecha}")
+        return None
+    try:
+        with open(edge_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"❌ Error leyendo Edge Scores: {e}")
+        return None
+
+def load_hypothesis_rules() -> Dict[str, Any]:
+    if not HYPOTHESIS_RULES_PATH.exists():
+        logger.error(f"❌ Catalogo de hipotesis ausente: {HYPOTHESIS_RULES_PATH}")
+        return {"rules": {}}
+    try:
+        with open(HYPOTHESIS_RULES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        logger.info(f"📚 Catalogo cargado: version {data.get('version', 'N/A')}")
+        return data
+    except Exception as e:
+        logger.error(f"❌ Error leyendo catalogo de hipotesis: {e}")
+        return {"rules": {}}
+
+def evaluate_rule(rule: Dict[str, Any], fv: Dict[str, Any]) -> bool:
+    condition_fn_name = rule.get("condition_fn")
+    if not condition_fn_name:
+        return False
+    
+    condition_fn = get_condition_function(condition_fn_name)
+    if condition_fn is None:
+        logger.warning(f"⚠️ Funcion de condicion no registrada: {condition_fn_name}")
+        return False
+    
+    try:
+        return bool(condition_fn(fv))
+    except Exception as e:
+        logger.error(f"❌ Error evaluando condicion '{condition_fn_name}': {e}")
+        return False
+
+def generate_hypothesis_id(symbol: str, style: str, rule_id: str, fecha: str) -> str:
+    raw = f"{fecha}|{symbol}|{style}|{rule_id}"
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]
+
+def generate_hypotheses_for_symbol(
+    symbol: str,
+    fecha: str,
+    fv: Dict[str, Any],
+    edge_scores: Dict[str, Any],
+    rules_catalog: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    hypotheses = []
+    rules = rules_catalog.get("rules", {})
+    
+    for style in ['scalping', 'intraday', 'swing']:
+        edge_data = edge_scores.get(style, {})
+        edge_score = edge_data.get("edge_score", 0.0)
+        min_threshold = EDGE_MIN_THRESHOLD.get(style, 60.0)
+        
+        if edge_score < min_threshold:
+            continue
+        
+        style_rules = rules.get(style, [])
+        for rule in style_rules:
+            if not rule.get("active", True):
+                continue
+            
+            rule_min_edge = rule.get("min_edge_score", min_threshold)
+            if edge_score < rule_min_edge:
+                continue
+            
+            if not evaluate_rule(rule, fv):
+                continue
+            
+            hypothesis_id = generate_hypothesis_id(
+                symbol, style, rule.get("rule_id", "UNKNOWN"), fecha
+            )
+            
+            hypothesis = {
+                "hypothesis_id": hypothesis_id,
+                "fecha": fecha,
+                "symbol": symbol,
+                "style": style,
+                "rule_id": rule.get("rule_id"),
+                "condition_fn": rule.get("condition_fn"),
+                "expectation": rule.get("expectation"),
+                "expected_environment": rule.get("expected_environment", "NEUTRAL"),
+                "priority": rule.get("priority", 99),
+                "edge_score": edge_score,
+                "breakdown": edge_data.get("breakdown", {}),
+                "feature_snapshot": {
+                    "regime_duration_bars": fv.get("regime_duration_bars"),
+                    "regime_age_minutes": fv.get("regime_age_minutes"),
+                    "minutes_since_last_anomalous_minute": fv.get("minutes_since_last_anomalous_minute"),
+                    "minutes_since_extreme_spread": fv.get("minutes_since_extreme_spread"),
+                    "regime_transitions_count": fv.get("regime_transitions_count"),
+                    "liquidity_changes_count": fv.get("liquidity_changes_count"),
+                    "minute_state": fv.get("minute_state"),
+                    "anomaly_classification": fv.get("anomaly_classification"),
+                    "fci": fv.get("fci"),
+                    "trend_persistence": fv.get("trend_persistence"),
+                },
+                "timestamp_generacion": datetime.now(timezone.utc).isoformat(),
+                "status": "PENDING_VALIDATION"
+            }
+            
+            hypotheses.append(hypothesis)
+    
+    return hypotheses
+
+def save_hypotheses(hypotheses: List[Dict[str, Any]], fecha: str) -> bool:
+    output_dir = DECISION_WORKSPACE_DIR / "hypotheses"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_file = output_dir / f"hypotheses_{fecha}.json"
+    
+    payload = {
+        "fecha": fecha,
+        "timestamp_generacion": datetime.now(timezone.utc).isoformat(),
+        "total_hypotheses": len(hypotheses),
+        "hypotheses": hypotheses
+    }
+    
+    try:
+        temp_file = output_file.with_suffix(".tmp.json")
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        temp_file.replace(output_file)
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error guardando hipotesis: {e}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description="Hypothesis Engine V1.0")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    
+    logger.info("=" * 80)
+    logger.info(f"💡 INICIANDO HYPOTHESIS ENGINE - FECHA: {fecha}")
+    logger.info("=" * 80)
+    
+    start_time = datetime.now()
+    
+    edge_data = load_edge_scores(fecha)
+    if edge_data is None:
+        logger.critical("❌ No se pueden generar hipotesis sin Edge Scores. Abortando.")
+        return
+    
+    rules_catalog = load_hypothesis_rules()
+    if not rules_catalog.get("rules"):
+        logger.warning("⚠️ Catalogo de hipotesis vacio. No se generaran hipotesis.")
+        return
+    
+    all_condition_fns = set()
+    for style_rules in rules_catalog.get("rules", {}).values():
+        for rule in style_rules:
+            fn_name = rule.get("condition_fn")
+            if fn_name:
+                all_condition_fns.add(fn_name)
+    
+    missing_fns = [fn for fn in all_condition_fns if fn not in CONDITION_REGISTRY]
+    if missing_fns:
+        logger.warning(f"⚠️ Funciones no registradas en el catalogo: {missing_fns}")
+        logger.warning(f"   Las reglas que las referencien seran ignoradas.")
+    
+    all_hypotheses = []
+    symbols_with_hypotheses = 0
+    
+    for symbol in SYMBOLS_TO_CAPTURE:
+        fv = load_feature_vector(symbol, fecha)
+        if fv is None:
+            continue
+        
+        symbol_edge_scores = edge_data.get("edge_scores", {}).get(symbol, {})
+        if not symbol_edge_scores:
+            continue
+        
+        hypotheses = generate_hypotheses_for_symbol(
+            symbol, fecha, fv, symbol_edge_scores, rules_catalog
+        )
+        
+        if hypotheses:
+            all_hypotheses.extend(hypotheses)
+            symbols_with_hypotheses += 1
+            logger.info(f"💡 {symbol}: {len(hypotheses)} hipotesis generadas")
+            for h in hypotheses:
+                logger.info(
+                    f"   • [{h['style']:10}] {h['rule_id']:12} | "
+                    f"Edge: {h['edge_score']:5.1f} | {h['expectation'][:60]}..."
+                )
+        else:
+            logger.info(f"⚪ {symbol}: Sin hipotesis (condiciones no cumplen o edge insuficiente)")
+    
+    if save_hypotheses(all_hypotheses, fecha):
+        logger.info(f"💾 {len(all_hypotheses)} hipotesis guardadas en hypotheses_{fecha}.json")
+    
+    elapsed = (datetime.now() - start_time).total_seconds()
+    
+    logger.info("=" * 80)
+    logger.info(f"📋 RESUMEN HYPOTHESIS ENGINE")
+    logger.info("=" * 80)
+    logger.info(f"   • Simbolos procesados: {len(SYMBOLS_TO_CAPTURE)}")
+    logger.info(f"   • Simbolos con hipotesis: {symbols_with_hypotheses}")
+    logger.info(f"   • Total de hipotesis: {len(all_hypotheses)}")
+    logger.info(f"   • Tiempo total: {elapsed:.2f}s")
+    logger.info("=" * 80)
+
+if __name__ == "__main__":
+    main()

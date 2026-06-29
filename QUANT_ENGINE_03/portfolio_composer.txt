@@ -1,0 +1,223 @@
+# -*- coding: utf-8 -*-
+"""
+==========================================================================
+PORTFOLIO COMPOSER - CONSTRUCTOR QUANT MULTIDIMENSIONAL
+==========================================================================
+Ubicación: QUANT_ENGINE_03
+Dependencias: quant_config (paths, logging, symbols, settings, contracts)
+Responsabilidad: Optimizar la selección de portafolios mediante desempates
+                 deterministas, filtros de exposición cambiaria y telemetría.
+==========================================================================
+"""
+import sys
+from pathlib import Path
+
+# Inyección dinámica de la raíz del proyecto
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+import os
+import itertools
+import json
+import argparse
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone
+
+# Importación desde quant_config
+from quant_config import (
+    PROCESSED_DATA_DIR,
+    AUDIT_STATE_DIR,
+    BROKER_TZ,
+    SYMBOLS_TO_QUANT,
+    MIN_VALID_BARS_FOR_CORR,
+    init_quant_logging,
+    send_telegram_alert,
+    save_contract_atomic,
+    create_portfolio_contract_template
+)
+
+# Inicializar logger
+logger = init_quant_logging("portfolio_composer", "03_QUANT")
+MIN_VALID_BARS_FOR_CORR = 30
+
+
+# ==============================================================================
+# 🧮 FUNCIONES AUXILIARES DE CÁLCULO CUANTITATIVO (ENCAPSULADAS)
+# ==============================================================================
+
+def calculate_stability_score(spread_cv: float, latency_cv: float, quality_std: float, integrity: float, tick_count: int) -> dict:
+    """Calcula el score de estabilidad del activo basado en variaciones de spread y latencia."""
+    score = 100.0 - (spread_cv * 25.0) - (latency_cv * 15.0) - (quality_std * 2.0)
+    score = score * (integrity / 100.0)
+    score = max(0.0, min(100.0, score))
+    return {"score": float(score)}
+
+def calculate_liquidity_score(tps: float, spread_cv: float, idle_ratio: float, gap_ratio: float, tick_count: int) -> dict:
+    """Evalúa la liquidez de mercado considerando transacciones por segundo (TPS) y tiempos de inactividad."""
+    tps_score = min(tps * 20.0, 50.0)
+    spread_score = max(0.0, 50.0 - (spread_cv * 15.0))
+    idle_penalty = idle_ratio * 30.0
+    score = tps_score + spread_score - idle_penalty
+    score = max(0.0, min(100.0, score))
+    return {"score": float(score)}
+
+def calculate_integrity_score(integrity: float, tick_count: int) -> dict:
+    """Pondera la integridad del flujo de datos con penalizaciones por baja muestra."""
+    score = integrity
+    if tick_count < 10:
+        score *= 0.5
+    score = max(0.0, min(100.0, score))
+    return {"score": float(score)}
+
+
+# ==============================================================================
+# 💼 LÓGICA PRINCIPAL DE CONSTRUCCIÓN DE PORTAFOLIOS
+# ==============================================================================
+
+def extraer_divisas_de_trio(trio: list) -> list:
+    divisas = []
+    for pair in trio:
+        if len(pair) == 6: divisas.extend([pair[:3], pair[3:]])
+        else: divisas.extend([pair, "USD"])
+    return divisas
+
+def evaluar_exposicion_divisa(trio: list) -> bool:
+    divisas = extraer_divisas_de_trio(trio)
+    counts = pd.Series(divisas).value_counts()
+    return bool(np.all(counts < 3))
+
+def calcular_matrices_correlacion_regimen(fecha: str) -> dict:
+    sessions_dict = {"ALL": {}, "ASIA": {}, "LONDON": {}, "NY": {}}
+    for symbol in SYMBOLS_TO_QUANT:
+        symbol = symbol.upper()
+        state_file = PROCESSED_DATA_DIR / "market_state" / symbol / f"{symbol}_{fecha}_market_state.parquet"
+        if state_file.exists():
+            try:
+                df = pd.read_parquet(state_file)
+                df_valid = df[(df["session"] != "CLOSED") & (df["low_confidence"] == False)].copy()
+                df_valid = df_valid.drop_duplicates(subset=["timestamp"])
+                if len(df_valid) >= MIN_VALID_BARS_FOR_CORR:
+                    df_valid["return"] = np.log(df_valid["close"] / df_valid["close"].shift(1))
+                    sessions_dict["ALL"][symbol] = df_valid.set_index("timestamp")["return"]
+                    for sess in ["ASIA", "LONDON", "NY"]:
+                        df_sess = df_valid[df_valid["session"] == sess]
+                        if len(df_sess) >= 15:
+                            sessions_dict[sess][symbol] = df_sess.set_index("timestamp")["return"]
+            except Exception as e:
+                logger.warning(f"⚠️ {symbol}: Error de correlación: {e}")
+
+    matrices = {}
+    for sess, returns_map in sessions_dict.items():
+        if len(returns_map) >= 2:
+            df_returns = pd.DataFrame(returns_map).dropna(how="any")
+            if len(df_returns) >= 15:
+                matrices[sess] = df_returns.corr(method="pearson").round(4).to_dict()
+    return matrices
+
+def componer_portafolio(fecha: str) -> bool:
+    readiness_file = PROCESSED_DATA_DIR / "readiness" / f"readiness_report_{fecha}.json"
+    contract_path = AUDIT_STATE_DIR / "portfolio_execution_contract.json"
+
+    if not readiness_file.exists():
+        logger.warning(f"⚠️ Reporte de readiness ausente para la fecha {fecha}.")
+        return False
+
+    try:
+        with open(readiness_file, "r") as rf: readiness_data = json.load(rf)
+    except Exception as e:
+        logger.error(f"❌ Error leyendo reporte de readiness: {e}")
+        return False
+
+    matrices_dict = calcular_matrices_correlacion_regimen(fecha)
+    global_matrix = matrices_dict.get("ALL", {})
+    df_global_corr = pd.DataFrame(global_matrix) if global_matrix else pd.DataFrame()
+
+    logger.info("⚖️ Iniciando optimización combinatoria multidimensional V2.2...")
+    portfolio_by_style = {}
+
+    for style in ['scalping', 'intraday', 'swing']:
+        admitidos, scores_map, features_map = [], {}, {}
+        for item in readiness_data.get("resultados_readiness", []):
+            sym = item.get("symbol")
+            style_data = item.get("readiness_by_style", {}).get(style, {})
+            if style_data.get("status") == "PASS":
+                admitidos.append(sym)
+                scores_map[sym] = float(style_data.get("readiness_score", 0.0))
+                metrics = item.get("metadata", {}).get("evaluated_metrics", {})
+                features_map[sym] = {
+                    "spread_cv": float(metrics.get("spread_mean", 10.0) / 10.0),
+                    "latency_cv": float(metrics.get("jitter_mean_ms", 5.0) / 50.0),
+                    "quality_std": 5.0, "tps": float(metrics.get("tps_mean", 1.0)),
+                    "idle_ratio": 0.05, "integrity": float(metrics.get("quality_mean", 100.0)), "tick_count": 100
+                }
+
+        if len(admitidos) < 3:
+            portfolio_by_style[style] = {"status": "DEFENSIVE_MODE", "trio": admitidos, "metrics": {"combined_score": 0.0, "portfolio_health_score": 0.0, "n_eff": len(admitidos)}, "reason": "Insuficientes activos aprobados."}
+            continue
+
+        trios_posibles = list(itertools.combinations(admitidos, 3))
+        candidates, discarded = [], []
+
+        for trio in trios_posibles:
+            trio_list = list(trio)
+            if not evaluar_exposicion_divisa(trio_list):
+                discarded.append({"trio": trio_list, "reason": f"Concentración cambiaria: {extraer_divisas_de_trio(trio_list)}"})
+                continue
+
+            if not df_global_corr.empty and np.all([p in df_global_corr.columns for p in trio_list]):
+                corrs = [abs(df_global_corr.loc[a, b]) for a, b in itertools.combinations(trio_list, 2)]
+                rho_avg = float(np.mean(corrs))
+                has_corr_data = True
+            else:
+                rho_avg = 0.5
+                has_corr_data = False
+
+            n_eff = 3.0 / (1.0 + 2.0 * rho_avg)
+            stabilities, liquidities, integrities = [], [], []
+
+            for sym in trio_list:
+                f = features_map[sym]
+                stab = calculate_stability_score(f["spread_cv"], f["latency_cv"], f["quality_std"], f["integrity"], f["tick_count"])["score"]
+                liq = calculate_liquidity_score(f["tps"], f["spread_cv"], f["idle_ratio"], 0.0, f["tick_count"])["score"]
+                integ = calculate_integrity_score(f["integrity"], f["tick_count"])["score"]
+                stabilities.append(stab)
+                liquidities.append(liq)
+                integrities.append(integ)
+
+            mean_stability, mean_liquidity, mean_integrity = float(np.mean(stabilities)), float(np.mean(liquidities)), float(np.mean(integrities))
+            mean_readiness = float(np.mean([scores_map[sym] for sym in trio_list]))
+            combined_score = mean_readiness * (n_eff / 3.0) * (mean_stability / 100.0)
+            portfolio_health = (((n_eff / 3.0) * 100.0) * 0.30) + (mean_readiness * 0.30) + (mean_stability * 0.20) + (mean_integrity * 0.20)
+
+            candidates.append({"trio": trio_list, "combined_score": round(combined_score, 1), "portfolio_health_score": round(portfolio_health, 1), "n_eff": round(n_eff, 2), "rho_avg": round(rho_avg, 3), "mean_readiness": round(mean_readiness, 1), "portfolio_stability": round(mean_stability, 1), "portfolio_liquidity": round(mean_liquidity, 1), "portfolio_integrity": round(mean_integrity, 1), "has_corr_data": has_corr_data})
+
+        if not candidates:
+            portfolio_by_style[style] = {"status": "DEFENSIVE_MODE", "trio": sorted(admitidos, key=lambda x: scores_map[x], reverse=True)[:3], "metrics": {"combined_score": 0.0, "portfolio_health_score": 0.0, "n_eff": 1.0}, "reason": "Todos los tríos violaron límites cambiarios.", "discarded_count": len(discarded)}
+            continue
+
+        df_candidates = pd.DataFrame(candidates)
+        df_candidates = df_candidates.sort_values(by=["combined_score", "n_eff", "rho_avg", "mean_readiness", "portfolio_stability"], ascending=[False, False, True, False, False]).reset_index(drop=True)
+        ganador = df_candidates.iloc[0].to_dict()
+        top_10 = df_candidates.head(10).to_dict(orient="records")
+
+        portfolio_by_style[style] = {"status": "OPERABLE", "trio": ganador["trio"], "metrics": {"combined_score": ganador["combined_score"], "portfolio_health_score": ganador["portfolio_health_score"], "n_eff": ganador["n_eff"], "rho_avg": ganador["rho_avg"], "mean_readiness": ganador["mean_readiness"], "portfolio_stability": ganador["portfolio_stability"], "portfolio_liquidity": ganador["portfolio_liquidity"], "portfolio_integrity": ganador["portfolio_integrity"]}, "traceability": {"total_combinations_evaluated": len(trios_posibles), "passed_filters_count": len(candidates), "discarded_count": len(discarded), "top_10_candidates": top_10, "discarded_items_sample": discarded[:10]}}
+
+    # Usar el contract_manager para estructurar atómicamente el contrato de Fase 3
+    from contract_manager import create_portfolio_contract_template, save_contract_atomic
+    contract_data = create_portfolio_contract_template(fecha, portfolio_by_style)
+    save_contract_atomic(contract_data, contract_path)
+    logger.info(f"✅ Contrato de Ejecución F3 'portfolio_execution_contract.json' guardado con éxito.")
+    return True
+
+def main():
+    parser = argparse.ArgumentParser(description="Portfolio Composer V2.2")
+    parser.add_argument("--date", type=str, default="latest")
+    args = parser.parse_args()
+    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    logger.info(f"🚀 Iniciando optimización combinatoria de portafolio para la fecha: {fecha}")
+    componer_portafolio(fecha)
+
+if __name__ == "__main__":
+    main()
