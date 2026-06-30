@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 ==========================================================================
-SYSTEM_CANONICAL - SYSTEM_STATES (ENUMERADORES DE ESTADO)
+SYSTEM_CANONICAL - SYSTEM_STATES (ENUMERADORES DE ESTADO CONSOLIDADOS)
 ==========================================================================
 Ubicación: SYSTEM_CANONICAL/system_states.py
-Responsabilidad: Centralizar los enumeradores de estado para todos los
-                 motores del bot, garantizando consistencia de tipos de datos.
+Responsabilidad: Centralizar los enumeradores de estado de negocio y técnicos.
                  - No realiza operaciones de entrada/salida (I/O).
                  - Libre de dependencias externas.
 ==========================================================================
@@ -38,11 +37,12 @@ class AuditSeverityLevel(str, Enum):
 
 
 class MarketRegime(str, Enum):
-    """Regímenes de mercado basados en los umbrales de volatilidad."""
-    QUIET = "QUIET"              # Mercado calmado / baja volatilidad
-    NORMAL = "NORMAL"            # Comportamiento estándar
-    ACTIVE = "ACTIVE"            # Volatilidad elevada
-    EXPLOSIVE = "EXPLOSIVE"      # Volatilidad extrema (noticias, rollover)
+    """Clasificación estadística discreta de precios (Estructura de Mercado)."""
+    TRENDING_UP = "TRENDING_UP"
+    TRENDING_DOWN = "TRENDING_DOWN"
+    MEAN_REVERTING_HIGH_VOL = "MEAN_REVERTING_HIGH_VOL"
+    MEAN_REVERTING_LOW_VOL = "MEAN_REVERTING_LOW_VOL"
+    ILLIQUID_STATIC = "ILLIQUID_STATIC"
 
 
 class MarketActivityState(str, Enum):
@@ -60,7 +60,7 @@ class MarketReadinessStatus(str, Enum):
 
 
 class DecisionStatus(str, Enum):
-    """Estado de resolución de una propuesta de ejecución en Fase 4."""
+    """Estado de resolución de una propuesta de ejecución."""
     EXECUTE = "EXECUTE"          # Orden autorizada para transmisión al broker (Modo Live)
     SHADOW_LOG = "SHADOW_LOG"    # Orden simulada y registrada en bitácora (Modo Shadow)
     PASS = "PASS"                # Señal descartada / sin operación
@@ -73,33 +73,25 @@ class ContractType(str, Enum):
     PORTFOLIO = "portfolio_execution_contract"
     EXECUTION = "decision_contract"
     LEARNING = "learning_contract"
-
-if __name__ == "__main__":
-    import json
-
-    print("=" * 80)
-    print("CAPA DE CONOCIMIENTO - VERIFICACIÓN DE ENUMERADORES DE ESTADO")
-    print("=" * 80)
     
-    # Prueba de serialización directa a JSON sin encoders especiales
-    test_contract = {
-        "symbol": "EURUSD",
-        "integrity": DatasetQuality.GOLD,
-        "readiness": MarketReadinessStatus.OPERABLE,
-        "regime": MarketRegime.NORMAL,
-        "decision": DecisionStatus.SHADOW_LOG
-    }
-    
-    print("Objeto de prueba en Python:")
-    for k, v in test_contract.items():
-        print(f"   • {k}: {v} (Tipo: {type(v).__name__})")
-        
-    print("\nSerializando directamente a JSON de forma nativa...")
-    try:
-        json_str = json.dumps(test_contract, indent=4)
-        print(json_str)
-        print("\n✅ Serialización nativa completada con éxito (herencia de str verificada).")
-    except TypeError as e:
-        print(f"\n❌ Error de serialización: {e}")
-        
-    print("=" * 80)
+    # Agregar este bloque al final de SYSTEM_CANONICAL/system_states.py
+
+# ==========================================================================
+# MAPPING CANÓNICO DE ESQUEMA DE TICKS (Optimización de espacio HFT)
+# ==========================================================================
+# Define la equivalencia oficial entre las claves ultra-cortas usadas en disco
+# y los nombres descriptivos de negocio de las variables de mercado.
+TICK_SCHEMA_MAPPING = {
+    "tm": "timestamp_msc",      # Unix Epoch en milisegundos del broker
+    "b": "bid",                 # Precio de venta (Bid) normalizado
+    "a": "ask",                 # Precio de compra (Ask) normalizado
+    "sp": "spread_pips",        # Spread en puntos/pips enteros del broker
+    "rs": "raw_spread",         # Spread en valor flotante real
+    "mp": "mid_price",          # Precio medio (Bid + Ask) / 2
+    "l": "last",                # Último precio transaccionado (si aplica)
+    "v": "volume_real",         # Volumen transaccional real (si aplica)
+    "f": "flags",               # Banderas de origen del tick (MT5)
+    "seq": "sequence",          # ID correlativo único de secuencia
+    "recv_ts": "received_ts",   # Timestamp local de recepción (milisegundos)
+    "sf": "spread_filter_flag"  # Bandera booleana de spread excedido (opcional)
+}

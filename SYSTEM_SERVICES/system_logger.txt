@@ -1,24 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 ==========================================================================
-SYSTEM_SERVICES - SYSTEM_LOGGER (LOG ASÍNCRONO SIN BLOQUEO)
-==========================================================================
-Ubicación: SYSTEM_SERVICES/system_logger.py
-Responsabilidad: Proveer inicialización de logs unificada y asíncrona.
-                 Previene que la escritura en disco del SSD interfiera con el
-                 hilo caliente de captura rápida de ticks en MT5.
-                 - Escribe en C:\\MT5_DATA\\LOGS\\ categorizado por motor.
+SYSTEM_SERVICES - SYSTEM_LOGGER (LOG ASÍNCRONO SEGURO CON MULTI-LISTENER)
 ==========================================================================
 """
 import logging
 import logging.handlers
 import queue
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Any
 
-# Importación de las rutas de Logs centralizadas en C:\MT5_DATA
 from SYSTEM_SERVICES.system_paths import (
     LOGS_MASTER_DIR,
     LOGS_CAPTURE_DIR,
@@ -27,7 +21,6 @@ from SYSTEM_SERVICES.system_paths import (
     LOGS_DECISION_DIR
 )
 
-# Mapeo de categorías operacionales a sus respectivos directorios físicos
 CATEGORY_MAP: Dict[str, Path] = {
     "00_ORCHESTRATOR": LOGS_MASTER_DIR,
     "01_CAPTURE": LOGS_CAPTURE_DIR,
@@ -36,111 +29,72 @@ CATEGORY_MAP: Dict[str, Path] = {
     "04_DECISION": LOGS_DECISION_DIR
 }
 
-# Configuración global del buffer de memoria del Logger asíncrono
-_log_queue = queue.Queue(-1)  # Cola con tamaño infinito para evitar descartes de logs
-_queue_listener = None
-
-
-def _initialize_listener() -> None:
-    """
-    Inicializa el hilo de segundo plano (Listener) que procesa de manera asíncrona
-    las solicitudes de escritura en el disco.
-    """
-    global _queue_listener
-    if _queue_listener is None:
-        # El Listener se encarga de recibir los logs de la cola y mandarlos a consola / archivos.
-        # No se le añaden Handlers directos aquí; se asocian de forma dinámica.
-        _queue_listener = logging.handlers.QueueListener(_log_queue)
-        _queue_listener.start()
+# Control de inicialización concurrente de loggers
+_logger_lock = threading.Lock()
+_active_listeners: Dict[str, logging.handlers.QueueListener] = {}
 
 
 def get_system_logger(module_name: str, category: str = "00_ORCHESTRATOR") -> logging.Logger:
     """
-    Genera y retorna un logger asíncrono y robusto para cualquier motor del bot.
-
-    Args:
-        module_name: Nombre del archivo/módulo que registra la información (ej. "mt5_tick_engine").
-        category: Categoría operativa (debe coincidir con las carpetas mapeadas).
-
-    Returns:
-        logging.Logger: Instancia del logger no bloqueante configurado.
+    Genera y retorna un logger asíncrono y robusto para cualquier motor del bot,
+    garantizando que sus logs se mantengan estrictamente en su archivo correspondiente.
     """
-    _initialize_listener()
-    
-    logger = logging.getLogger(module_name)
-    logger.setLevel(logging.INFO)
-    
-    # Prevenir duplicidad de logs si el logger ya fue inicializado previamente
-    if logger.handlers:
+    with _logger_lock:
+        logger = logging.getLogger(module_name)
+        
+        # Si el logger ya tiene configurado un QueueHandler, evitamos duplicar handlers
+        if any(isinstance(h, logging.handlers.QueueHandler) for h in logger.handlers):
+            return logger
+            
+        logger.setLevel(logging.INFO)
+        logger.propagate = False  # Evita duplicación hacia el logger raíz
+        
+        # Resolver ruta destino
+        log_folder = CATEGORY_MAP.get(category, LOGS_MASTER_DIR)
+        current_date = datetime.now().strftime("%Y%m%d")
+        log_file_path = log_folder / f"{module_name}_{current_date}.log"
+        
+        # Formato unificado
+        formatter = logging.Formatter(
+            "[%(asctime)s.%(msecs)03d] [%(levelname)s] [%(name)s] -> %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        
+        # Handlers físicos de destino
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file_path,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8"
+        )
+        file_handler.setFormatter(formatter)
+        
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        
+        # Cola y Listener dedicado exclusivo para ESTE módulo
+        module_queue = queue.Queue(-1)
+        queue_handler = logging.handlers.QueueHandler(module_queue)
+        logger.addHandler(queue_handler)
+        
+        # Instanciar e iniciar listener para el módulo actual
+        listener = logging.handlers.QueueListener(module_queue, file_handler, console_handler)
+        listener.start()
+        
+        # Almacenar referencia al listener para poder cerrarlo en el shutdown
+        _active_listeners[module_name] = listener
+        
         return logger
-        
-    # Resolver ruta destino
-    log_folder = CATEGORY_MAP.get(category, LOGS_MASTER_DIR)
-    current_date = datetime.now().strftime("%Y%m%d")
-    log_file_path = log_folder / f"{module_name}_{current_date}.log"
-    
-    # Formato de salida profesional y estructurado
-    formatter = logging.Formatter(
-        "[%(asctime)s.%(msecs)03d] [%(levelname)s] [%(name)s] -> %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    
-    # Handler para Escritura física en Archivo
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_file_path,
-        maxBytes=10 * 1024 * 1024,  # Rotar archivo cada 10 MB
-        backupCount=5,
-        encoding="utf-8"
-    )
-    file_handler.setFormatter(formatter)
-    
-    # Handler para Consola (Salida estándar)
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    
-    # Registrar los Handlers de escritura reales en el Listener asíncrono global
-    # Esto es lo que desvincula la escritura en disco del hilo que llama al logger
-    global _queue_listener
-    if _queue_listener:
-        _queue_listener.handlers = tuple(list(_queue_listener.handlers) + [file_handler, console_handler])
-        
-    # El logger del módulo únicamente despacha el registro a la cola en memoria (QueueHandler)
-    # Esta operación toma menos de un microsegundo, garantizando cero latencia en el hilo principal
-    queue_handler = logging.handlers.QueueHandler(_log_queue)
-    logger.addHandler(queue_handler)
-    
-    return logger
 
 
 def stop_logger_listener() -> None:
     """
-    Detiene de forma segura el hilo de segundo plano del logger al apagar el bot,
-    asegurando que todos los mensajes en memoria se escriban en el disco.
+    Detiene de forma segura todos los hilos listener de fondo del logger al apagar el bot.
     """
-    global _queue_listener
-    if _queue_listener:
-        _queue_listener.stop()
-        _queue_listener = None
-
-
-if __name__ == "__main__":
-    print("=" * 80)
-    print("SOPORTE DE INFRAESTRUCTURA - VERIFICACIÓN DE LOG ASÍNCRONO")
-    print("=" * 80)
-    
-    # Inicialización de loggers de prueba bajo distintas categorías
-    log_captura = get_system_logger("test_captura", "01_CAPTURE")
-    log_master = get_system_logger("test_master", "00_ORCHESTRATOR")
-    
-    # Ejecución de logs
-    log_master.info("Inicializando ciclo de prueba del logger.")
-    log_captura.info("Simulando captura de tick rápido EURUSD sin latencia de disco.")
-    
-    # Detener listener de forma ordenada para pruebas
-    stop_logger_listener()
-    
-    print("\n✅ Verificación completada.")
-    print("   Revise que se hayan generado de forma asíncrona los archivos de texto en:")
-    print("   - C:\\MT5_DATA\\LOGS\\00_ORCHESTRATOR\\test_master_[FECHA].log")
-    print("   - C:\\MT5_DATA\\LOGS\\01_CAPTURE\\test_captura_[FECHA].log")
-    print("=" * 80)
+    with _logger_lock:
+        for module_name, listener in list(_active_listeners.items()):
+            try:
+                listener.stop()
+            except Exception:
+                pass
+        _active_listeners.clear()

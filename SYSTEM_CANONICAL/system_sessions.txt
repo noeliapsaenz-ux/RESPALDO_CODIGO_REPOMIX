@@ -43,13 +43,11 @@ def get_broker_timezone() -> zoneinfo.ZoneInfo:
     """
     return BROKER_TZ
 
-
 def get_current_broker_time() -> datetime:
     """
     Obtiene la hora actual localizada con precisión en la zona horaria del broker.
     """
     return datetime.now(timezone.utc).astimezone(BROKER_TZ)
-
 
 def classify_session(hour: int) -> str:
     """
@@ -71,26 +69,25 @@ def classify_session(hour: int) -> str:
         return "NEW_YORK"
     return "UNKNOWN"
 
-
 def is_market_open_at(dt: datetime) -> bool:
     """
-    Evalúa si el mercado está abierto en un momento del tiempo específico.
-    Utiliza de forma estricta las reglas operativas de su entorno de producción.
-
-    Reglas de producción integradas:
-       1. Fines de semana cerrados (Sábado = 5, Domingo = 6).
-       2. El bot solo opera dentro del rango horario diario: 06:00 a 22:00.
+    Evalúa si el mercado global de Forex está abierto de acuerdo al calendario 24/5.
+    
+    Reglas de mercado internacionales aplicadas:
+       - Abre: Lunes a las 00:00:00 (Hora del Broker).
+       - Cierra: Viernes a las 23:59:59 (Hora del Broker).
+       - Fines de semana (Sábado y Domingo) permanece cerrado.
     """
-    # 1. Comprobar fin de semana en base al día de la semana (Lunes=0 ... Domingo=6)
-    if dt.weekday() in [5, 6]:
+    # En Python: Lunes=0, Martes=1, Miércoles=2, Jueves=3, Viernes=4, Sábado=5, Domingo=6
+    day = dt.weekday()
+    
+    # 1. Si es Sábado o Domingo, el mercado está cerrado
+    if day in [5, 6]:
         return False
         
-    # 2. Comprobar ventana diaria operativa (06:00 <= hora < 22:00)
-    if dt.hour < 6 or dt.hour >= 22:
-        return False
-        
+    # 2. De lunes a viernes el mercado opera de forma continua las 24 horas del día.
+    # El sistema captura y opera desde el lunes a las 00:00:00 hasta el viernes a las 23:59:59.
     return True
-
 
 def is_market_open() -> bool:
     """
@@ -99,7 +96,6 @@ def is_market_open() -> bool:
     """
     now_broker = get_current_broker_time()
     return is_market_open_at(now_broker)
-
 
 if __name__ == "__main__":
     print("=" * 80)

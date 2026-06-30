@@ -59,20 +59,42 @@ def load_contract_safe(filepath: Path) -> Dict[str, Any]:
 
 
 def save_contract_atomic(data: Dict[str, Any], filepath: Path) -> None:
-    """Guarda un contrato de forma atómica en Windows usando un archivo temporal."""
+    """
+    Guarda un contrato de forma atómica en Windows usando un archivo temporal.
+    Mitiga el riesgo de archivos truncados a mitad de escritura y previene bloqueos
+    por accesos concurrentes de lectura en sistemas de archivos locales NTFS/FAT32.
+    """
+    import time
     temp_path = filepath.with_suffix(".tmp")
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    
     try:
-        filepath.parent.mkdir(parents=True, exist_ok=True)
+        # 1. Escritura inicial en archivo temporal
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False, cls=NumpySafeEncoder)
             f.flush()
             os.fsync(f.fileno())
-        temp_path.replace(filepath)
+            
+        # 2. Reemplazo atómico con política de reintentos para Windows (File Locks temporales)
+        retries = 3
+        delay = 0.05
+        for attempt in range(retries):
+            try:
+                # os.replace es atómica tanto en Unix como en Windows (Python 3.3+)
+                os.replace(temp_path, filepath)
+                break
+            except PermissionError as pe:
+                if attempt == retries - 1:
+                    raise pe
+                time.sleep(delay)
+                delay *= 2  # Backoff exponencial
     except Exception as e:
         if temp_path.exists():
-            temp_path.unlink()
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
         raise OSError(f"Error escribiendo contrato de forma atómica en {filepath.name}: {e}")
-
 
 def create_audit_contract_template(fecha: str, contracts: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     """
