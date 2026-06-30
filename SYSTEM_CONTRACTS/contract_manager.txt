@@ -28,6 +28,65 @@ SCHEMA_VERSIONS: Dict[str, str] = {
     ContractType.EXECUTION.value: "3.0"    # decision_contract (F4)
 }
 
+# Constantes de versión globales para compatibilidad del Motor de Auditoría
+SCHEMA_VERSION_AUDIT = "2.0"
+PRODUCER_AUDIT = "AUDIT_ENGINE_02"
+AUDIT_VERSION = "2.0.0"
+
+# ==========================================================================
+# ESQUEMAS FÍSICOS Y ESTRUCTURALES UNIFICADOS (PARQUET)
+# ==========================================================================
+PARQUET_SCHEMAS = {
+    "parquet_required_columns": [
+        "time",
+        "time_msc",
+        "bid",
+        "ask",
+        "spread_pips",
+        "session",
+        "seq"
+    ],
+    "gold_required_columns": [
+        "time",
+        "time_msc",
+        "bid",
+        "ask",
+        "spread_pips",
+        "session",
+        "seq",
+        "quality_score"
+    ],
+    "maestro_v2": [
+        "time", "time_msc", "recv_ts", "bid", "ask", "mid_price",
+        "spread_pips", "raw_spread_pips", "volume", "flags_mt5",
+        "seq", "session", "broker_hour", "utc_hour", "weekday",
+        "tick_interval_ms", "delta_bid", "delta_ask", "delta_mid",
+        "delta_spread", "delta2_spread", "quote_update_type",
+        "duplicate_tick", "duplicate_group", "latency_ms",
+        "clock_sync_issue"
+    ],
+    "gold_v2": [
+        "time", "time_msc", "recv_ts", "bid", "ask", "mid_price",
+        "spread_pips", "raw_spread_pips", "volume", "flags_mt5",
+        "seq", "session", "broker_hour", "utc_hour", "weekday",
+        "tick_interval_ms", "delta_bid", "delta_ask", "delta_mid",
+        "delta_spread", "delta2_spread", "quote_update_type",
+        "duplicate_tick", "duplicate_group", "latency_ms",
+        "clock_sync_issue", "quality_score", "quality_flags"
+    ]
+}
+
+# ==========================================================================
+# MÁSCARAS DE BITS DE CALIDAD VECTORIAL
+# ==========================================================================
+BIT_REVERSED_SPREAD = 0x01    # Bid >= Ask
+BIT_WIDE_SPREAD = 0x02        # Excede spread canónico
+BIT_STALE_TICK = 0x04         # Tick congelado
+BIT_CLOCK_SYNC = 0x08         # Latencia negativa o desfase temporal
+BIT_ZERO_SPREAD = 0x10        # Spread <= 0
+BIT_DUPLICATE_SEQ = 0x20      # ID de secuencia duplicado
+BIT_QUALITY_MASK = 0x3F
+
 
 class NumpySafeEncoder(json.JSONEncoder):
     """Codificador seguro contra tipos no serializables de NumPy."""

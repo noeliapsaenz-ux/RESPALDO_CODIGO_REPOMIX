@@ -1,28 +1,29 @@
 """
 ==========================================================================
-CRYPTO LINEAGE AUDITOR V2 - TRAZABILIDAD CRIPTOGRÁFICA
+AUDIT_ENGINE_02 - CRYPTO_LINEAGE_AUDITOR
 ==========================================================================
-Ubicación: AUDIT_ENGINE_02
-Dependencias: audit_config (paths, symbols, logging, validation)
-Responsabilidad: Auditar la trazabilidad criptográfica de los datos
-                 desde JSONL hasta Parquet Gold, verificando la integridad
-                 de la cadena de custodia mediante hashes SHA-256.
+Ubicación: AUDIT_ENGINE_02/crypto_lineage_auditor.py
+Descripción: Garantiza el linaje e integridad criptográfica de la cadena
+             de custodia de los ticks desde JSONL crudo hasta Parquet Gold.
 ==========================================================================
 """
+
 import sys
+import gzip
+import json
+import hashlib
+import argparse
 from pathlib import Path
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+import pandas as pd
 
 # Inyección de ruta raíz
-root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
-local_path = Path(__file__).resolve().parent
-if str(local_path) not in sys.path:
-    sys.path.insert(0, str(local_path))
-
-# Redirección UTF-8 robusta de buffers de consola Windows
-import io
+# Redirección de codificación robusta de terminales Windows
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -30,49 +31,36 @@ if sys.platform == "win32":
     except AttributeError:
         pass
 
-import json
-import hashlib
-import gzip
-import argparse
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any
-import pandas as pd
-
-# Importación desde audit_config
-from audit_config import (
-    AUDIT_REPORTES_DIR,
-    AUDIT_STATE_DIR,
-    AUDIT_LINEAGE_DIR,
-    AUDIT_MAESTROS_DIR,
-    AUDIT_GOLD_DIR,
-    ARCHIVE_SAFE_DIR,
+# Importaciones desde audit_config
+from AUDIT_ENGINE_02.audit_config import (
+    AUDIT_REPORTS,
+    AUDIT_STATE,
+    AUDIT_LINEAGE,
+    AUDIT_MAESTROS,
+    AUDIT_GOLD,
+    SAFE_DIR,
     SSD_EVIDENCE_DIR,
+    PRIMARY_TICK_DIR,
     SYMBOLS_TO_AUDIT,
     get_fecha_broker_str,
-    HOT_RAM_DIR,
-    PROCESSED_DATA_DIR,
     STRUCTURE_VALIDATION,
-    init_audit_logging
+    init_audit_logging,
+    load_contract_safe,
+    save_contract_atomic
 )
 
-# Importación desde audit_contracts
-from audit_contracts import (
-    load_json_safe,
+from AUDIT_ENGINE_02.audit_contracts import (
     create_audit_result_template,
     validate_audit_result,
-    calculate_file_hash,
-    resolve_target_date,
-    CRITICAL_ERRORS
+    resolve_target_date
 )
 
-# Inicializar logger
 logger = init_audit_logging("crypto_lineage_auditor", "02_AUDIT")
 
 COLUMNAS_REQUERIDAS_MAESTRO = STRUCTURE_VALIDATION.get("parquet_required_columns")
 
-
 def contar_ticks_jsonl(file_path: Path) -> int:
-    """Cuenta el número de ticks en un archivo JSONL o JSONL.GZ."""
+    """Cuenta de manera eficiente el número de líneas (ticks) en un archivo JSONL/GZ."""
     try:
         open_func = gzip.open(file_path, "rt", encoding="utf-8", errors="ignore") if file_path.suffix == ".gz" else open(file_path, "r", encoding="utf-8", errors="ignore")
         with open_func as f:
@@ -80,9 +68,8 @@ def contar_ticks_jsonl(file_path: Path) -> int:
     except Exception:
         return 0
 
-
 def calcular_hash_contenido_jsonl(file_path: Path) -> str:
-    """Calcula el hash SHA-256 del contenido de un archivo JSONL/JSONL.GZ."""
+    """Calcula el hash SHA-256 de las líneas de datos útiles del archivo."""
     if not file_path.exists():
         return ""
     try:
@@ -96,27 +83,15 @@ def calcular_hash_contenido_jsonl(file_path: Path) -> str:
     except Exception:
         return ""
 
-
 def obtener_metadatos_jsonl(symbol: str, fecha: str) -> Dict[str, Any]:
-    """
-    Obtiene metadatos de los archivos JSONL para un símbolo y fecha.
-
-    Args:
-        symbol: Símbolo a auditar
-        fecha: Fecha en formato YYYYMMDD
-
-    Returns:
-        Dict[str, Any]: Metadatos del archivo JSONL
-    """
+    """Recopila la metadata física del archivo de ticks original."""
     symbol = symbol.upper()
 
-    # Buscar usando la terminología unificada del SOT
+    # Rutas físicas posibles ordenadas por jerarquía
     search_paths = [
-        HOT_RAM_DIR / symbol / fecha,
+        PRIMARY_TICK_DIR / symbol / fecha,
         SSD_EVIDENCE_DIR / symbol / fecha,
-        ARCHIVE_SAFE_DIR / symbol / fecha,
-        PROCESSED_DATA_DIR / symbol / fecha,
-        PROCESSED_DATA_DIR / "compressed" / symbol / fecha
+        SAFE_DIR / symbol / fecha
     ]
 
     all_files = []
@@ -130,7 +105,6 @@ def obtener_metadatos_jsonl(symbol: str, fecha: str) -> Dict[str, Any]:
     file_hashes = {}
     file_metadata = {}
     total_ticks = 0
-    total_size = 0
 
     for fp in all_files:
         try:
@@ -141,7 +115,6 @@ def obtener_metadatos_jsonl(symbol: str, fecha: str) -> Dict[str, Any]:
                 "is_gz": fp.suffix == ".gz"
             }
             total_ticks += ticks
-            total_size += fp.stat().st_size
             file_hashes[fp.name] = calcular_hash_contenido_jsonl(fp) or "ERROR"
         except Exception:
             pass
@@ -157,19 +130,9 @@ def obtener_metadatos_jsonl(symbol: str, fecha: str) -> Dict[str, Any]:
         "file_metadata": file_metadata
     }
 
-
 def obtener_metadatos_parquet(symbol: str, fecha: str) -> Dict[str, Any]:
-    """
-    Obtiene metadatos del Parquet Maestro para un símbolo y fecha.
-
-    Args:
-        symbol: Símbolo a auditar
-        fecha: Fecha en formato YYYYMMDD
-
-    Returns:
-        Dict[str, Any]: Metadatos del Parquet Maestro
-    """
-    parquet_path = AUDIT_MAESTROS_DIR / f"ticks_maestro_{symbol}_{fecha}.parquet"
+    """Obtiene y valida la metadata estructural del Parquet Maestro."""
+    parquet_path = AUDIT_MAESTROS / f"ticks_maestro_{symbol}_{fecha}.parquet"
     if not parquet_path.exists():
         return {"exists": False, "total_ticks": 0}
     try:
@@ -186,19 +149,9 @@ def obtener_metadatos_parquet(symbol: str, fecha: str) -> Dict[str, Any]:
     except Exception as e:
         return {"exists": False, "error": str(e), "total_ticks": 0}
 
-
 def obtener_metadatos_gold(symbol: str, fecha: str) -> Dict[str, Any]:
-    """
-    Obtiene metadatos del Parquet Gold para un símbolo y fecha.
-
-    Args:
-        symbol: Símbolo a auditar
-        fecha: Fecha en formato YYYYMMDD
-
-    Returns:
-        Dict[str, Any]: Metadatos del Parquet Gold
-    """
-    gold_path = AUDIT_GOLD_DIR / f"{symbol}_{fecha}_gold.parquet"
+    """Obtiene y valida la metadata estructural del Parquet Gold."""
+    gold_path = AUDIT_GOLD / f"{symbol}_{fecha}_gold.parquet"
     if not gold_path.exists():
         return {"exists": False, "total_ticks": 0}
     try:
@@ -214,18 +167,8 @@ def obtener_metadatos_gold(symbol: str, fecha: str) -> Dict[str, Any]:
     except Exception:
         return {"exists": False, "total_ticks": 0}
 
-
 def auditar_lineage(symbol: str, fecha: str) -> Dict[str, Any]:
-    """
-    Audita la trazabilidad criptográfica para un símbolo y fecha.
-
-    Args:
-        symbol: Símbolo a auditar
-        fecha: Fecha en formato YYYYMMDD
-
-    Returns:
-        Dict[str, Any]: Resultado de la auditoría de lineage
-    """
+    """Audita y compara las firmas hash para asegurar la inmutabilidad física."""
     symbol = symbol.upper()
     result = create_audit_result_template(symbol, stage="cryptographic_lineage")
 
@@ -248,12 +191,15 @@ def auditar_lineage(symbol: str, fecha: str) -> Dict[str, Any]:
     if not jsonl_meta.get("exists", False) or not parquet_meta.get("exists", False):
         result["status"] = "FAIL"
         result["confidence"] = 0.0
-        result["critical_errors"].append({"code": "missing_mandatory_stages", "message": "Faltan etapas físicas del pipeline de datos."})
+        result["critical_errors"].append({
+            "code": "missing_mandatory_stages",
+            "message": f"Faltan etapas físicas mandatorias del flujo para el símbolo {symbol}."
+        })
         return result
 
     collective_hash = jsonl_meta.get("sha256_collective", "")
-    state_file = AUDIT_STATE_DIR / "lineage_state.json"
-    state = load_json_safe(state_file)
+    state_file = AUDIT_STATE / "lineage_state.json"
+    state = load_contract_safe(state_file)
 
     if symbol not in state:
         state[symbol] = {}
@@ -262,16 +208,18 @@ def auditar_lineage(symbol: str, fecha: str) -> Dict[str, Any]:
         if collective_hash != state[symbol][fecha]:
             result["critical_errors"].append({
                 "code": "cryptographic_tamper_detected",
-                "message": "Fallo de custodia: Hash colectivo actual no coincide con el original."
+                "message": "Fallo de cadena de custodia: El hash colectivo actual no coincide con la firma inicial."
             })
             penalty += 50.0
     else:
         state[symbol][fecha] = collective_hash
-        AUDIT_STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
+        save_contract_atomic(state, state_file)
 
     if not parquet_meta.get("structure_valid", False):
+        result["critical_errors"].append({
+            "code": "invalid_structure",
+            "message": "Esquema del Parquet Maestro no coincide con las columnas requeridas canónicas."
+        })
         penalty += 25.0
 
     result["confidence"] = max(0.0, 100.0 - penalty)
@@ -280,14 +228,13 @@ def auditar_lineage(symbol: str, fecha: str) -> Dict[str, Any]:
     assert validate_audit_result(result)
     return result
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Crypto Lineage Auditor V2")
+    parser = argparse.ArgumentParser(description="Crypto Lineage Auditor")
     parser.add_argument("--date", type=str, default="latest")
     args = parser.parse_args()
 
-    fecha = resolve_target_date(args.date, AUDIT_STATE_DIR, get_fecha_broker_str)
-    logger.info(f"📊 TRAZABILIDAD CRIPTOGRÁFICA (LINAJE) - FECHA: {fecha}")
+    fecha = resolve_target_date(args.date, AUDIT_STATE, get_fecha_broker_str)
+    logger.info(f"🛡️ ANALIZANDO INTEGRIDAD DE LINAJE CRIPTOGRÁFICO - FECHA: {fecha}")
 
     resultados = {s.upper(): auditar_lineage(s, fecha) for s in SYMBOLS_TO_AUDIT}
     reporte = {
@@ -296,12 +243,9 @@ def main():
         "resultados": resultados
     }
 
-    output_path = AUDIT_LINEAGE_DIR / f"lineage_report_{fecha}.json"
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(reporte, f, indent=2)
-
-    logger.info(f"✅ Reporte de lineage guardado en: {output_path.name}")
-
+    output_path = AUDIT_LINEAGE / f"lineage_report_{fecha}.json"
+    save_contract_atomic(reporte, output_path)
+    logger.info(f"✅ Reporte de linaje de datos emitido: {output_path.name}")
 
 if __name__ == "__main__":
     main()

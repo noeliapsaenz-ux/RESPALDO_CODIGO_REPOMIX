@@ -141,6 +141,17 @@ def get_symbol_specification(symbol: str) -> SymbolSpecification:
     return _CANONICAL_CATALOG[sym_upper]
 
 
+def get_spread_limit(symbol: str) -> float:
+    """
+    Retorna el límite de spread canónico para un símbolo.
+    No admite límites 'hardcoded' locales. Fallback defensivo de 30.0 puntos.
+    """
+    try:
+        return get_symbol_specification(symbol).spread_limit
+    except KeyError:
+        return 30.0
+        
+
 if __name__ == "__main__":
     print("=" * 80)
     print("CAPA DE CONOCIMIENTO - CONSOLIDACIÓN INMUTABLE Y POLÍTICA FAIL-FAST")
@@ -150,6 +161,7 @@ if __name__ == "__main__":
     # 1. Prueba de consulta de un activo válido
     specs = get_symbol_specification("EURUSD")
     print(f"Activo válido verificado: {specs.symbol} | Búfer: {specs.buffer_size}")
+    print(f"Límite de spread canónico: {get_spread_limit('EURUSD')} puntos")
     
     # 2. Prueba del comportamiento Fail-Fast ante un activo inválido
     print("\nEjecutando prueba de control de errores (Fail-Fast)...")

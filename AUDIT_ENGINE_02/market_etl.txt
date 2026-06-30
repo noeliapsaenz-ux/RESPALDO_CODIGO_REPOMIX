@@ -1,41 +1,39 @@
 # -*- coding: utf-8 -*-
 """
 ==========================================================================
-MARKET ETL - COMPILADOR DE MAESTROS Y GOLD V2.1
+AUDIT_ENGINE_02 - MARKET_ETL
 ==========================================================================
-Ubicación: AUDIT_ENGINE_02
-Dependencias: audit_config (paths, symbols, logging, validation)
-Responsabilidad: Compilar Parquets Maestros y Gold a partir de JSONL/JSONL.GZ
-                 con enriquecimiento de features y certificación de calidad.
+Ubicación: AUDIT_ENGINE_02/market_etl.py
+Descripción: Compila y unifica los Parquets Maestro y Gold a partir de
+             los buffers del capturador de ticks.
 ==========================================================================
 """
+
 import sys
+import gzip
+import json
+import argparse
 from pathlib import Path
+from datetime import datetime, timezone
+import numpy as np
+import pandas as pd
 
 # Inyección de ruta raíz
-root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
-
-import json
-import gzip
-import argparse
-from datetime import datetime, timezone
-import pandas as pd
-import numpy as np
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 # Importación desde audit_config
-from audit_config import (
-    ARCHIVE_SAFE_DIR,
+from AUDIT_ENGINE_02.audit_config import (
+    SAFE_DIR,
     SSD_EVIDENCE_DIR,
-    AUDIT_MAESTROS_DIR,
-    AUDIT_GOLD_DIR,
+    AUDIT_MAESTROS,
+    AUDIT_GOLD,
     SYMBOLS_TO_AUDIT,
-    SPREAD_LIMITS,
-    BROKER_TZ,
+    get_spread_limit,
+    get_broker_timezone,
     init_audit_logging,
     classify_session,
-    PROCESSED_DATA_DIR,
     STRUCTURE_VALIDATION,
     BIT_REVERSED_SPREAD,
     BIT_WIDE_SPREAD,
@@ -45,37 +43,23 @@ from audit_config import (
     BIT_DUPLICATE_SEQ
 )
 
-# Inicializar logger
 logger = init_audit_logging("market_etl", "02_AUDIT")
 
-# Obtener esquemas de STRUCTURE_VALIDATION
 MAESTRO_SCHEMA_V2 = STRUCTURE_VALIDATION.get("maestro_schema_v2", [])
 GOLD_SCHEMA_V2 = STRUCTURE_VALIDATION.get("gold_schema_v2", [])
 
-
 def generar_parquet_gold(symbol: str, fecha: str, df_maestro: pd.DataFrame) -> bool:
-    """
-    Construye el Parquet GOLD a partir del Maestro.
-    Filtra físicamente los duplicados, pero conserva el flag de evidencia.
-
-    Args:
-        symbol: Símbolo
-        fecha: Fecha en formato YYYYMMDD
-        df_maestro: DataFrame Maestro
-
-    Returns:
-        bool: True si se generó correctamente
-    """
+    """Consolida el archivo certificado GOLD libre de duplicados con métricas de calidad."""
     if df_maestro.empty:
         return False
 
-    logger.info(f"✨ {symbol}: Construyendo Parquet GOLD certificado (Esquema V2)...")
+    logger.info(f"✨ {symbol}: Certificando y normalizando dataset GOLD...")
 
-    # Eliminar duplicados físicos para análisis cuantitativo limpio
+    # Exclusión de duplicados para análisis cuantitativo e histórico limpio
     df_gold = df_maestro.drop_duplicates(subset=["seq"], keep="first").copy()
 
-    # Evaluación de Calidad Vectorial
-    limit = SPREAD_LIMITS.get(symbol, SPREAD_LIMITS.get('DEFAULT', 30.0))
+    # Cálculo dinámico del límite de spread desde la capa canónica
+    limit = get_spread_limit(symbol)
     spreads = df_gold['spread_pips'].values
     bids = df_gold['bid'].values
     asks = df_gold['ask'].values
@@ -83,12 +67,11 @@ def generar_parquet_gold(symbol: str, fecha: str, df_maestro: pd.DataFrame) -> b
     scores = np.ones(len(df_gold)) * 100.0
     bitmask = np.zeros(len(df_gold), dtype=np.uint8)
 
-    # Detección de condiciones anómalas
+    # Identificación de anomalías vectoriales
     reversed_mask = bids >= asks
     zero_spread_mask = spreads <= 0
     wide_spread_mask = (spreads > limit) & (~reversed_mask) & (~zero_spread_mask)
 
-    # Cotización congelada (stale)
     stale_cond = (df_gold['delta_bid'] == 0) & (df_gold['delta_ask'] == 0)
     if len(stale_cond) > 0:
         stale_cond.iloc[0] = False
@@ -96,7 +79,7 @@ def generar_parquet_gold(symbol: str, fecha: str, df_maestro: pd.DataFrame) -> b
     clock_cond = df_gold['clock_sync_issue'].values
     dup_cond = df_gold['duplicate_tick'].values
 
-    # Construcción de la Máscara de Bits
+    # Codificación de la máscara de bits de anomalías detectadas
     bitmask |= np.where(reversed_mask, BIT_REVERSED_SPREAD, 0).astype(np.uint8)
     bitmask |= np.where(wide_spread_mask, BIT_WIDE_SPREAD, 0).astype(np.uint8)
     bitmask |= np.where(stale_cond, BIT_STALE_TICK, 0).astype(np.uint8)
@@ -104,7 +87,7 @@ def generar_parquet_gold(symbol: str, fecha: str, df_maestro: pd.DataFrame) -> b
     bitmask |= np.where(zero_spread_mask, BIT_ZERO_SPREAD, 0).astype(np.uint8)
     bitmask |= np.where(dup_cond, BIT_DUPLICATE_SEQ, 0).astype(np.uint8)
 
-    # Cálculo dinámico del Quality Score
+    # Penalización del score de calidad
     scores[reversed_mask | zero_spread_mask] = 20.0
     scores[wide_spread_mask] = np.clip(100.0 - (spreads[wide_spread_mask] - limit) * 3.0, 10.0, 100.0)
     scores[stale_cond & (~reversed_mask)] -= 5.0
@@ -114,51 +97,36 @@ def generar_parquet_gold(symbol: str, fecha: str, df_maestro: pd.DataFrame) -> b
     df_gold['quality_score'] = np.clip(scores, 0.0, 100.0).round(1)
     df_gold['quality_flags'] = bitmask
 
-    # Asegurar orden exacto de columnas del esquema GOLD V2
     df_gold = df_gold[GOLD_SCHEMA_V2]
 
-    # Guardar archivo certificado
-    AUDIT_GOLD_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = AUDIT_GOLD_DIR / f"{symbol}_{fecha}_gold.parquet"
+    AUDIT_GOLD.mkdir(parents=True, exist_ok=True)
+    output_path = AUDIT_GOLD / f"{symbol}_{fecha}_gold.parquet"
 
     try:
         df_gold.to_parquet(output_path, index=False)
-        logger.info(f"✨ {symbol}: Parquet GOLD V2 guardado con éxito ({len(df_gold):,} ticks limpios).")
+        logger.info(f"✨ {symbol}: Parquet GOLD guardado exitosamente ({len(df_gold):,} ticks).")
         return True
     except Exception as e:
-        logger.error(f"❌ Error escribiendo Parquet GOLD para {symbol}: {e}")
+        logger.critical(f"❌ Falló la persistencia física del archivo GOLD de {symbol}: {e}")
         return False
 
-
 def compilar_parquet_maestro(symbol: str, fecha: str) -> bool:
-    """
-    Compila el Parquet Maestro para un símbolo y fecha.
-
-    Args:
-        symbol: Símbolo
-        fecha: Fecha en formato YYYYMMDD
-
-    Returns:
-        bool: True si se compiló correctamente
-    """
+    """Compila y normaliza todos los registros crudos del día en el Parquet Maestro."""
     symbol = symbol.upper()
-    safe_dir = ARCHIVE_SAFE_DIR / symbol / fecha
+    safe_dir = SAFE_DIR / symbol / fecha
     ssd_dir = SSD_EVIDENCE_DIR / symbol / fecha
-    historic_compressed_dir = PROCESSED_DATA_DIR / "compressed" / symbol / fecha
 
     sources = []
     if safe_dir.exists():
         sources = sorted(list(safe_dir.glob("*.jsonl.gz")))
-    if not sources and historic_compressed_dir.exists():
-        sources = sorted(list(historic_compressed_dir.glob("*.jsonl.gz")))
     if not sources and ssd_dir.exists():
         sources = sorted(list(ssd_dir.glob("*.jsonl")))
 
     if not sources:
-        logger.warning(f"⚠️ {symbol}: Sin archivos origen para compilar el {fecha}.")
+        logger.warning(f"⚠️ {symbol}: No se localizaron archivos fuente para el {fecha}.")
         return False
 
-    logger.info(f"📂 {symbol}: Leyendo y normalizando {len(sources)} archivos de entrada...")
+    logger.info(f"📂 {symbol}: Compilando {len(sources)} archivos a formato unificado...")
 
     rows = []
     for fp in sources:
@@ -197,21 +165,20 @@ def compilar_parquet_maestro(symbol: str, fecha: str) -> bool:
                     except Exception:
                         pass
         except Exception as e:
-            logger.error(f"Error procesando {fp.name}: {e}")
+            logger.error(f"Fallo leyendo archivo físico de ticks {fp.name}: {e}")
 
     if not rows:
-        logger.warning(f"⚠️ {symbol}: Datos insuficientes para procesar.")
+        logger.warning(f"⚠️ {symbol}: Registros vacíos u omitidos durante la lectura.")
         return False
 
-    # Convertir a DataFrame primario
     df = pd.DataFrame(rows)
     df = df.sort_values(by=["time_msc", "seq"]).reset_index(drop=True)
 
-    # Detección y Marcado de Duplicados de Secuencia
+    # Identificar duplicados físicos de secuencia
     df["duplicate_tick"] = df.duplicated(subset=["seq"], keep=False)
     df["duplicate_group"] = np.where(df["duplicate_tick"], df["seq"], 0)
 
-    # Autocalibración de Latencia de Red
+    # Detección de desfase de reloj local
     median_diff_ms = np.median(df['time_msc'] - df['recv_ts'])
     offset_hours = round(median_diff_ms / 3600000.0)
     offset_ms = offset_hours * 3600000.0
@@ -222,7 +189,7 @@ def compilar_parquet_maestro(symbol: str, fecha: str) -> bool:
     df['clock_sync_issue'] = latency < 0
     df['latency_ms'] = np.where(df['clock_sync_issue'], 0, latency).astype(int)
 
-    # Datos de Tiempo
+    # Unificación de datos temporales
     dt_broker = pd.to_datetime(df['time_msc'], unit='ms', utc=False)
     dt_utc = pd.to_datetime(df['recv_ts'], unit='ms', utc=True)
 
@@ -231,7 +198,7 @@ def compilar_parquet_maestro(symbol: str, fecha: str) -> bool:
     df['weekday'] = dt_utc.dt.weekday
     df['session'] = df['broker_hour'].apply(classify_session)
 
-    # Cálculo Vectorial de Deltas y Velocidades
+    # Cálculo de Deltas
     df['tick_interval_ms'] = df['time_msc'].diff().fillna(0).astype(int)
     df['delta_bid'] = df['bid'].diff().fillna(0.0)
     df['delta_ask'] = df['ask'].diff().fillna(0.0)
@@ -239,7 +206,6 @@ def compilar_parquet_maestro(symbol: str, fecha: str) -> bool:
     df['delta_spread'] = df['spread_pips'].diff().fillna(0.0)
     df['delta2_spread'] = df['delta_spread'].diff().fillna(0.0)
 
-    # Clasificación del Tipo de Actualización de Cotización
     bid_changed = df['delta_bid'] != 0.0
     ask_changed = df['delta_ask'] != 0.0
     df['quote_update_type'] = np.select(
@@ -248,40 +214,36 @@ def compilar_parquet_maestro(symbol: str, fecha: str) -> bool:
         default=0
     ).astype(np.uint8)
 
-    # Asegurar consistencia del esquema Maestro V2
     df = df[MAESTRO_SCHEMA_V2]
 
-    # Guardar Parquet Maestro
-    AUDIT_MAESTROS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = AUDIT_MAESTROS_DIR / f"ticks_maestro_{symbol}_{fecha}.parquet"
+    AUDIT_MAESTROS.mkdir(parents=True, exist_ok=True)
+    output_path = AUDIT_MAESTROS / f"ticks_maestro_{symbol}_{fecha}.parquet"
 
     try:
         df.to_parquet(output_path, index=False)
-        logger.info(f"✅ {symbol}: Parquet Maestro V2 unificado ({len(df):,} ticks) guardado.")
+        logger.info(f"✅ {symbol}: Parquet Maestro unificado guardado ({len(df):,} ticks).")
 
-        # Generar Parquet GOLD V2
+        # Generación del archivo GOLD correspondiente
         generar_parquet_gold(symbol, fecha, df)
         return True
     except Exception as e:
-        logger.critical(f"❌ Error guardando Parquet Maestro para {symbol}: {e}")
+        logger.critical(f"❌ Error al salvar el Parquet Maestro del símbolo {symbol}: {e}")
         return False
 
-
 def main():
-    parser = argparse.ArgumentParser(description="Market ETL - Compilador de Maestros & GOLD V2.1")
+    parser = argparse.ArgumentParser(description="Market ETL - Compilador de Maestros & GOLD")
     parser.add_argument("--date", type=str, default="latest")
     args = parser.parse_args()
 
-    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
-    logger.info(f"🏭 Iniciando Feature Engine Nivel 0 (ETL Maestros V2) para la fecha: {fecha}")
+    fecha = args.date if args.date != "latest" else datetime.now(get_broker_timezone()).strftime("%Y%m%d")
+    logger.info(f"🏭 Iniciando Compilador ETL Maestro de Auditoría - Fecha: {fecha}")
 
     compilados = sum(1 for s in SYMBOLS_TO_AUDIT if compilar_parquet_maestro(s, fecha))
 
     if compilados == 0:
-        logger.warning("⚠️ No se generó ningún archivo maestro.")
+        logger.warning("⚠️ No se pudo compilar ningún archivo de auditoría.")
     else:
-        logger.info(f"🏭 Fin de compilación. {compilados}/{len(SYMBOLS_TO_AUDIT)} contratos de datos estandarizados en V2.")
-
+        logger.info(f"🏭 Proceso ETL concluido. {compilados}/{len(SYMBOLS_TO_AUDIT)} datasets estructurados.")
 
 if __name__ == "__main__":
     main()

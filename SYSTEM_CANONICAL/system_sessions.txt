@@ -49,6 +49,12 @@ def get_current_broker_time() -> datetime:
     """
     return datetime.now(timezone.utc).astimezone(BROKER_TZ)
 
+def get_fecha_broker_str() -> str:
+    """
+    Retorna la fecha actual del bróker en formato YYYYMMDD unificado.
+    """
+    return get_current_broker_time().strftime("%Y%m%d")
+
 def classify_session(hour: int) -> str:
     """
     Clasifica de forma determinista la sesión según la hora militar del broker.
@@ -113,8 +119,11 @@ if __name__ == "__main__":
     print(f"Clasificación de sesión actual:      {session_actual}")
     print(f"Estado del mercado (Filtro bot):     {estado_mercado}\n")
     
+    # Prueba de clasificación de fecha unificada
+    print(f"Fecha broker unificada (str):        {get_fecha_broker_str()}")
+    
     # Prueba de clasificación determinista de horas
-    print("Simulaciones horarias:")
+    print("\nSimulaciones horarias:")
     for h in [3, 9, 15, 20]:
         print(f"   • Hora broker: {h:02d}:00 -> Sesión: {classify_session(h):<10} | Abierto: {is_market_open_at(hora_actual.replace(hour=h))}")
         

@@ -1,44 +1,40 @@
 # -*- coding: utf-8 -*-
 """
 ==========================================================================
-RAM INGESTION AUDITOR - CERTIFICACIÓN FORENSE CON TELEMETRÍA WINDOWS
+AUDIT_ENGINE_02 - RAM_INGESTION_AUDITOR
 ==========================================================================
-Ubicación: AUDIT_ENGINE_02
-Dependencias: audit_config (paths, symbols, logging, contracts)
-Responsabilidad: Auditar el flujo de ingesta desde la RAM, evaluando
-                 la integridad de los procesos de captura y la telemetría
-                 del sistema Windows.
+Ubicación: AUDIT_ENGINE_02/ram_ingestion_auditor.py
+Descripción: Evalúa y audita de manera exhaustiva la calidad de ingesta y
+             el comportamiento del proceso de captura en memoria RAM.
 ==========================================================================
 """
+
 import sys
-from pathlib import Path
-
-# Inyección de ruta raíz
-root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
-
 import json
 import argparse
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
+# Inyección de ruta raíz
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 # Importación desde audit_config
-from audit_config import (
-    AUDIT_FLOW_DIR,
-    AUDIT_STATE_DIR,
-    AUDIT_RECOVERY_DIR,
-    STATE_DIR,
+from AUDIT_ENGINE_02.audit_config import (
+    AUDIT_FLOW,
+    AUDIT_STATE,
+    AUDIT_RECOVERY,
     LOGS_MASTER_DIR,
-    ARCHIVE_QUARANTINE_DIR,
+    QUARANTINE_DIR,
     SYMBOLS_TO_AUDIT,
     get_fecha_broker_str,
     init_audit_logging,
     load_contract_safe
 )
 
-# Importación desde audit_contracts
-from audit_contracts import (
+from AUDIT_ENGINE_02.audit_contracts import (
     create_audit_result_template,
     validate_audit_result,
     CRITICAL_ERRORS,
@@ -47,21 +43,11 @@ from audit_contracts import (
     load_json_safe
 )
 
-# Inicializar logger
 logger = init_audit_logging("ram_ingestion_auditor", "02_AUDIT")
 
-
 def leer_shutdown_ok(symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Lee el archivo de apagado limpio para un símbolo.
-
-    Args:
-        symbol: Símbolo
-
-    Returns:
-        Optional[Dict[str, Any]]: Datos del archivo o None si no existe
-    """
-    ok_file = STATE_DIR / f"{symbol}.shutdown_ok"
+    """Busca y parsea el archivo de confirmación de apagado del colector."""
+    ok_file = AUDIT_STATE / f"{symbol}.shutdown_ok"
     if not ok_file.exists():
         return None
     try:
@@ -75,17 +61,8 @@ def leer_shutdown_ok(symbol: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-
 def analizar_desconexiones_log(symbol: str) -> Dict[str, Any]:
-    """
-    Analiza el log del capturador en busca de desconexiones.
-
-    Args:
-        symbol: Símbolo
-
-    Returns:
-        Dict[str, Any]: Estadísticas de desconexiones
-    """
+    """Escanea la bitácora del capturador buscando desconexiones registradas."""
     log_file = LOGS_MASTER_DIR / "capturers" / f"capturer.{symbol.upper()}.log"
     disconnect_count = 0
     reconnect_count = 0
@@ -107,20 +84,11 @@ def analizar_desconexiones_log(symbol: str) -> Dict[str, Any]:
         "unresolved_disconnects": max(0, disconnect_count - reconnect_count)
     }
 
-
 def auditar_flujo_captura(symbol: str) -> Dict[str, Any]:
-    """
-    Audita el flujo de captura para un símbolo.
-
-    Args:
-        symbol: Símbolo
-
-    Returns:
-        Dict[str, Any]: Resultado de la auditoría
-    """
+    """Evalúa las métricas de captura del colector de ticks."""
     symbol = symbol.upper()
-    state_file = STATE_DIR / f"{symbol}_system_state.json"
-    cache_state_file = STATE_DIR / f"{symbol}_state.json"
+    state_file = AUDIT_STATE / f"{symbol}_system_state.json"
+    cache_state_file = AUDIT_STATE / f"{symbol}_state.json"
 
     state_data = load_json_safe(state_file)
     cache_state = load_json_safe(cache_state_file)
@@ -155,9 +123,8 @@ def auditar_flujo_captura(symbol: str) -> Dict[str, Any]:
         result["confidence"] = 0.0
         result["critical_errors"].append({
             "code": "telemetry_missing",
-            "message": "Falta el archivo de estado de ejecución en disco del capturador."
+            "message": f"Falta el archivo de estado de ejecución en disco para {symbol}."
         })
-        assert validate_audit_result(result)
         return result
 
     state = state_data.get("state", "UNKNOWN").upper()
@@ -191,7 +158,7 @@ def auditar_flujo_captura(symbol: str) -> Dict[str, Any]:
         penalty += 15.0
         result["warnings"].append({
             "code": "high_process_memory_usage",
-            "message": f"Uso de memoria RAM de Windows inusualmente alto ({ram_mb} MB). Posible fuga de recursos."
+            "message": f"Consumo de RAM inusual para colector: {ram_mb} MB."
         })
 
     if conn_info["disconnects"] > 0:
@@ -199,34 +166,34 @@ def auditar_flujo_captura(symbol: str) -> Dict[str, Any]:
         penalty += penalty_disconnect
         result["warnings"].append({
             "code": "mt5_connection_lost",
-            "message": f"Inestabilidad de red: Se registraron {conn_info['disconnects']} desconexiones."
+            "message": f"Inestabilidad de colector: {conn_info['disconnects']} pérdidas de enlace."
         })
 
     if state == "RED":
         penalty += CRITICAL_ERRORS["state_red_alert"]["penalty"]
         result["critical_errors"].append({
             "code": "state_red_alert",
-            "message": "El capturador finalizó en estado crítico (RED)."
+            "message": "Colector finalizó en estado de alerta crítico (RED)."
         })
     elif state == "YELLOW":
         penalty += WARNING_CONDITIONS["state_yellow_warning"]["penalty"]
         result["warnings"].append({
             "code": "state_yellow_warning",
-            "message": "El capturador reportó estado degradado (YELLOW)."
+            "message": "Colector en estado de alerta moderado (YELLOW)."
         })
 
     if loss_rate_pct > 0.5:
         penalty += CRITICAL_ERRORS["loss_rate_exceeded"]["penalty"]
         result["critical_errors"].append({
             "code": "loss_rate_exceeded",
-            "message": f"Pérdida de secuencias por encima del límite: {loss_rate_pct}%"
+            "message": f"Tasa de pérdida por encima del límite permitido: {loss_rate_pct}%"
         })
 
     if not has_shutdown_ok:
         penalty += WARNING_CONDITIONS["no_shutdown_ok"]["penalty"]
         result["warnings"].append({
             "code": "no_shutdown_ok",
-            "message": "Falta la firma física de apagado limpio (.shutdown_ok)."
+            "message": "El capturador carece de firma física de apagado limpio (.shutdown_ok)."
         })
 
     result["confidence"] = max(0.0, 100.0 - penalty)
@@ -235,18 +202,8 @@ def auditar_flujo_captura(symbol: str) -> Dict[str, Any]:
     assert validate_audit_result(result)
     return result
 
-
 def generar_reporte_flujo(fecha: str, symbols: List[str]) -> Dict[str, Any]:
-    """
-    Genera el reporte consolidado de flujo de captura.
-
-    Args:
-        fecha: Fecha en formato YYYYMMDD
-        symbols: Lista de símbolos
-
-    Returns:
-        Dict[str, Any]: Reporte consolidado
-    """
+    """Genera el reporte consolidado de auditoría de flujo e ingesta."""
     resultados = {}
     passed = 0
     warning = 0
@@ -263,184 +220,3 @@ def generar_reporte_flujo(fecha: str, symbols: List[str]) -> Dict[str, Any]:
             passed += 1
         elif status == "WARNING":
             warning += 1
-        else:
-            failed += 1
-
-        if res["confidence"] > 0:
-            total_confidence += res["confidence"]
-            count_valid += 1
-
-    # Cargar telemetría del Daemon
-    daemon_state_file = STATE_DIR / "archive_daemon_state.json"
-    daemon_state = load_json_safe(daemon_state_file)
-    windows_telemetry = daemon_state.get("windows_telemetry", {
-        "ramdisk_health": {"space_free_pct": 100.0, "status": "NOT_USED"},
-        "ntp_drift_ms": 0.0
-    })
-
-    # Quarantine
-    quarantined_files = []
-    if ARCHIVE_QUARANTINE_DIR.exists():
-        for q_file in ARCHIVE_QUARANTINE_DIR.iterdir():
-            if q_file.is_file() and not q_file.name.endswith(".lock"):
-                try:
-                    mtime = datetime.fromtimestamp(q_file.stat().st_mtime, tz=timezone.utc)
-                    if mtime.strftime("%Y%m%d") == fecha:
-                        quarantined_files.append({
-                            "file_name": q_file.name,
-                            "size_kb": round(q_file.stat().st_size / 1024.0, 1),
-                            "quarantined_at": mtime.isoformat()
-                        })
-                except Exception:
-                    pass
-
-    # Recovery events
-    recovery_events = []
-    recovery_dir = LOGS_MASTER_DIR / "recovery"
-    if recovery_dir.exists():
-        for symbol in symbols:
-            json_log = recovery_dir / f"{symbol.upper()}_recovery_audit.json"
-            if json_log.exists():
-                try:
-                    with open(json_log, "r", encoding="utf-8") as f:
-                        for line in f:
-                            if line.strip():
-                                evt = json.loads(line.strip())
-                                formatted_date = f"{fecha[0:4]}-{fecha[4:6]}-{fecha[6:8]}"
-                                if evt.get("timestamp", "").startswith(formatted_date):
-                                    recovery_events.append({
-                                        "symbol": symbol,
-                                        "timestamp": evt.get("timestamp"),
-                                        "selected_seq": evt.get("selected_seq"),
-                                        "selected_source": evt.get("selected_source"),
-                                        "detected_values": evt.get("detected_values")
-                                    })
-                except Exception:
-                    pass
-
-    # Evaluar penalizaciones
-    drift_ms = abs(windows_telemetry.get("ntp_drift_ms", 0.0))
-    ramdisk_status = windows_telemetry.get("ramdisk_health", {}).get("status", "OK")
-
-    global_warnings = []
-    global_penalty = 0.0
-
-    if drift_ms > 50.0:
-        global_warnings.append({
-            "code": "clock_drift_exceeded",
-            "message": f"Deriva crítica del reloj de Windows: Desfase de {drift_ms} ms detectado contra pool.ntp.org."
-        })
-        global_penalty += 10.0
-
-    if ramdisk_status in ["WARNING", "CRITICAL"]:
-        global_warnings.append({
-            "code": "ramdisk_space_warning",
-            "message": f"Espacio en Ramdisk M:\\ bajo. Estatus de capacidad: {ramdisk_status}."
-        })
-        global_penalty += 15.0
-
-    if quarantined_files:
-        global_warnings.append({
-            "code": "files_in_quarantine",
-            "message": f"Se aislaron {len(quarantined_files)} archivos corruptos en la carpeta de CUARENTENA debido a inconsistencia criptográfica."
-        })
-        global_penalty += 20.0
-
-    avg_confidence = round(total_confidence / count_valid, 2) if count_valid > 0 else 0.0
-    avg_confidence = max(0.0, avg_confidence - global_penalty)
-
-    # Integración con Recovery Forensics
-    recovery_summary = {}
-    recovery_dir = AUDIT_RECOVERY_DIR
-
-    if recovery_dir.exists():
-        for symbol in symbols:
-            recovery_files = sorted(
-                recovery_dir.glob(f"recovery_{symbol.upper()}_*.json"),
-                key=lambda f: f.stat().st_mtime,
-                reverse=True
-            )
-
-            if recovery_files:
-                recovery_data = load_json_safe(recovery_files[0])
-                if recovery_data:
-                    seq_issues = (
-                        recovery_data.get("duplicates_found", 0) > 0 or
-                        recovery_data.get("regressions_found", 0) > 0 or
-                        recovery_data.get("seq_jumps_found", 0) > 0 or
-                        recovery_data.get("reset_from_zero_found", False)
-                    )
-
-                    recovery_summary[symbol] = {
-                        "status": recovery_data.get("overall_status"),
-                        "state_consistent": recovery_data.get("state_match", False),
-                        "state_reset_detected": recovery_data.get("state_reset_detected", False),
-                        "seq_integrity": "FAIL" if seq_issues else "PASS",
-                        "largest_gap_seconds": recovery_data.get("max_gap_seconds", 0),
-                        "capture_gaps": len(recovery_data.get("capture_gaps", [])),
-                        "files_analyzed": recovery_data.get("files_analyzed", 0),
-                        "duplicates": recovery_data.get("duplicates_found", 0),
-                        "regressions": recovery_data.get("regressions_found", 0),
-                        "seq_jumps": recovery_data.get("seq_jumps_found", 0),
-                        "reset_from_zero": recovery_data.get("reset_from_zero_found", False)
-                    }
-
-    reporte_flujo = {
-        "fecha": fecha,
-        "timestamp_generacion": datetime.now(timezone.utc).isoformat(),
-        "resumen": {
-            "total_symbols": len(symbols),
-            "passed": passed,
-            "warning": warning,
-            "failed": failed,
-            "avg_confidence": avg_confidence
-        },
-        "windows_environment": {
-            "telemetry": windows_telemetry,
-            "quarantine": {
-                "count": len(quarantined_files),
-                "items": quarantined_files
-            },
-            "recovery_incidents": {
-                "count": len(recovery_events),
-                "items": recovery_events
-            },
-            "warnings": global_warnings
-        },
-        "recovery_integration": {
-            "enabled": True,
-            "source": "recovery_forensics",
-            "symbols": recovery_summary
-        },
-        "resultados": resultados
-    }
-
-    return reporte_flujo
-
-
-def main():
-    parser = argparse.ArgumentParser(description="RAM Ingestion Auditor")
-    parser.add_argument("--date", type=str, default="latest")
-    args = parser.parse_args()
-
-    fecha = resolve_target_date(args.date, AUDIT_STATE_DIR, get_fecha_broker_str)
-    logger.info(f"📊 AUDITORÍA DE INGESTA Y PROCESOS DE FLUJO (RAM) - FECHA: {fecha}")
-
-    # Guardar auditoría individual por símbolo
-    for symbol in SYMBOLS_TO_AUDIT:
-        res = auditar_flujo_captura(symbol)
-        output_path = AUDIT_FLOW_DIR / f"flow_{symbol.upper()}_latest.json"
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(res, f, indent=2, ensure_ascii=False)
-
-    # Generar reporte consolidado
-    reporte_flujo = generar_reporte_flujo(fecha, SYMBOLS_TO_AUDIT)
-    output_reporte_path = AUDIT_FLOW_DIR / f"flow_report_{fecha}.json"
-    with open(output_reporte_path, 'w', encoding='utf-8') as f:
-        json.dump(reporte_flujo, f, indent=2, ensure_ascii=False)
-
-    logger.info(f"💾 Flujos de RAM e Ingesta certificados. Guardados en: {output_reporte_path.name}")
-
-
-if __name__ == "__main__":
-    main()

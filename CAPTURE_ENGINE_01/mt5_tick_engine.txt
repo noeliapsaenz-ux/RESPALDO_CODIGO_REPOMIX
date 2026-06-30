@@ -129,7 +129,7 @@ class TickCapturerV2:
         except ValueError:
             pass
             
-        self.logger.info(f"=== INICIANDO CAPTURADOR V2 (PURE MODE) PARA {self.symbol} ===")
+        self.logger.info(f"=== INICIANDO CAPTURADOR (PURE MODE) PARA {self.symbol} ===")
         
         self.wrapper = MT5Wrapper(self.symbol)
         self.wrapper.set_connection(get_mt5_connection())

@@ -1,60 +1,56 @@
 # -*- coding: utf-8 -*-
 """
 ==========================================================================
-FCI EVIDENCE CALCULATOR - PERITO FORENSE DE CONECTIVIDAD
+AUDIT_ENGINE_02 - FCI_EVIDENCE_CALCULATOR
 ==========================================================================
-Ubicación: AUDIT_ENGINE_02
-Dependencias: audit_config (paths, symbols, logging, timezone)
-Responsabilidad: Comparar y reconciliar los datos físicos del SSD/SAFE,
-                 analizando brechas basándose en marcas de tiempo absolutas
-                 del bróker (tm) para detectar cortes de red (H-10).
+Ubicación: AUDIT_ENGINE_02/fci_evidence_calculator.py
+Descripción: Compara los datos físicos recopilados, detecta brechas
+             temporales y calcula el Feed Confidence Index (FCI) 
+             del flujo determinista.
 ==========================================================================
 """
+
 import sys
-from pathlib import Path
-
-# Inyección de ruta raíz
-root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
-
-import json
 import re
 import gzip
+import json
 import argparse
+from pathlib import Path
 from datetime import datetime, timezone
 
-# Importación desde audit_config
-from audit_config import (
+# Inyección de ruta raíz
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+# Importaciones desde audit_config
+from AUDIT_ENGINE_02.audit_config import (
     SSD_EVIDENCE_DIR,
-    ARCHIVE_SAFE_DIR,
-    AUDIT_REPORTES_DIR,
+    SAFE_DIR,
+    AUDIT_REPORTS,
+    AUDIT_STATE,
     SYMBOLS_TO_AUDIT,
     BROKER_TZ,
     init_audit_logging,
     save_contract_atomic
 )
 
-# Inicializar logger
 logger = init_audit_logging("fci_evidence_calculator", "02_AUDIT")
 
-# Constantes
 STALL_THRESHOLD_MS = 5000
 SESSION_START_UTC_H = 6
 SESSION_END_UTC_H = 22
 
-
 def is_in_session(tm_ms: int) -> bool:
-    """Verifica si un timestamp está dentro de la sesión de mercado."""
+    """Evalúa si el tick ocurrió dentro del horario activo (Filtro Forex standard)."""
     try:
         hour = datetime.fromtimestamp(tm_ms / 1000, tz=timezone.utc).hour
         return SESSION_START_UTC_H <= hour < SESSION_END_UTC_H
     except Exception:
         return False
 
-
 def normalize_to_ms(val) -> float:
-    """Normaliza un timestamp a milisegundos."""
+    """Normaliza marcas de tiempo de diversas resoluciones a milisegundos."""
     if val is None:
         return 0.0
     try:
@@ -68,29 +64,11 @@ def normalize_to_ms(val) -> float:
     except (ValueError, TypeError):
         return 0.0
 
-
 def calculate_fci(ticks: int, missing_files: int, seq_loss_rate: float,
                   seq_duplicates: int, seq_inversions: int, seq_resets: int,
                   negative_gaps: int, bid_ask_inversions: int, stale_ticks_pct: float,
                   infrastructure_silence_count: int) -> float:
-    """
-    Calcula el Feed Confidence Index (FCI) penalizando caídas de conectividad.
-
-    Args:
-        ticks: Total de ticks procesados
-        missing_files: Número de archivos faltantes estimados
-        seq_loss_rate: Tasa de pérdida de secuencias
-        seq_duplicates: Número de duplicados de secuencia
-        seq_inversions: Número de inversiones de secuencia
-        seq_resets: Número de reseteos de secuencia
-        negative_gaps: Número de gaps negativos en timestamps
-        bid_ask_inversions: Número de inversiones bid-ask
-        stale_ticks_pct: Porcentaje de ticks congelados
-        infrastructure_silence_count: Número de silencios de infraestructura
-
-    Returns:
-        float: FCI calculado (0-100)
-    """
+    """Algoritmo determinista de asignación de puntuación FCI por estabilidad de feed."""
     if ticks == 0:
         return 0.0
 
@@ -98,27 +76,16 @@ def calculate_fci(ticks: int, missing_files: int, seq_loss_rate: float,
     base_seq = 100.0 * (1.0 - seq_loss_rate)
     s_seq = max(0.0, min(100.0, base_seq - min(15.0, seq_duplicates * 0.01) - (seq_inversions * 5.0) - (seq_resets * 10.0)))
 
-    # H-10: Penalización drástica por cortes de conectividad local
+    # H-10: Penalización severa ante pérdidas o caídas de red local (silencios extendidos)
     s_temporal = max(0.0, 100.0 - (infrastructure_silence_count * 10.0) - (negative_gaps * 5.0))
     s_quality = max(0.0, 100.0 - (bid_ask_inversions * 1.0) - (max(0.0, stale_ticks_pct - 80.0) * 2.0))
 
     return round(max(0.0, min(100.0, (s_continuity * 0.40) + (s_seq * 0.30) + (s_temporal * 0.20) + (s_quality * 0.10))), 2)
 
-
 def find_reconciliation_files(symbol: str, date_str: str) -> list:
-    """
-    Encuentra archivos de reconciliación para un símbolo y fecha.
-
-    Args:
-        symbol: Símbolo a buscar
-        date_str: Fecha en formato YYYYMMDD
-
-    Returns:
-        list: Lista de archivos encontrados
-    """
+    """Encuentra y valida los archivos fuente físicos del día."""
     raw_paths = []
 
-    # Buscar en SSD_EVIDENCE
     if SSD_EVIDENCE_DIR.exists():
         for sym_dir in SSD_EVIDENCE_DIR.iterdir():
             if sym_dir.is_dir() and sym_dir.name.lower() == symbol.lower():
@@ -126,9 +93,8 @@ def find_reconciliation_files(symbol: str, date_str: str) -> list:
                 if date_dir.exists():
                     raw_paths.extend(date_dir.glob("*.jsonl"))
 
-    # Buscar en ARCHIVE_SAFE
-    if ARCHIVE_SAFE_DIR.exists():
-        all_safe_files = list(ARCHIVE_SAFE_DIR.rglob("*"))
+    if SAFE_DIR.exists():
+        all_safe_files = list(SAFE_DIR.rglob("*"))
         for p in all_safe_files:
             if not p.is_file():
                 continue
@@ -150,7 +116,6 @@ def find_reconciliation_files(symbol: str, date_str: str) -> list:
                 if date_str in p.name:
                     raw_paths.append(p)
 
-    # Deduplicación
     dedup_dict = {}
     for p in raw_paths:
         base_name = p.name.replace(".gz", "").replace(".jsonl", "")
@@ -159,21 +124,17 @@ def find_reconciliation_files(symbol: str, date_str: str) -> list:
 
     return sorted(list(dedup_dict.values()), key=lambda x: x.name)
 
-
 def analyze_evidence(date_str: str, symbols: list):
+    """Procesa secuencialmente los datos físicos del día calculando las métricas
+    operativas detalladas de conectividad e integridad para cada par.
     """
-    Analiza la evidencia de conectividad para una fecha y lista de símbolos.
-
-    Args:
-        date_str: Fecha en formato YYYYMMDD
-        symbols: Lista de símbolos a analizar
-    """
-    logger.info(f"🔍 Reconciliación Forense de conectividad (Fase 0) - Fecha: {date_str}")
+    logger.info(f"🔍 Iniciando Reconciliación Forense de Colectores - Fecha: {date_str}")
     integrity_summary = []
 
     for symbol in symbols:
         all_files = find_reconciliation_files(symbol, date_str)
         if not all_files:
+            logger.info(f"⚠️ {symbol:7} | Sin datos detectados para la fecha.")
             continue
 
         ticks_processed = 0
@@ -245,14 +206,13 @@ def analyze_evidence(date_str: str, symbols: list):
                             gap = tm - prev_tm
                             if gap < 0:
                                 negative_ts_gaps += 1
-                            # H-10: Detección de silencio por desconexión local
-                            elif gap >= 300000:
+                            elif gap >= 300000:  # 5 Minutos de silencio absoluto
                                 if is_in_session(tm):
                                     infrastructure_silence_count += 1
-                                    logger.critical(f"⚠️ {symbol}: Silencio absoluto de {gap/1000:.1f}s detectado en sesión activa. Caída de red probable.")
+                                    logger.warning(f"⚠️ {symbol}: Silencio inusual de {gap/1000:.1f}s detectado en horario activo.")
                         prev_tm = tm
             except Exception as e:
-                logger.error(f"Error procesando {filepath.name}: {e}")
+                logger.error(f"Fallo de lectura procesando {filepath.name}: {e}")
 
         if ticks_processed == 0:
             continue
@@ -273,7 +233,7 @@ def analyze_evidence(date_str: str, symbols: list):
             infrastructure_silence_count=infrastructure_silence_count
         )
 
-        logger.info(f"📊 {symbol:7} | Ticks: {ticks_processed:9,} | Gaps Conectividad: {infrastructure_silence_count} | FCI: {fci_score}%")
+        logger.info(f"📊 {symbol:7} | Ticks: {ticks_processed:9,} | Silencios: {infrastructure_silence_count} | FCI: {fci_score}%")
 
         integrity_summary.append({
             "symbol": symbol,
@@ -291,15 +251,18 @@ def analyze_evidence(date_str: str, symbols: list):
             }
         })
 
-    AUDIT_REPORTES_DIR.mkdir(parents=True, exist_ok=True)
-    report_file = AUDIT_REPORTES_DIR / f"capture_audit_report_{date_str}.json"
+    AUDIT_REPORTS.mkdir(parents=True, exist_ok=True)
+    report_file = AUDIT_REPORTS / f"capture_audit_report_{date_str}.json"
 
     save_contract_atomic({
-        "metadata": {"date": date_str, "generated_at": datetime.now(timezone.utc).isoformat(), "schema_version": "2.0"},
+        "metadata": {
+            "date": date_str,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "schema_version": "2.0"
+        },
         "integrity_summary": integrity_summary
     }, report_file)
-    logger.info(f"✅ Reporte consolidado guardado en: {report_file.name}")
-
+    logger.info(f"✅ Reporte de estabilidad del feed guardado: {report_file.name}")
 
 def main():
     parser = argparse.ArgumentParser(description="FCI Evidence Calculator")
@@ -307,7 +270,6 @@ def main():
     args = parser.parse_args()
     fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
     analyze_evidence(fecha, SYMBOLS_TO_AUDIT)
-
 
 if __name__ == "__main__":
     main()

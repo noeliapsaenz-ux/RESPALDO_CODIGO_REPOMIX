@@ -81,6 +81,7 @@ class SystemState(str, Enum):
     ORANGE = "ORANGE"
     RED = "RED"
 
+
 # ==========================================================================
 # MAPPING CANÓNICO DE ESQUEMA DE TICKS (Optimización de espacio HFT)
 # ==========================================================================
@@ -99,4 +100,42 @@ TICK_SCHEMA_MAPPING = {
     "seq": "sequence",          # ID correlativo único de secuencia
     "recv_ts": "received_ts",   # Timestamp local de recepción (milisegundos)
     "sf": "spread_filter_flag"  # Bandera booleana de spread excedido (opcional)
+}
+
+
+# ==========================================================================
+# UMBRALES DE VETO, AUDITORÍA Y CONTROL DE RIESGOS (F2-F3)
+# ==========================================================================
+VETO_FCI_THRESHOLD = 70.0          # Por debajo de este FCI, el símbolo es NO_CONFIABLE
+VETO_QUALITY_THRESHOLD = 50.0      # Calidad mínima vectorial admitida para GOLD
+
+# Pesos de Confianza Consolidada para Auditoría y Análisis
+CONFIDENCE_WEIGHTS = {
+    "fci": 0.60,
+    "profile": 0.40,
+    "lineage": 0.30,
+    "flow": 0.15,
+    "audit": 0.30,
+    "metrics": 0.35,
+    "overall": 0.20
+}
+
+# Umbrales de Auditoría Forense y Tolerancia Sistémica
+AUDIT_THRESHOLDS = {
+    "max_loss_rate_pct": 0.5,          # Tasa máxima de pérdida de secuencias (0.5%)
+    "max_seq_gap": 10,                 # Gap máximo tolerado sin cuarentena
+    "max_heartbeat_age_sec": 120,      # Tiempo máximo sin ticks en horario activo
+    "min_gold_percentage": 5.0,
+    "max_gold_percentage": 100.0,
+    "completitud_minima": 70.0,
+    "fci_minima": 70.0,
+    "confidence_minima": 40.0
+}
+
+# Umbrales para clasificación estadística de regímenes de volatilidad
+VOLATILITY_THRESHOLDS = {
+    "QUIET": 0.7,
+    "NORMAL": 1.3,
+    "ACTIVE": 2.0,
+    "EXPLOSIVE": 3.0
 }

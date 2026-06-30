@@ -53,6 +53,9 @@ load_env_file(ENV_FILE_PATH)
 # 1. Modo operativo (Por defecto en SHADOW por razones de seguridad de cuenta)
 OPERATIONAL_MODE: str = os.getenv("OPERATIONAL_MODE", "SHADOW").upper()
 
+# Comportamiento de infraestructura para la purga de evidencias temporales
+DELETE_SSD_ON_PASS: bool = os.getenv("DELETE_SSD_ON_PASS", "True").upper() == "TRUE"
+
 # 2. Credenciales del Broker MT5
 MT5_LOGIN: int = int(os.getenv("MT5_LOGIN", "0"))
 MT5_PASSWORD: str = os.getenv("MT5_PASSWORD", "")
@@ -95,6 +98,7 @@ def validate_settings() -> bool:
         
     print(f"\n[SYSTEM_SETTINGS] ✅ Configuración cargada correctamente.")
     print(f"                  Modo de Operación: {OPERATIONAL_MODE}")
+    print(f"                  Purga SSD en éxito: {DELETE_SSD_ON_PASS}")
     return True
 
 

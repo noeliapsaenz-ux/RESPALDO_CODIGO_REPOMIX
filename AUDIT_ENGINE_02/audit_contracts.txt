@@ -1,37 +1,40 @@
 """
 ==========================================================================
-AUDIT CONTRACTS V3.0 - PUENTE DE CONTRATOS CANÓNICOS (FASE 0)
+AUDIT_ENGINE_02 - AUDIT_CONTRACTS
 ==========================================================================
-Ubicación: AUDIT_ENGINE_02
-Dependencias: audit_config (system_canonical, contract_manager)
-Responsabilidad: Proveer utilidades para la construcción estricta de
-                 certificados de auditoría alineados al SYSTEM_CANONICAL.
-REGLA: Ningún módulo debe crear diccionarios de resultado manualmente.
-       Todo debe pasar por create_canonical_audit_certificate().
+Ubicación: AUDIT_ENGINE_02/audit_contracts.py
+Descripción: Adaptador y manejador de contratos canónicos para auditoría.
+             Construye certificados inmutables y consistentes según la 
+             v2.0 del esquema unificado de SYSTEM_CONTRACTS.
 ==========================================================================
 """
+
+import sys
 import json
 import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
-# Importación desde audit_config (que reexporta system_canonical y contract_manager)
-from audit_config import (
+# Inyección de ruta raíz
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+# Importaciones desde audit_config
+from AUDIT_ENGINE_02.audit_config import (
     SymbolCaptureStatus,
     DataIntegrity,
-    AuditSeverityLevel,
     ContractType,
     MetadataEnvelope,
     validate_canonical_enum,
     SCHEMA_VERSION_AUDIT,
     PRODUCER_AUDIT,
-    NumpySafeEncoder,
     load_contract_safe,
     save_contract_atomic
 )
 
-# Constantes legacy mantenidas solo para compatibilidad interna de cálculos
+# Constantes de penalización para cálculo interno de estabilidad
 CRITICAL_ERRORS = {
     "state_red_alert": {"message": "Estado crítico detectado en post-cierre", "penalty": 30.0},
     "loss_rate_exceeded": {"message": "Tasa de pérdida física superior al límite", "penalty": 20.0},
@@ -47,25 +50,16 @@ WARNING_CONDITIONS = {
     "no_shutdown_ok": {"message": "Falta la firma de apagado limpio en el SSD", "penalty": 5.0}
 }
 
-# Alias para compatibilidad con módulos existentes
-AUDIT_VERSION = SCHEMA_VERSION_AUDIT
-
-
 def load_json_safe(filepath: Path) -> Dict[str, Any]:
-    """Carga controlada de JSON previniendo excepciones."""
-    if not filepath.exists():
-        return {}
-    try:
-        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
+    """Carga un JSON de forma segura previniendo corrupciones físicas en disco."""
+    return load_contract_safe(filepath)
 
 def calculate_file_hash(filepath: Path) -> str:
-    """Calcula hash SHA-256 inmutable de un archivo físico."""
+    """Calcula el hash SHA-256 inmutable de un archivo físico para linaje."""
     sha = hashlib.sha256()
     try:
+        if not filepath.exists():
+            return ""
         with open(filepath, "rb") as f:
             while chunk := f.read(65536):
                 sha.update(chunk)
@@ -73,9 +67,8 @@ def calculate_file_hash(filepath: Path) -> str:
     except Exception:
         return ""
 
-
 def resolve_target_date(date_arg: str, state_dir: Path, fallback_func) -> str:
-    """Resuelve la fecha objetivo unificada."""
+    """Resuelve dinámicamente la fecha objetivo de análisis."""
     if date_arg == "latest":
         sync_file = state_dir / "last_audited_date.txt"
         if sync_file.exists():
@@ -86,7 +79,6 @@ def resolve_target_date(date_arg: str, state_dir: Path, fallback_func) -> str:
         return fallback_func()
     return date_arg
 
-
 def create_canonical_audit_certificate(
     symbol: str,
     fci_score: float,
@@ -95,15 +87,11 @@ def create_canonical_audit_certificate(
     anomaly_list: Optional[List[Dict]] = None,
     metadata_extra: Optional[Dict] = None
 ) -> Dict[str, Any]:
-    """
-    Construye el CERTIFICADO CANÓNICO por símbolo según SYSTEM_CANONICAL.
-    Reemplaza definitivamente a create_audit_result_template().
-    """
-    # Validaciones estrictas contra la Ontología
+    """Construye el certificado canónico estructurado y alineado con la Ontología."""
     if not validate_canonical_enum(data_integrity, DataIntegrity):
-        raise ValueError(f"data_integrity inválido: {data_integrity}")
+        raise ValueError(f"Atributo data_integrity canónico inválido: {data_integrity}")
     if not validate_canonical_enum(capture_status, SymbolCaptureStatus):
-        raise ValueError(f"symbol_capture_status inválido: {capture_status}")
+        raise ValueError(f"Atributo symbol_capture_status canónico inválido: {capture_status}")
 
     envelope = MetadataEnvelope(
         schema_version=SCHEMA_VERSION_AUDIT,
@@ -123,9 +111,8 @@ def create_canonical_audit_certificate(
     }
     return certificate
 
-
 def validate_audit_certificate(cert: Dict[str, Any]) -> bool:
-    """Valida que un certificado cumpla con el esquema canónico V3."""
+    """Valida la integridad de un certificado de auditoría contra el esquema v2.0."""
     required = {
         "schema_version", "contract_type", "producer_identity",
         "timestamp_emission", "symbol", "fci_score",
@@ -135,19 +122,16 @@ def validate_audit_certificate(cert: Dict[str, Any]) -> bool:
         return False
     if cert.get("contract_type") != ContractType.AUDIT_CERTIFICATE.value:
         return False
+    if cert.get("schema_version") != SCHEMA_VERSION_AUDIT:
+        return False
     if not validate_canonical_enum(cert.get("data_integrity", ""), DataIntegrity):
         return False
     if not validate_canonical_enum(cert.get("symbol_capture_status", ""), SymbolCaptureStatus):
         return False
     return True
 
-
-# Funciones legacy para compatibilidad con módulos existentes
 def create_audit_result_template(symbol: str, stage: str = "audit") -> Dict[str, Any]:
-    """
-    Template legacy para compatibilidad con módulos que aún no migran a certificados canónicos.
-    Se recomienda migrar a create_canonical_audit_certificate().
-    """
+    """Estructura de resultado de auditoría para preservación de compatibilidad."""
     return {
         "symbol": symbol.upper(),
         "stage": stage,
@@ -159,12 +143,27 @@ def create_audit_result_template(symbol: str, stage: str = "audit") -> Dict[str,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
-
 def validate_audit_result(result: Dict[str, Any]) -> bool:
-    """Valida un resultado de auditoría legacy."""
+    """Valida estructuralmente una plantilla legacy de auditoría."""
     required = {"symbol", "stage", "status", "confidence"}
     if not required.issubset(result.keys()):
         return False
-    if result.get("confidence", 0) < 0 or result.get("confidence", 0) > 100:
+    if result.get("confidence", 0.0) < 0.0 or result.get("confidence", 0.0) > 100.0:
         return False
     return True
+
+if __name__ == "__main__":
+    print("=" * 80)
+    print("AUDIT_ENGINE_02 - VERIFICACIÓN DE AUDIT_CONTRACTS")
+    print("=" * 80)
+    dummy_cert = create_canonical_audit_certificate(
+        symbol="EURUSD",
+        fci_score=98.5,
+        data_integrity=DataIntegrity.INTEGRO.value,
+        capture_status=SymbolCaptureStatus.CONFIABLE.value,
+        anomaly_list=[]
+    )
+    is_valid = validate_audit_certificate(dummy_cert)
+    print(f"Certificado dummy generado de forma correcta: {is_valid}")
+    print(json.dumps(dummy_cert, indent=2))
+    print("=" * 80)

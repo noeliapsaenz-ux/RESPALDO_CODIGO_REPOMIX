@@ -1,77 +1,55 @@
+# -*- coding: utf-8 -*-
 """
 ==========================================================================
-HISTORICAL PERSISTENCE - BITÁCORA HISTÓRICA DE AUDITORÍA
+AUDIT_ENGINE_02 - HISTORICAL_PERSISTENCE
 ==========================================================================
-Ubicación: AUDIT_ENGINE_02
-Dependencias: audit_config (paths, symbols, logging, contracts)
-Responsabilidad: Mantener la bitácora histórica y de eventos de auditoría,
-                 garantizando la idempotencia matemática ante re-ejecuciones.
+Ubicación: AUDIT_ENGINE_02/historical_persistence.py
+Descripción: Registra y consolida la bitácora histórica diaria de los
+             resultados de auditoría de forma consistente e idempotente.
 ==========================================================================
 """
+
 import sys
-from pathlib import Path
-
-# Inyección de ruta raíz
-root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
-
 import json
 import hashlib
 import argparse
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 import pandas as pd
 
+# Inyección de ruta raíz
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 # Importación desde audit_config
-from audit_config import (
-    AUDIT_REPORTES_DIR,
-    AUDIT_STATE_DIR,
-    AUDIT_LINEAGE_DIR,
+from AUDIT_ENGINE_02.audit_config import (
+    AUDIT_REPORTS,
+    AUDIT_STATE,
+    AUDIT_LINEAGE,
     SYMBOLS_TO_AUDIT,
     get_fecha_broker_str,
-    PROCESSED_DATA_DIR,
     init_audit_logging,
     load_contract_safe,
     save_contract_atomic
 )
 
-# Importación desde audit_contracts
-from audit_contracts import (
-    load_json_safe,
-    resolve_target_date,
-    AUDIT_VERSION
-)
+from AUDIT_ENGINE_02.audit_contracts import resolve_target_date
 
-# Inicialización del Logger
 logger = init_audit_logging("historical_persistence", "02_AUDIT")
 
-
 def generate_sha256(raw_str: str) -> str:
-    """Genera un hash SHA-256 de una cadena."""
+    """Genera una firma determinista para asegurar la idempotencia del registro."""
     return hashlib.sha256(raw_str.encode('utf-8')).hexdigest()
-
 
 def extract_events_for_symbol(symbol: str, fecha: str, capture_item: Optional[Dict],
                              lineage_item: Optional[Dict], consolidated_item: Optional[Dict]) -> List[Dict[str, Any]]:
-    """
-    Extrae eventos de auditoría para un símbolo.
-
-    Args:
-        symbol: Símbolo
-        fecha: Fecha en formato YYYYMMDD
-        capture_item: Datos de captura
-        lineage_item: Datos de lineage
-        consolidated_item: Datos consolidados
-
-    Returns:
-        List[Dict[str, Any]]: Lista de eventos
-    """
+    """Extrae eventos específicos del feed dignos de ser catalogados en el historial."""
     events = []
     timestamp_str = datetime.now(timezone.utc).isoformat()
 
     def _create_event(event_name: str, value: Any = 1) -> Dict[str, Any]:
-        # ID determinista basado en fecha y datos estables
         raw_key = f"{fecha}|{symbol.upper()}|{event_name}|{value}"
         return {
             "event_id": generate_sha256(raw_key),
@@ -83,17 +61,18 @@ def extract_events_for_symbol(symbol: str, fecha: str, capture_item: Optional[Di
         }
 
     if capture_item:
-        missing_files = capture_item.get("missing_files_estimated", 0)
+        metrics = capture_item.get("integrity_metrics", {})
+        missing_files = metrics.get("missing_files_estimated", 0)
         if missing_files > 0:
             events.append(_create_event("missing_files", missing_files))
 
-        neg_gaps = capture_item.get("negative_timestamp_gaps", 0)
+        neg_gaps = metrics.get("negative_timestamp_gaps", 0)
         if neg_gaps > 0:
             events.append(_create_event("negative_timestamps", neg_gaps))
 
-        stale_ticks = capture_item.get("stale_ticks_count", 0)
-        if stale_ticks > 5000:
-            events.append(_create_event("stale_ticks_burst", stale_ticks))
+        stale_pct = metrics.get("stale_ticks_pct", 0.0)
+        if stale_pct > 80.0:
+            events.append(_create_event("stale_ticks_burst", int(stale_pct)))
 
     if lineage_item:
         stages_meta = lineage_item.get("metadata", {}).get("stages", {})
@@ -106,31 +85,25 @@ def extract_events_for_symbol(symbol: str, fecha: str, capture_item: Optional[Di
 
     return events
 
-
 def find_capture_report(fecha: str) -> Path:
-    """Localiza el reporte de captura física en las rutas posibles."""
+    """Intenta ubicar el reporte de captura del colector en las rutas físicas."""
     posibles_rutas = [
-        AUDIT_REPORTES_DIR / f"capture_audit_report_{fecha}.json",
-        PROCESSED_DATA_DIR / f"capture_audit_report_{fecha}.json",
-        AUDIT_STATE_DIR / f"capture_audit_report_{fecha}.json"
+        AUDIT_REPORTS / f"capture_audit_report_{fecha}.json",
+        AUDIT_STATE / f"capture_audit_report_{fecha}.json"
     ]
     for r in posibles_rutas:
         if r.exists():
             return r
     return posibles_rutas[0]
 
-
 def update_history(fecha: str):
-    """
-    Actualiza el historial de auditoría para una fecha.
-
-    Args:
-        fecha: Fecha en formato YYYYMMDD
+    """Consolida todos los insumos de auditoría del día y los vuelca estructuradamente
+    dentro de la base parquet acumulativa de auditoría y la bitácora de eventos.
     """
     capture_report_path = find_capture_report(fecha)
-    profile_report_path = AUDIT_REPORTES_DIR / f"market_profile_report_{fecha}.json"
-    lineage_report_path = AUDIT_LINEAGE_DIR / f"lineage_report_{fecha}.json"
-    consolidated_report_path = AUDIT_REPORTES_DIR / f"audit_report_{fecha}.json"
+    profile_report_path = AUDIT_REPORTS / f"market_profile_report_{fecha}.json"
+    lineage_report_path = AUDIT_LINEAGE / f"lineage_report_{fecha}.json"
+    consolidated_report_path = AUDIT_REPORTS / f"audit_report_{fecha}.json"
 
     capture_report = load_contract_safe(capture_report_path)
     profile_report = load_contract_safe(profile_report_path)
@@ -182,7 +155,7 @@ def update_history(fecha: str):
         events_rows.extend(extract_events_for_symbol(sym_upper, fecha, c_item, l_item, con_item))
 
     df_new = pd.DataFrame(history_rows)
-    history_file_path = AUDIT_STATE_DIR / "confidence_history.parquet"
+    history_file_path = AUDIT_STATE / "confidence_history.parquet"
 
     if history_file_path.exists():
         try:
@@ -197,8 +170,8 @@ def update_history(fecha: str):
     df_combined = df_combined.sort_values(by=["symbol", "fecha"]).reset_index(drop=True)
     df_combined.to_parquet(history_file_path, index=False)
 
-    # Escritura idempotente de eventos
-    events_file_path = AUDIT_STATE_DIR / "audit_events.jsonl"
+    # Registro de eventos en formato JSONL seguro
+    events_file_path = AUDIT_STATE / "audit_events.jsonl"
     existing_event_ids = set()
     if events_file_path.exists():
         try:
@@ -214,21 +187,19 @@ def update_history(fecha: str):
             for event in events_rows:
                 if event["event_id"] not in existing_event_ids:
                     ef.write(json.dumps(event) + "\n")
-    except OSError:
-        pass
-
+    except OSError as e:
+        logger.error(f"Error persistiendo eventos en disco: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Historical Persistence")
     parser.add_argument("--date", type=str, default="latest")
     args = parser.parse_args()
 
-    fecha = resolve_target_date(args.date, AUDIT_STATE_DIR, get_fecha_broker_str)
+    fecha = resolve_target_date(args.date, AUDIT_STATE, get_fecha_broker_str)
 
-    logger.info(f"📊 PERSISTENCIA HISTÓRICA DE AUDITORÍA - FECHA: {fecha}")
+    logger.info(f"📊 CONSOLIDANDO PERSISTENCIA DE AUDITORÍA HISTÓRICA - FECHA: {fecha}")
     update_history(fecha)
-    logger.info(f"✅ Historial actualizado para fecha: {fecha}")
-
+    logger.info(f"✅ Historial y bitácoras para {fecha} actualizados con éxito.")
 
 if __name__ == "__main__":
     main()
