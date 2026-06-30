@@ -74,7 +74,12 @@ class ContractType(str, Enum):
     EXECUTION = "decision_contract"
     LEARNING = "learning_contract"
     
-    # Agregar este bloque al final de SYSTEM_CANONICAL/system_states.py
+class SystemState(str, Enum):
+    """Estado técnico operativo de presión en la adquisición de datos."""
+    GREEN = "GREEN"
+    YELLOW = "YELLOW"
+    ORANGE = "ORANGE"
+    RED = "RED"
 
 # ==========================================================================
 # MAPPING CANÓNICO DE ESQUEMA DE TICKS (Optimización de espacio HFT)

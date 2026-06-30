@@ -1,37 +1,48 @@
 """
 ==========================================================================
-MT5_TICK_ENGINE - Capturador de ticks de alta frecuencia
+MT5_TICK_ENGINE - Capturador de ticks de alta frecuencia (M3)
 ==========================================================================
-Ubicación: CAPTURE_ENGINE_01
-Dependencias: common_logger, settings, paths, capture_config,
-              mt5_gateway, state_persistence, disk_persistence_ledger,
-              backpressure_controller, buffer_slope_monitor, alert_engine
-Responsabilidad: Obtener ticks de MT5, normalizarlos, aplicar control de
-                 flujo (backpressure), asignar secuencia (SEQ), persistirlos
-                 en disco y gestionar el apagado seguro mediante señales
-                 físicas en disco (shutdown.signal).
+Ubicación: CAPTURE_ENGINE_01/mt5_tick_engine.py
+Dependencias:
+    - SYSTEM_SERVICES.system_logger (get_system_logger)
+    - SYSTEM_SERVICES.system_paths (AUDIT_STATE as STATE_DIR, AUDIT_FLOW as ACTIVE_DATA_DIR, LOGS_DIR)
+    - SYSTEM_SERVICES.system_settings (OPERATIONAL_MODE)
+    - SYSTEM_CANONICAL.system_sessions (BROKER_TZ)
+    - CAPTURE_ENGINE_01.capture_config (SYMBOL_CONFIG, get_optimized_gc_interval)
+    - CAPTURE_ENGINE_01.mt5_gateway (MT5Wrapper, get_mt5_connection)
+    - CAPTURE_ENGINE_01.state_persistence (StateManager, read_last_valid_seq)
+    - CAPTURE_ENGINE_01.disk_persistence_ledger (TickLedger)
+    - CAPTURE_ENGINE_01.backpressure_controller (StateMachine)
+    - CAPTURE_ENGINE_01.buffer_slope_monitor (SlopeMonitor)
+    - CAPTURE_ENGINE_01.alert_engine (AlertEngine)
+Responsabilidad:
+    - Ejecutar el bucle de alta velocidad para la lectura de ticks a través de la API nativa MT5.
+    - Estructurar el payload normalizado, calcular pips reales y aplicar filtrado adaptativo de spreads.
+    - Autogestionar de manera coordinada el apagado seguro (*safe shutdown*) a través de señales físicas 
+      en disco para evitar la corrupción de datos históricos.
+    - Sincronizar la resolución de reloj interna del sistema operativo en Windows a un milisegundo de precisión.
 ==========================================================================
 """
+import sys
+from pathlib import Path
+
+# ==============================================================================
+# INYECCIÓN DE PATH CRÍTICA (Debe ejecutarse antes de cualquier importación local)
+# ==============================================================================
+raiz_proyecto = Path(__file__).resolve().parent.parent
+if str(raiz_proyecto) not in sys.path:
+    sys.path.insert(0, str(raiz_proyecto))
+
 import gc
 import io
 import json
 import logging
 import os
 import signal
-import sys
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# ==============================================================================
-# CONFIGURACIÓN DE ENTORNO Y PATH (Previo a importaciones locales)
-# ==============================================================================
-raiz_proyecto = Path(__file__).parent.parent.resolve()
-if str(raiz_proyecto) not in sys.path:
-    sys.path.insert(0, str(raiz_proyecto))
-
-# Forzar codificación UTF-8 en flujos estándar
 def _force_utf8_streams():
     try:
         if hasattr(sys.stdout, "buffer") and sys.stdout.encoding.lower() != "utf-8":
@@ -47,32 +58,35 @@ def _force_utf8_streams():
 
 _force_utf8_streams()
 
-# ==============================================================================
-# IMPORTACIONES LOCALES - SIN FALLBACK A CONFIG.PY
-# ==============================================================================
-from common_logger import get_logger as init_logging
-from settings import set_windows_clock_resolution, OPTIMIZACION, BROKER_TZ
-from paths import STATE_DIR, ACTIVE_DATA_DIR
-from capture_config import SYMBOL_CONFIG, get_optimized_gc_interval
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_SERVICES.system_paths import AUDIT_STATE as STATE_DIR, AUDIT_FLOW as ACTIVE_DATA_DIR, LOGS_DIR
+from SYSTEM_SERVICES.system_settings import OPERATIONAL_MODE
+from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
+from CAPTURE_ENGINE_01.capture_config import SYMBOL_CONFIG, get_optimized_gc_interval
 
-# Importaciones de otros módulos del motor de captura
-from mt5_gateway import MT5Wrapper, get_mt5_connection
-from state_persistence import StateManager, read_last_valid_seq
-from disk_persistence_ledger import TickLedger
-from backpressure_controller import StateMachine
-from buffer_slope_monitor import SlopeMonitor
-from alert_engine import AlertEngine
+from CAPTURE_ENGINE_01.mt5_gateway import MT5Wrapper, get_mt5_connection
+from CAPTURE_ENGINE_01.state_persistence import StateManager, read_last_valid_seq
+from CAPTURE_ENGINE_01.disk_persistence_ledger import TickLedger
+from CAPTURE_ENGINE_01.backpressure_controller import StateMachine
+from CAPTURE_ENGINE_01.buffer_slope_monitor import SlopeMonitor
+from CAPTURE_ENGINE_01.alert_engine import AlertEngine
+
+
+def set_windows_clock_resolution():
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            libc = ctypes.windll.ntdll
+            libc.NtSetTimerResolution(10000, 1, ctypes.byref(ctypes.c_ulong()))
+        except Exception:
+            pass
 
 
 class TickCapturerV2:
-    """
-    Controlador de captura y normalización de ticks de alta velocidad para MT5.
-    Implementa la arquitectura de apagado seguro coordinada por señal de disco sin WAL.
-    """
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
         self.running = True
-        self.logger = init_logging(f"capturer.{self.symbol}", "capturers")
+        self.logger = get_system_logger(f"capturer.{self.symbol}", "01_CAPTURE")
         self.heartbeat_file = STATE_DIR / f"{self.symbol}.heartbeat"
         self._last_heartbeat = 0
         self._heartbeat_interval = 30
@@ -132,9 +146,9 @@ class TickCapturerV2:
             self._queue_overflows = previous_state.get("queue_overflows", 0)
             self.logger.info(f"Contadores restaurados | Ticks: {self._total_ticks_accepted:,}")
         else:
-            self.logger.info("Sin histórico de contadores métricos para este símbolo. Iniciando contadores en cero.")
+            self.logger.info("Sin histórico de contadores métricos para este símbolo. Iniciando en cero.")
             
-        _dynamic_buffer = SYMBOL_CONFIG.get(self.symbol, SYMBOL_CONFIG['DEFAULT'])['buffer_size']
+        _dynamic_buffer = SYMBOL_CONFIG.get(self.symbol, {}).get('buffer_size', 2000)
         self.ledger = TickLedger(self.symbol, max_buffer_size=_dynamic_buffer)
         
         self.state_machine = StateMachine(self.symbol)
@@ -174,7 +188,6 @@ class TickCapturerV2:
 
     def _reconcile_seq(self) -> int:
         seq_jsonl = self._recover_last_seq_from_jsonl()
-        
         state_file = STATE_DIR / f"{self.symbol}_state.json"
         seq_state = None
         if state_file.exists():
@@ -216,8 +229,7 @@ class TickCapturerV2:
 
     def _write_recovery_log(self, sources: list, selected_seq: int, selected_source: str):
         try:
-            from paths import LOGS_UNIFIED_DIR
-            recovery_dir = LOGS_UNIFIED_DIR / "recovery"
+            recovery_dir = LOGS_DIR / "recovery"
             recovery_dir.mkdir(parents=True, exist_ok=True)
             
             log_data = {

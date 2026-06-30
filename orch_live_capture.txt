@@ -1,14 +1,19 @@
+# -*- coding: utf-8 -*-
 """
 ==========================================================================
-ORCH_LIVE_CAPTURE - Supervisor inteligente de captura HFT
+ORCH_LIVE_CAPTURE - Supervisor y Orquestador de Captura HFT
 ==========================================================================
-Ubicación: CARPETA_RAIZ
-Dependencias: paths, settings, common_logger, capture_config
-Responsabilidad: Orquestar, monitorear y recuperar automáticamente los
-                 procesos de captura de ticks para todos los símbolos.
-                 Gestiona el apagado controlado (Graceful Shutdown)
-                 mediante señales físicas en disco (shutdown.signal).
-                 Puede ejecutarse de forma autónoma (sin orch_master_cycle).
+Ubicación: CARPETA_RAIZ/orch_live_capture.py
+Dependencias:
+    - SYSTEM_SERVICES.system_paths (AUDIT_FLOW, AUDIT_STATE, LOGS_DIR, LOGS_MASTER_DIR)
+    - SYSTEM_SERVICES.system_settings (OPERATIONAL_MODE, send_telegram_alert)
+    - SYSTEM_CANONICAL.system_sessions (BROKER_TZ, classify_session, is_market_open)
+    - SYSTEM_SERVICES.system_logger (get_system_logger)
+    - CAPTURE_ENGINE_01.capture_config (SYMBOLS_TO_CAPTURE, USAR_RAMDISK)
+Responsabilidad:
+    - Orquestar, monitorear y recuperar de forma asíncrona los capturadores de ticks.
+    - Supervisar procesos colgados o lentos (zombies) a través de la evaluación del heartbeat en disco.
+    - Implementar apagado ordenado (*graceful shutdown*) enviando la señal física `shutdown.signal`.
 ==========================================================================
 """
 import sys
@@ -25,7 +30,7 @@ import os
 import signal
 import json
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 try:
     import colorama
@@ -41,18 +46,25 @@ except ImportError:
 os.chdir(raiz_proyecto)
 
 # ==============================================================================
-# 🔌 IMPORTACIONES DIRECTAS DE INFRAESTRUCTURA (SIN DEPENDER DE CONFIG.PY)
+# 🔌 IMPORTACIONES DIRECTAS DE LA INFRAESTRUCTURA DE TRES NIVELES (M3)
 # ==============================================================================
-from paths import ACTIVE_DATA_DIR, STATE_DIR, LOGS_UNIFIED_DIR, LOGS_MASTER_DIR, create_directories
-from settings import BROKER_TZ, OPTIMIZACION, USAR_RAMDISK, send_telegram_alert
-from common_logger import get_logger
+from SYSTEM_SERVICES.system_paths import (
+    AUDIT_FLOW as ACTIVE_DATA_DIR,
+    AUDIT_STATE as STATE_DIR,
+    LOGS_DIR as LOGS_UNIFIED_DIR,
+    LOGS_MASTER_DIR,
+    ensure_directories_exist as create_directories
+)
+from SYSTEM_SERVICES.system_settings import OPERATIONAL_MODE, send_telegram_alert
+from SYSTEM_CANONICAL.system_sessions import BROKER_TZ, classify_session, is_market_open
+from SYSTEM_SERVICES.system_logger import get_system_logger
 
 # Importación del universo de captura local
-from CAPTURE_ENGINE_01.capture_config import SYMBOLS_TO_CAPTURE
+from CAPTURE_ENGINE_01.capture_config import SYMBOLS_TO_CAPTURE, USAR_RAMDISK
 
-def init_logging(component: str = "system", category: str = "00_ORCHESTRATOR"):
+def init_logging(component: str = "launcher", category: str = "00_ORCHESTRATOR"):
     create_directories()
-    return get_logger(component, category)
+    return get_system_logger(component, category)
 
 # ==============================================================================
 # CONSTANTES OPERATIVAS DE INFRAESTRUCTURA
@@ -63,6 +75,8 @@ TIEMPO_VIDA_MINIMO_SEG = 30
 DELAY_BETWEEN_STARTS = 2.0
 STABILIZATION_TIMEOUT = 15
 
+# Detectar optimizaciones de latencia basadas en el entorno
+OPTIMIZACION = os.getenv("OPTIMIZACION", "local").lower()
 if OPTIMIZACION == 'aws':
     ZOMBIE_TIMEOUT_SEG = 900
     HEARTBEAT_TIMEOUT_SEG = 600
@@ -72,6 +86,7 @@ else:
 
 SHUTDOWN_GRACEFUL_WAIT = 15.0
 
+
 def get_session_umbral_normal(session: str) -> int:
     if session in ["LONDON", "OVERLAP", "NEW_YORK"]:
         return 60
@@ -79,6 +94,7 @@ def get_session_umbral_normal(session: str) -> int:
         return 180
     else:
         return 600
+
 
 def get_session_umbral_critico(session: str) -> int:
     if session in ["LONDON", "OVERLAP", "NEW_YORK"]:
@@ -128,25 +144,16 @@ class SmartLauncher:
                 if symbol_signal_file.exists():
                     symbol_signal_file.unlink()
         except Exception as e:
-            self.logger.error(f"Error limpiando archivos de señal huérfanos al arrancar: {e}")
+            self.logger.error(f"No se pudo limpiar los archivos de señal residuales: {e}")
 
     def signal_handler(self, signum, frame):
         self.logger.info(f"Señal nativa del SO [{signum}] interceptada. Orquestando apagado seguro por señal...")
         self.running = False
 
     def _get_current_session(self) -> str:
-        ahora = datetime.now(BROKER_TZ)
-        hour = ahora.hour
-        if 6 <= hour < 14:
-            return "LONDON"
-        elif 14 <= hour < 18:
-            return "OVERLAP"
-        elif 18 <= hour < 22:
-            return "NEW_YORK"
-        elif 22 <= hour < 24:
-            return "CLOSED"
-        else:
-            return "ASIA"
+        from SYSTEM_CANONICAL.system_sessions import get_current_broker_time
+        ahora = get_current_broker_time()
+        return classify_session(ahora.hour)
 
     def _update_session_for_symbol(self, symbol: str):
         self._current_session[symbol] = self._get_current_session()
@@ -161,7 +168,8 @@ class SmartLauncher:
         print(f"{Fore.CYAN}{'='*100}")
         print(f"{Fore.YELLOW}🚀 SUPERVISOR INTELIGENTE — INFRAESTRUCTURA DE APAGADO SEGURO (SHUTDOWN SIGNAL)")
         print(f"{Fore.CYAN}{'='*100}")
-        broker_time = datetime.now(BROKER_TZ)
+        from SYSTEM_CANONICAL.system_sessions import get_current_broker_time
+        broker_time = get_current_broker_time()
         local_time = datetime.now()
         session = self._get_current_session()
         session_colors = {"LONDON": Fore.GREEN, "OVERLAP": Fore.CYAN, "NEW_YORK": Fore.BLUE, "ASIA": Fore.YELLOW, "CLOSED": Fore.RED}
@@ -171,31 +179,96 @@ class SmartLauncher:
         print(f"{Fore.WHITE}💾 Entorno     : {'PC' if not USAR_RAMDISK else 'PC+RAMDISK'}")
         print(f"{Fore.CYAN}{'='*100}")
 
-    def is_market_open(self) -> bool:
-        ahora = datetime.now(BROKER_TZ)
-        dia_semana = ahora.weekday()
-        hora_actual = ahora.hour
-
-        if dia_semana == 5:
-            return False
-        if dia_semana == 6:
-            return False
-        if dia_semana == 4:
-            return hora_actual < 24
-        return True
-
     def check_market_before_start(self):
         print(f"\n{Fore.YELLOW}🔍 VERIFICANDO ESTADO DEL MERCADO...")
-        ahora = datetime.now(BROKER_TZ)
+        from SYSTEM_CANONICAL.system_sessions import get_current_broker_time
+        ahora = get_current_broker_time()
         dia_nombre = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'][ahora.weekday()]
         print(f"{Fore.WHITE} Hora broker : {ahora.strftime('%H:%M')} ({dia_nombre})")
-        if self.is_market_open():
+        if is_market_open():
             self.market_open = True
-            print(f"{Fore.GREEN}✅ MERCADO ABIERTO — Iniciando captura")
+            print(f"{Fore.GREEN}✅ ABIERTO. El bot puede operar.{Fore.RESET}")
         else:
             self.market_open = False
-            print(f"{Fore.YELLOW}⏸️ MERCADO CERRADO — En espera")
-        print(f"{Fore.CYAN}{'='*100}")
+            print(f"{Fore.RED}❌ CERRADO. El bot operará en espera activa.{Fore.RESET}")
+
+    def _check_process_alive(self, symbol: str) -> Tuple[bool, str]:
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    cmdline = ' '.join(proc.info['cmdline'] or [])
+                    if ('mt5_tick_engine.py' in cmdline) and symbol.upper() in cmdline:
+                        if proc.is_running():
+                            return True, f"PID {proc.info['pid']}"
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            return False, "No encontrado"
+        except Exception:
+            return False, "Error"
+
+    def _check_heartbeat(self, symbol: str) -> Tuple[bool, float]:
+        heartbeat_file = STATE_DIR / f"{symbol}.heartbeat"
+        if not heartbeat_file.exists():
+            return False, 0.0
+        
+        try:
+            with open(heartbeat_file, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                lines = content.split('\n')
+                if lines:
+                    timestamp = float(lines[0].strip())
+                    age = time.time() - timestamp
+                    return True, age
+        except Exception:
+            pass
+        return False, 0.0
+
+    def _determine_real_state(self, symbol: str, data: Dict[str, Any]) -> Tuple[str, str, str]:
+        process_alive, pid_info = self._check_process_alive(symbol)
+        heartbeat_exists, heartbeat_age = self._check_heartbeat(symbol)
+        system_timestamp = data.get('system_timestamp', 0)
+        
+        if system_timestamp > 0:
+            data_age = time.time() - system_timestamp
+            if data_age < 0:
+                data_age = 0.0
+        else:
+            state_file = STATE_DIR / f"{symbol}_state.json"
+            if state_file.exists():
+                data_age = time.time() - state_file.stat().st_mtime
+            else:
+                data_age = float('inf')
+        
+        data_fresh = data_age < 30.0
+        data_critical = data_age > 120.0
+        
+        if process_alive:
+            process_status = "RUNNING"
+        else:
+            process_status = "STOPPED"
+        
+        if process_status == "RUNNING" and data_fresh:
+            real_status = "LIVE"
+            real_color = "GREEN"
+            detail = f"PID activo | Heartbeat: {heartbeat_age:.0f}s"
+        elif process_status == "RUNNING" and not data_fresh and not data_critical:
+            real_status = "STALE"
+            real_color = "YELLOW"
+            detail = f"Proceso vivo | Sin datos {data_age:.0f}s"
+        elif process_status == "RUNNING" and data_critical:
+            real_status = "STALLED"
+            real_color = "ORANGE"
+            detail = f"Proceso atascado | Sin datos {data_age:.0f}s"
+        elif process_status == "STOPPED" and data_age > 60:
+            real_status = "DEAD"
+            real_color = "RED"
+            detail = f"Proceso detenido | Último dato {data_age:.0f}s"
+        else:
+            real_status = "OFFLINE"
+            real_color = "GRAY"
+            detail = "Sistema inactivo"
+        
+        return real_status, real_color, detail
 
     def check_dead_processes(self) -> List[Tuple[str, int]]:
         dead_symbols = []
@@ -212,7 +285,7 @@ class SmartLauncher:
             process = info.get('process')
             if not process or process.poll() is not None:
                 continue
-            if not self.is_market_open():
+            if not is_market_open():
                 continue
             is_zombie = False
             zombie_age = 0
@@ -235,7 +308,6 @@ class SmartLauncher:
         return zombies
 
     def start_capturer_smart(self, symbol: str) -> bool:
-        """Lanza un capturador de forma asíncrona y lo mantiene en segundo plano."""
         print(f"{Fore.WHITE}▶️ Iniciando {symbol}... ", end=' ', flush=True)
         
         try:
@@ -249,12 +321,10 @@ class SmartLauncher:
             
             log_file = open(log_path, "a", encoding='utf-8', buffering=1)
             
-            # Configurar entorno con PYTHONPATH para que encuentre los módulos de la raíz
             env_utf8 = os.environ.copy()
             env_utf8["PYTHONIOENCODING"] = "utf-8"
             env_utf8["PYTHONPATH"] = str(raiz_proyecto) + os.pathsep + env_utf8.get("PYTHONPATH", "")
             
-            # Ejecutar en segundo plano (NO timeout)
             p = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
@@ -337,7 +407,7 @@ class SmartLauncher:
             uptime = datetime.now() - self.start_time
             hours, remainder = divmod(int(uptime.total_seconds()), 3600)
             minutes, seconds = divmod(remainder, 60)
-            mercado_str = f"{Fore.GREEN}🟢 ABIERTO" if self.market_open else f"{Fore.YELLOW}🟡 CERRADO"
+            mercado_str = f"{Fore.GREEN}🟢 ABIERTO" if is_market_open() else f"{Fore.YELLOW}🟡 CERRADO"
             print(f"\n{Fore.WHITE}Mercado: {mercado_str} | Uptime: {hours:02d}:{minutes:02d}:{seconds:02d} | Re-inicios: {sum(self.restart_count.values())}")
             print(f"\n{Fore.CYAN}{'SÍMBOLO':<10} {'ESTADO SM':<10} {'VEL':<6} {'BUFFER':<14} {'OVERFLOW':<10} {'SLOPE':<8} {'REIN'}")
             print(f"{Fore.CYAN}{'-'*100}")
@@ -393,7 +463,7 @@ class SmartLauncher:
                 print(f"\n{Fore.GREEN}✅ Estado Consistente — Captura de alta frecuencia sin cuellos de botella")
             print(f"\n{Fore.YELLOW}[Q] Salir de Supervisor | [R] Re-lanzar todo el pipeline | [L] Mostrar ruta de logs")
             print(f"{Fore.CYAN}{'='*100}")
-        except Exception as e:
+        except Exception:
             pass
 
     def restart_all(self):
@@ -427,12 +497,13 @@ class SmartLauncher:
         print(f"\n{Fore.YELLOW}⏸️ En espera de la apertura del mercado...")
         while self.running:
             try:
-                if self.is_market_open():
+                if is_market_open():
                     self.market_open = True
                     print(f"\n{Fore.GREEN}🔔 ¡MERCADO ABIERTO!")
-                    self.logger.info("🔔 Apertura de mercado detectada. Arrancando procesos de captura.")
+                    self.logger.info("🔔 Apertura de mercado detectada. Arrancando de forma coordinada.")
                     return True
-                ahora_broker = datetime.now(BROKER_TZ)
+                from SYSTEM_CANONICAL.system_sessions import get_current_broker_time
+                ahora_broker = get_current_broker_time()
                 print(f"\r{Fore.YELLOW}⏳ {ahora_broker.strftime('%H:%M:%S')} (Hora Broker en espera)", end='', flush=True)
                 time.sleep(15)
             except KeyboardInterrupt:
@@ -449,7 +520,7 @@ class SmartLauncher:
                 f.write(f"shutdown_initiated_at={time.time()}\nby_pid={os.getpid()}\n")
             self.logger.info("✅ Señal de parada física 'shutdown.signal' creada en el disco.")
         except Exception as e:
-            self.logger.error(f"Fallo crítico escribiendo señal en disco. Forzando detención tradicional: {e}")
+            self.logger.error(f"Fallo crítico escribiendo señal en disco: {e}")
             self._fallback_force_kill()
             return
             
@@ -464,7 +535,7 @@ class SmartLauncher:
                         print(f"  {Fore.GREEN}✅ {symbol} detuvo sus operaciones y confirmó guardado seguro.")
                         self.logger.info(f"Confirmación de guardado de datos recibida para {symbol}.")
             if len(confirmed_symbols) == len(SYMBOLS_TO_CAPTURE):
-                print(f"\n{Fore.GREEN}✅ Todos los capturadores finalizaron y confirmaron la consistencia de su persistencia.")
+                print(f"\n{Fore.GREEN}✅ Todos los capturadores finalizaron de manera consistente.")
                 self.logger.info("Todos los capturadores activos confirmaron un apagado limpio.")
                 break
             time.sleep(0.5)
@@ -507,7 +578,7 @@ class SmartLauncher:
                     self.print_status()
                     last_visual_refresh = ahora
                 
-                if not self.is_market_open():
+                if not is_market_open():
                     self.market_open = False
                     print(f"\n{Fore.YELLOW}🔴 Mercado cerrado — Deteniendo pipeline de forma controlada...")
                     self.logger.info("🔴 Cierre de mercado. Deteniendo capturadores de forma controlada.")
@@ -586,7 +657,8 @@ class SmartLauncher:
                 time.sleep(5)
 
     def run(self):
-        broker_time = datetime.now(BROKER_TZ)
+        from SYSTEM_CANONICAL.system_sessions import get_current_broker_time
+        broker_time = get_current_broker_time()
         self.logger.info(f"🚀 Launcher iniciado de forma integrada a las {broker_time.strftime('%H:%M:%S')}")
         self.check_market_before_start()
         while self.running:
@@ -604,6 +676,7 @@ class SmartLauncher:
 def main():
     launcher = SmartLauncher()
     launcher.run()
+
 
 if __name__ == "__main__":
     main()

@@ -1,11 +1,17 @@
 """
 ==========================================================================
-ALERT_ENGINE - Alertas en tiempo real con Telegram
+ALERT_ENGINE - Evaluación y Despacho de Alertas Técnicas en Tiempo Real
 ==========================================================================
-Ubicación: CAPTURE_ENGINE_01
-Dependencias: settings (send_telegram_alert, BROKER_TZ)
-Responsabilidad: Evaluar métricas del capturador (stall, overflow, pérdida pendiente) 
-                            y generar alertas en tiempo real vía Telegram.
+Ubicación: CAPTURE_ENGINE_01/alert_engine.py
+Dependencias:
+    - SYSTEM_SERVICES.system_settings (send_telegram_alert)
+    - SYSTEM_CANONICAL.system_sessions (BROKER_TZ)
+Responsabilidad:
+    - Monitorear de forma no bloqueante las métricas operativas de cada par
+      (congelamiento, sobreflujo, porcentaje de descarte de ticks).
+    - Evaluar estados de la máquina de estados frente a umbrales de peligro.
+    - Despachar notificaciones asíncronas vía Telegram bajo políticas de
+      enfriamiento (cooldown) para mitigar ruidos operativos.
 ==========================================================================
 """
 import time
@@ -13,7 +19,9 @@ import logging
 from typing import Dict, Any, Optional
 from datetime import datetime
 
-from settings import send_telegram_alert, BROKER_TZ
+from SYSTEM_SERVICES.system_settings import send_telegram_alert
+from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
+
 
 class AlertEngine:
     def __init__(self, symbol: str):

@@ -1,44 +1,46 @@
 """
 ==========================================================================
-TELEMETRY_DASHBOARD - Monitor de diagnóstico en tiempo real
+TELEMETRY_DASHBOARD - Terminal de Monitoreo Diagnóstico en Tiempo Real
 ==========================================================================
-Ubicación: CAPTURE_ENGINE_01
-Dependencias: common_logger, paths, settings, capture_config
-Responsabilidad: Mostrar en tiempo real el estado de todos los capturadores,
-                 métricas del sistema (CPU, RAM, RAMDisk), persistencia
-                 de datos, estado del Archive Daemon, y alertas activas.
-                 Soporta modo headless para VPS y modo interactivo con
-                 teclas de control (Q, R, G, L, A, S, F).
+Ubicación: CAPTURE_ENGINE_01/telemetry_dashboard.py
+Dependencias:
+    - SYSTEM_SERVICES.system_logger (get_system_logger)
+    - SYSTEM_SERVICES.system_paths (AUDIT_FLOW as ACTIVE_DATA_DIR, CODE_DIR as BASE_DIR, LOGS_DIR as LOGS_UNIFIED_DIR, PRIMARY_TICK_DIR as RAMDISK_PATH, SSD_EVIDENCE_DIR, AUDIT_STATE as STATE_DIR)
+    - SYSTEM_CANONICAL.system_sessions (BROKER_TZ)
+    - SYSTEM_SERVICES.system_settings (OPERATIONAL_MODE)
+    - CAPTURE_ENGINE_01.capture_config (SYMBOLS_TO_CAPTURE, get_session_actual, USAR_RAMDISK)
+Responsabilidad:
+    - Interceptar las telemetrías y marcas de latidos (heartbeats) de cada proceso para determinar
+      el estado real de ejecución del bot en entornos locales o headless (VPS).
+    - Exponer métricas consolidadas sobre el uso del hardware físico de almacenamiento, memoria y procesador.
+    - Proveer una interfaz interactiva de diagnóstico en consola y despachar auditorías automáticas de recuperación.
 ==========================================================================
 """
 import sys
-from pathlib import Path
-
-# Inyección de ruta del directorio superior (Single Source of Truth)
-raiz_proyecto = Path(__file__).parent.parent.resolve()
-if str(raiz_proyecto) not in sys.path:
-    sys.path.insert(0, str(raiz_proyecto))
-
 import gc
 import json
-import logging
 import os
 import signal
 import threading
 import time
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import psutil
 
-# Importaciones directas y limpias de soporte
-from common_logger import get_logger as init_logging
-from paths import (
-    ACTIVE_DATA_DIR, BASE_DIR, LOGS_UNIFIED_DIR, 
-    RAMDISK_PATH, SSD_EVIDENCE_DIR, STATE_DIR
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_SERVICES.system_paths import (
+    AUDIT_FLOW as ACTIVE_DATA_DIR,
+    CODE_DIR as BASE_DIR,
+    LOGS_DIR as LOGS_UNIFIED_DIR,
+    PRIMARY_TICK_DIR as RAMDISK_PATH,
+    SSD_EVIDENCE_DIR,
+    AUDIT_STATE as STATE_DIR
 )
-from settings import BROKER_TZ, ENTORNO_ACTUAL, USAR_RAMDISK
-from capture_config import SYMBOLS_TO_CAPTURE, get_session_actual
+from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
+from SYSTEM_SERVICES.system_settings import OPERATIONAL_MODE
+from CAPTURE_ENGINE_01.capture_config import SYMBOLS_TO_CAPTURE, get_session_actual, USAR_RAMDISK
 
 try:
     from colorama import init, Fore, Style
@@ -50,6 +52,7 @@ except ImportError:
         WHITE = '\033[97m'; RESET = '\033[0m'
     class Style:
         RESET = ''
+
 
 class StateCache:
     def __init__(self, ttl_seconds: float = 2.0):
@@ -89,7 +92,7 @@ class UnifiedMonitor:
         critical_threshold_sec: float = 120.0,
         forensic_mode: bool = False
     ):
-        self.logger = init_logging("monitor", "system")
+        self.logger = get_system_logger("monitor", "00_ORCHESTRATOR")
         self.refresh_interval = refresh_interval
         self.cache_ttl = cache_ttl
         self.headless = headless if headless is not None else self._detect_headless()
@@ -140,7 +143,7 @@ class UnifiedMonitor:
     def _detect_headless(self) -> bool:
         if os.environ.get('VPS_MODE', '0') == '1': return True
         if os.environ.get('AWS_EXECUTION_ENV') or os.environ.get('EC2_REGION'): return True
-        return ENTORNO_ACTUAL == 'VPS'
+        return OPERATIONAL_MODE == "LIVE"
     
     def _signal_handler(self, signum, frame):
         self.logger.info(f"🛑 Señal {signum} recibida. Apagando monitor...")
@@ -160,7 +163,6 @@ class UnifiedMonitor:
             return None
     
     def _check_process_alive(self, symbol: str) -> Tuple[bool, str]:
-        """Verifica si el proceso del capturador está vivo de manera híbrida."""
         try:
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                 try:
@@ -175,7 +177,6 @@ class UnifiedMonitor:
             return False, "Error"
 
     def _check_heartbeat(self, symbol: str) -> Tuple[bool, float]:
-        """Verifica el heartbeat del capturador"""
         heartbeat_file = STATE_DIR / f"{symbol}.heartbeat"
         if not heartbeat_file.exists():
             return False, 0.0
@@ -193,15 +194,10 @@ class UnifiedMonitor:
         return False, 0.0
 
     def _determine_real_state(self, symbol: str, data: Dict[str, Any]) -> Tuple[str, str, str]:
-        """
-        Determina el estado REAL del sistema unificando el pid y las alertas de tiempo local.
-        """
         process_alive, pid_info = self._check_process_alive(symbol)
         heartbeat_exists, heartbeat_age = self._check_heartbeat(symbol)
-        
         system_timestamp = data.get('system_timestamp', 0)
         
-        # Uso estricto de marcas de tiempo de PC local para evitar desfases
         if system_timestamp > 0:
             data_age = time.time() - system_timestamp
             if data_age < 0:
@@ -257,7 +253,6 @@ class UnifiedMonitor:
         sys_state_file = STATE_DIR / f"{symbol}_system_state.json"
         
         state_data = {}
-        
         data = self._read_state_file(state_file)
         if data:
             state_data.update(data)
@@ -401,13 +396,11 @@ class UnifiedMonitor:
                     pass
     
     def _check_stale_data(self) -> List[Dict[str, Any]]:
-        """Identifica alertas de congelamiento EXCLUSIVAMENTE para capturadores encendidos."""
         now = time.time()
         alerts = []
         
         with self._cache_lock:
             for symbol, data in self.symbol_cache.items():
-                # Evitar alertas ruidosas si el capturador está apagado a propósito
                 process_alive, _ = self._check_process_alive(symbol)
                 if not process_alive:
                     continue
@@ -485,7 +478,7 @@ class UnifiedMonitor:
         colors = {
             'LIVE': Fore.GREEN,
             'STALE': Fore.YELLOW,
-            'STALLED': '\033[38;5;208m',  # Orange
+            'STALLED': '\033[38;5;208m',
             'DEAD': Fore.RED,
             'OFFLINE': Fore.WHITE
         }
@@ -514,7 +507,6 @@ class UnifiedMonitor:
         mode_str = "🔍 FORENSE (SSD)" if self.forensic_mode else "📡 LIVE (RAMDISK)"
         mode_color = Fore.CYAN if self.forensic_mode else Fore.GREEN
         
-        # Contar estados reales
         real_states = {}
         for symbol in SYMBOLS_TO_CAPTURE:
             data = self.symbol_cache.get(symbol, {})
@@ -522,19 +514,13 @@ class UnifiedMonitor:
             real_states[state] = real_states.get(state, 0) + 1
         
         print(f"{Fore.CYAN}{'='*130}")
-        print(f"{Fore.YELLOW}📊 MONITOR V3.3 — ESTADO REAL DEL SISTEMA (TIME COMPENSATED)")
+        print(f"{Fore.YELLOW}📊 MONITOR V3.3 — ESTADO REAL DEL SISTEMA")
         print(f"{mode_color}📂 MODO: {mode_str}{Fore.RESET}")
-        
-        # Resumen de estados
         print(f"{'':<2} | ".join([f"{self._get_status_icon(s)} {s}: {c}" for s, c in real_states.items()]))
-        
         print(f"{Fore.WHITE}🕐 {now} | 🔄 #{self.refresh_count} | ⏱️ Uptime: {uptime_str} | 📅 Sesión: {get_session_actual()}")
-        print(f"{Fore.WHITE}💾 Modo: {'RAMDISK+SSD' if USAR_RAMDISK else 'SSD/EBS'} | Entorno: {ENTORNO_ACTUAL} | Recovery Audits: {total_recovery}")
+        print(f"{Fore.WHITE}💾 Modo: {'RAMDISK+SSD' if USAR_RAMDISK else 'SSD/EBS'} | Entorno: {OPERATIONAL_MODE} | Recovery Audits: {total_recovery}")
         print(f"{Fore.CYAN}{'='*130}")
         
-        # ==============================================================================
-        # ⚠️ BANNER DE ALERTAS COMPACTO (Filtra solo capturadores ENCENDIDOS con fallos)
-        # ==============================================================================
         stale_alerts = self._stale_alerts
         if stale_alerts:
             critical_symbols = [a['symbol'] for a in stale_alerts if a['level'] == 'CRITICAL']
@@ -559,7 +545,6 @@ class UnifiedMonitor:
             symbols = list(self.symbol_cache.items())
         
         for symbol, data in symbols:
-            # Determinar estado REAL
             real_status, _, detail = self._determine_real_state(symbol, data)
             status_color = self._get_status_color(real_status)
             status_icon = self._get_status_icon(real_status)
@@ -568,14 +553,12 @@ class UnifiedMonitor:
             buffer_pct = metrics.get('buffer_pct', 0)
             seq = data.get('last_sequence', 0)
             
-            # Verificar proceso y heartbeat
             process_alive, pid_info = self._check_process_alive(symbol)
             heartbeat_exists, heartbeat_age = self._check_heartbeat(symbol)
             
             process_display = f"✅ {pid_info}" if process_alive else "❌ DETENIDO"
             heartbeat_display = f"✅ {heartbeat_age:.0f}s" if heartbeat_exists else "❌ NO"
             
-            # Cálculo de edad del dato basado en el reloj local
             system_timestamp = data.get('system_timestamp', 0)
             if system_timestamp > 0:
                 age_sec = time.time() - system_timestamp
@@ -757,7 +740,6 @@ class UnifiedMonitor:
         stale_count = len(stale_alerts)
         
         mode_str = "F" if self.forensic_mode else "L"
-        
         msg = (f"Monitor[{mode_str}] | TPS: {total_tps:.1f} | "
                f"Críticos: {critical} | "
                f"STALE: {stale_count} | "
@@ -771,7 +753,6 @@ class UnifiedMonitor:
     
     def run(self):
         self._start_fetch_thread()
-        
         try:
             while self.running:
                 if self._check_shutdown_signal():
@@ -782,12 +763,9 @@ class UnifiedMonitor:
                 else:
                     self._draw_dashboard()
                     self.refresh_count += 1
-                    
                     if not self._handle_input():
                         break
-                    
                     time.sleep(self.refresh_interval)
-        
         except KeyboardInterrupt:
             pass
         finally:
@@ -816,6 +794,7 @@ def main():
         forensic_mode=args.forensic
     )
     monitor.run()
+
 
 if __name__ == "__main__":
     main()

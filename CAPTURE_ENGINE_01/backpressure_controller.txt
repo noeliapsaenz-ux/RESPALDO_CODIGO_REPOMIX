@@ -1,29 +1,26 @@
 """
 ==========================================================================
-BACKPRESSURE_CONTROLLER - Control de flujo adaptativo por símbolo
+BACKPRESSURE_CONTROLLER - Control de Flujo Adaptativo y Estados Técnicos
 ==========================================================================
-Ubicación: CAPTURE_ENGINE_01
-Dependencias: capture_config (SYMBOL_CONFIG)
-Responsabilidad: Monitorear buffer_pct, overflow_rate, slope y loss_rate
-                 para determinar el estado del sistema (GREEN/YELLOW/ORANGE/RED)
-                 y ajustar la velocidad de procesamiento en consecuencia.
+Ubicación: CAPTURE_ENGINE_01/backpressure_controller.py
+Dependencias:
+    - SYSTEM_CANONICAL.system_states (SystemState)
+    - SYSTEM_CANONICAL.system_symbols (get_symbol_specification)
+Responsabilidad:
+    - Evaluar métricas en caliente de buffers, pendientes de llenado y pérdida.
+    - Determinar el estado del sistema técnico utilizando la máquina de estados.
+    - Mitigar oscilaciones y regular de manera dinámica la tasa de muestreo
+      de ticks en base a los multiplicadores de sensibilidad canónicos.
 ==========================================================================
 """
 import time
 import logging
-from enum import Enum
 from typing import Dict, Any, Optional
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent.resolve()))
-from capture_config import SYMBOL_CONFIG
+# Consumo de la Capa de Conocimiento unificada (Sin redundancias)
+from SYSTEM_CANONICAL.system_states import SystemState
+from SYSTEM_CANONICAL.system_symbols import get_symbol_specification
 
-class SystemState(Enum):
-    GREEN = "GREEN"
-    YELLOW = "YELLOW"
-    ORANGE = "ORANGE"
-    RED = "RED"
 
 class StateMachine:
     BASE_THRESHOLDS = {
@@ -39,29 +36,17 @@ class StateMachine:
         'ORANGE': 0.60,
         'RED': 0.30
     }
-    
-    SYMBOL_PROFILES = {
-        'EURUSD': {'multiplier': 1.0, 'min_buffer': 5000},
-        'GBPUSD': {'multiplier': 0.9, 'min_buffer': 5000},
-        'USDJPY': {'multiplier': 0.9, 'min_buffer': 5000},
-        'GBPJPY': {'multiplier': 0.8, 'min_buffer': 4000},
-        'AUDUSD': {'multiplier': 0.5, 'min_buffer': 2000},
-        'USDCAD': {'multiplier': 0.4, 'min_buffer': 2000},
-        'NZDUSD': {'multiplier': 0.2, 'min_buffer': 1500},
-        'EURJPY': {'multiplier': 0.7, 'min_buffer': 3000},
-        'CHFJPY': {'multiplier': 0.25, 'min_buffer': 1500},
-        'CADJPY': {'multiplier': 0.2, 'min_buffer': 1500},
-        'DEFAULT': {'multiplier': 0.5, 'min_buffer': 2000}
-    }
 
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
         self.logger = logging.getLogger(f"state.{self.symbol}")
-        self.profile = self.SYMBOL_PROFILES.get(self.symbol, self.SYMBOL_PROFILES['DEFAULT'])
-        self.multiplier = self.profile['multiplier']
-        self.min_buffer = self.profile['min_buffer']
         
-        # Calcular los umbrales adaptativos fijos de sesión basados en el multiplicador del símbolo
+        # Recuperar especificación técnica directamente del catálogo canónico
+        spec = get_symbol_specification(self.symbol)
+        self.multiplier = spec.backpressure_multiplier
+        self.min_buffer = spec.buffer_size  # Elimina la duplicidad del buffer hardcoded
+        
+        # Calcular los umbrales adaptativos basados en el multiplicador del canon
         self._dynamic_thresholds = self._calculate_dynamic_thresholds()
         
         self.current_state = SystemState.GREEN
@@ -93,9 +78,6 @@ class StateMachine:
         self._slope = slope
         self._loss_rate = loss_rate
         
-        # FASE A - Corrección de Bug de Unidades:
-        # Se evalúa el porcentaje de ocupación (buffer_pct) frente a un valor porcentual dinámico de referencia (10.0%)
-        # en lugar de comparar porcentajes contra conteos absolutos de ticks.
         if buffer_pct > 10.0:
             self._dynamic_thresholds = self._calculate_dynamic_thresholds()
             

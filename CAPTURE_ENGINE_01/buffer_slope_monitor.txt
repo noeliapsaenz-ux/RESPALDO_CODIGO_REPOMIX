@@ -1,12 +1,17 @@
 """
 ==========================================================================
-BUFFER_SLOPE_MONITOR - Monitor de pendiente y aceleración del buffer
+BUFFER_SLOPE_MONITOR - Regresión y Estimación Predictiva del Desborde de Búfer
 ==========================================================================
-Ubicación: CAPTURE_ENGINE_01
-Dependencias: logging, collections
-Responsabilidad: Calcular la tasa de cambio (pendiente) del buffer de
-                 persistencia mediante regresión lineal, detectar
-                 aceleraciones y predecir tiempos de overflow.
+Ubicación: CAPTURE_ENGINE_01/buffer_slope_monitor.py
+Dependencias:
+    - collections (deque)
+Responsabilidad:
+    - Calcular con precisión científica la tasa de cambio de ticks por segundo 
+      envolviendo las mediciones mediante regresión lineal por mínimos cuadrados.
+    - Centrar los timestamps en un origen común para blindar la ejecución contra 
+      cancelaciones catastróficas por precisión de punto flotante en Windows.
+    - Estimar de manera proactiva el tiempo estimado en segundos hacia un desborde 
+      (overflow) para permitir que la máquina de estados actúe con anticipación.
 ==========================================================================
 """
 import time
@@ -15,11 +20,6 @@ from collections import deque
 from typing import Dict, Any, Optional
 
 class SlopeMonitor:
-    """
-    Monitor predictivo de tasa de cambio (pendiente) del búfer de persistencia.
-    Implementa regresión lineal por mínimos cuadrados alineada a nivel de bytes
-    y protegida contra cancelación catastrófica de punto flotante.
-    """
     def __init__(self, symbol: str, window_size: int = 10):
         self.symbol = symbol.upper()
         self.logger = logging.getLogger(f"slope.{self.symbol}")
@@ -41,16 +41,10 @@ class SlopeMonitor:
             self._calculate_slope()
 
     def _calculate_slope(self):
-        """
-        Calcula la pendiente utilizando mínimos cuadrados ordinarios.
-        Centra los timestamps en t_0 para prevenir la cancelación catastrófica de float64.
-        """
         if len(self._measurements) < 2:
             return
             
-        # Centrar los tiempos restando el primer elemento de la ventana (t_0)
         t_0 = self._measurements[0]['time']
-        
         times = [m['time'] - t_0 for m in self._measurements]
         sizes = [m['size'] for m in self._measurements]
         
@@ -61,8 +55,6 @@ class SlopeMonitor:
         sum_ts = sum(t * s for t, s in zip(times, sizes))
         
         denominator = n * sum_tt - sum_t * sum_t
-        
-        # Si no hay variación de tiempo significativa, omitimos la división
         if denominator == 0:
             return
             

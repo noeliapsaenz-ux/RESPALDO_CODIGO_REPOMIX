@@ -1,52 +1,53 @@
 """
 ==========================================================================
-CAPTURE_CONFIG - Configuración operativa del módulo de captura
+CAPTURE_CONFIG - Orquestador Técnico y Adaptación Dinámica de Parámetros
 ==========================================================================
-Ubicación: CAPTURE_ENGINE_01
-Dependencias: settings (BROKER_TZ, USAR_RAMDISK), paths (DYNAMIC_SYMBOL_CONFIG_PATH)
-Responsabilidad: Definir la lista de símbolos operables, límites de spread,
-                 tamaños de buffer por símbolo, y parámetros del demonio
-                 de compresión. Carga dinámica de configuraciones desde
-                 DYNAMIC_SYMBOL_CONFIG_PATH para ajustes en caliente.
+Ubicación: CAPTURE_ENGINE_01/capture_config.py
+Dependencias:
+    - SYSTEM_SERVICES.system_settings (OPERATIONAL_MODE)
+    - SYSTEM_SERVICES.system_paths (QUANT_FEEDBACK)
+    - SYSTEM_CANONICAL.system_symbols (get_symbols, get_symbol_specification)
+    - SYSTEM_CANONICAL.system_sessions (BROKER_TZ, is_market_open, classify_session)
+Responsabilidad:
+    - Integrar las constantes inmutables de los activos financieros con los archivos
+      de configuración en caliente generados por el motor cuántico (`QUANT_FEEDBACK`).
+    - Exponer configuraciones seguras y saneadas de spreads y límites de buffers 
+      a la cola asíncrona de los capturadores activos.
+    - Determinar la validez de los intervalos de recolección de basura (GC) basándose
+      en el uso del RAMDisk.
 ==========================================================================
 """
+import os
 import json
-from datetime import datetime
 from pathlib import Path
-from settings import BROKER_TZ, USAR_RAMDISK
-from paths import DYNAMIC_SYMBOL_CONFIG_PATH
+from SYSTEM_SERVICES.system_settings import OPERATIONAL_MODE
+from SYSTEM_SERVICES.system_paths import QUANT_FEEDBACK
+from SYSTEM_CANONICAL.system_symbols import get_symbols, get_symbol_specification
+from SYSTEM_CANONICAL.system_sessions import BROKER_TZ, is_market_open, classify_session
 
-# Universo de Símbolos Operables en Captura
-SYMBOLS_TO_CAPTURE = [
-    'EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'AUDUSD', 
-    'NZDUSD', 'GBPJPY', 'EURJPY', 'CHFJPY', 'CADJPY'
-]
+# Recuperar Universo de Símbolos Autorizados desde el Canon
+SYMBOLS_TO_CAPTURE = list(get_symbols())
 
-# Límites Base de Spread por Símbolo (en Pips)
-SPREAD_LIMITS = {
-    'EURUSD': 20.0, 'GBPUSD': 25.0, 'USDJPY': 20.0, 'GBPJPY': 35.0, 
-    'USDCAD': 25.0, 'AUDUSD': 25.0, 'NZDUSD': 30.0, 'EURJPY': 25.0, 
-    'CHFJPY': 30.0, 'CADJPY': 30.0, 'DEFAULT': 25.0
-}
+# Extraer límites de spread base desde el catálogo canónico (puntos a pips según especificación)
+SPREAD_LIMITS = {}
+SYMBOL_CONFIG = {}
 
-# Límites de Tamaño de Búfer de Escritura de Memoria
-SYMBOL_CONFIG = {
-    'EURUSD': {'buffer_size': 5000}, 'GBPUSD': {'buffer_size': 5000},
-    'USDJPY': {'buffer_size': 5000}, 'GBPJPY': {'buffer_size': 4000},
-    'AUDUSD': {'buffer_size': 2000}, 'USDCAD': {'buffer_size': 2000},
-    'NZDUSD': {'buffer_size': 1500}, 'EURJPY': {'buffer_size': 3000},
-    'CHFJPY': {'buffer_size': 1500}, 'CADJPY': {'buffer_size': 1500},
-    'DEFAULT': {'buffer_size': 2000}
-}
+for sym in SYMBOLS_TO_CAPTURE:
+    spec = get_symbol_specification(sym)
+    SPREAD_LIMITS[sym] = spec.spread_limit
+    SYMBOL_CONFIG[sym] = {'buffer_size': spec.buffer_size}
 
 # Parámetros del Demonio de Compresión (Compuerta Forense)
 VERIFY_RAMDISK_SSD_MATCH = True
 QUARANTINE_SUFFIX = ".QUARANTINE_MISMATCH"
 
+# Parámetro global de uso de RAMDisk
+USAR_RAMDISK = os.getenv("USAR_RAMDISK", "TRUE").upper() == "TRUE"
 
-# ==============================================================================
-# CARGA DINÁMICA DE CONFIGURACIÓN DESDE FEEDBACK
-# ==============================================================================
+# Ruta para configuración en caliente desde el Workspace de Quant
+DYNAMIC_SYMBOL_CONFIG_PATH = QUANT_FEEDBACK / "dynamic_symbol_config.json"
+
+# Carga dinámica de ajustes en caliente
 if DYNAMIC_SYMBOL_CONFIG_PATH.exists():
     try:
         with open(DYNAMIC_SYMBOL_CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -56,17 +57,17 @@ if DYNAMIC_SYMBOL_CONFIG_PATH.exists():
                 if sym not in SYMBOLS_TO_CAPTURE:
                     continue
                 
-                # Sanitización de Límites de Spread (Mínimo 5.0 pips, Máximo 200.0 pips)
+                # Saneamiento de límites de spread ajustados
                 if "spread_limit_pips" in cfg:
                     val = float(cfg["spread_limit_pips"])
                     if 5.0 <= val <= 200.0:
                         SPREAD_LIMITS[sym] = val
                 
-                # Sanitización de Búfer de persistencia (Factor mínimo 0.1x, Máximo 10.0x)
+                # Saneamiento de ajuste del buffer de persistencia
                 if "buffer_adjustment" in cfg and sym in SYMBOL_CONFIG:
                     factor = float(cfg["buffer_adjustment"])
                     if 0.1 <= factor <= 10.0:
-                        base_buffer = SYMBOL_CONFIG[sym].get('buffer_size', 2000)
+                        base_buffer = get_symbol_specification(sym).buffer_size
                         SYMBOL_CONFIG[sym]['buffer_size'] = int(base_buffer * factor)
     except Exception:
         pass
@@ -75,23 +76,8 @@ if DYNAMIC_SYMBOL_CONFIG_PATH.exists():
 def get_optimized_gc_interval() -> int:
     return 60 if USAR_RAMDISK else 45
 
-def classify_session(hour: int) -> str:
-    if 6 <= hour < 14: return "LONDON"
-    elif 14 <= hour < 18: return "OVERLAP"
-    elif 18 <= hour < 22: return "NEW_YORK"
-    elif 22 <= hour < 24: return "CLOSED"
-    else: return "ASIA"
 
 def get_session_actual() -> str:
-    ahora = datetime.now(BROKER_TZ)
+    from SYSTEM_CANONICAL.system_sessions import get_current_broker_time
+    ahora = get_current_broker_time()
     return classify_session(ahora.hour)
-
-def is_market_open() -> bool:
-    """Determina si el mercado está abierto según hora del broker."""
-    ahora = datetime.now(BROKER_TZ)
-    dia_semana = ahora.weekday()
-    if dia_semana == 5:  # Sábado
-        return False
-    if dia_semana == 6:  # Domingo
-        return ahora.hour >= 22
-    return True

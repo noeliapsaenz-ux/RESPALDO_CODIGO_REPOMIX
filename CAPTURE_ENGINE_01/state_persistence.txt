@@ -1,11 +1,18 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
-STATE_PERSISTENCE - Persistencia y recuperación de estados unificada (M1)
+STATE_PERSISTENCE - Gestor de Estados Técnicos y Reconciliación de Secuencias
 ==========================================================================
-Ubicación: CAPTURE_ENGINE_01
-Dependencias: SYSTEM_SERVICES.system_paths, SYSTEM_SERVICES.system_settings,
-              SYSTEM_CONTRACTS.contract_manager
+Ubicación: CAPTURE_ENGINE_01/state_persistence.py
+Dependencias:
+    - SYSTEM_SERVICES.system_paths (AUDIT_STATE as STATE_DIR, AUDIT_FLOW as ACTIVE_DATA_DIR)
+    - SYSTEM_SERVICES.system_settings (OPERATIONAL_MODE)
+    - SYSTEM_CONTRACTS.contract_manager (save_contract_atomic)
+Responsabilidad:
+    - Centralizar la carga, validación e inicialización de contadores del capturador.
+    - Garantizar la integridad secuencial (SEQ) tras caídas o apagados forzados en Windows
+      mediante algoritmos eficientes de búsqueda regresiva en archivos JSONL físicos.
+    - Delegar las escrituras de estado al motor de contratos atómicos con el fin de 
+      prevenir de manera absoluta archivos truncados o bloqueos por accesos concurrentes.
 ==========================================================================
 """
 import json
@@ -16,22 +23,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# --- Importaciones de la Arquitectura de Fase M1 ---
 from SYSTEM_SERVICES.system_paths import AUDIT_STATE as STATE_DIR
 from SYSTEM_SERVICES.system_paths import AUDIT_FLOW as ACTIVE_DATA_DIR
 from SYSTEM_SERVICES.system_settings import OPERATIONAL_MODE
-
-# Importamos la persistencia atómica certificada para evitar duplicar lógica y resolver el bug de Windows
 from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic
 
 logger = logging.getLogger("system.state_manager")
 
 
 def read_last_valid_seq(file_path: Path) -> Optional[int]:
-    """
-    Realiza una búsqueda regresiva eficiente en binario sobre archivos JSONL
-    para recuperar el último valor 'seq' secuencial tras un apagado forzado.
-    """
     try:
         if not file_path.exists():
             return None
@@ -82,9 +82,6 @@ def read_last_valid_seq(file_path: Path) -> Optional[int]:
 
 
 def read_last_valid_timestamp(file_path: Path) -> Optional[int]:
-    """
-    Extrae el último timestamp 'tm' válido del archivo de ticks.
-    """
     try:
         if not file_path.exists() or file_path.stat().st_size == 0:
             return None
@@ -112,24 +109,14 @@ def read_last_valid_timestamp(file_path: Path) -> Optional[int]:
 
 
 class StateManager:
-    """
-    Gestor unificado de carga, validación y persistencia atómica de estados de sesión.
-    """
     def __init__(self):
         self.state_dir = STATE_DIR
         self.active_data_dir = ACTIVE_DATA_DIR
-        
-        # Crear directorios de estado si no existen
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("state_manager")
-        
-        # Parámetro de limpieza basado en entorno operativo
         self.max_state_age_days = 7 if OPERATIONAL_MODE == "LIVE" else 14
 
     def save_symbol_state(self, symbol: str, state_data: Dict[str, Any]) -> bool:
-        """
-        Persiste de manera atómica el estado de ticks y contadores de un símbolo.
-        """
         try:
             if "last_sequence" not in state_data:
                 raise ValueError(f"Falta el campo obligatorio 'last_sequence' al intentar persistir el estado de {symbol}")
@@ -139,7 +126,6 @@ class StateManager:
             state_data["saved_by"] = f"pid_{os.getpid()}"
             state_data["environment"] = OPERATIONAL_MODE
             
-            # Delega la escritura atómica segura en el Contract Manager certificado
             save_contract_atomic(state_data, state_file)
             return True
         except Exception as e:
@@ -147,9 +133,6 @@ class StateManager:
             return False
 
     def load_symbol_state(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        Carga el estado de sesión de un símbolo. Si está corrupto, inicia recuperación JSONL.
-        """
         state_file = self.state_dir / f"{symbol}_state.json"
         if state_file.exists():
             try:
@@ -160,7 +143,6 @@ class StateManager:
             except Exception:
                 pass
         
-        # Ejecuta recuperación regresiva si el archivo principal no es válido o falta
         recovered_state = self._recover_from_jsonl(symbol)
         if recovered_state:
             self.save_symbol_state(symbol, recovered_state)
@@ -214,13 +196,8 @@ class StateManager:
         return None
 
     def save_system_state(self, symbol: str, state: str, metrics: Dict[str, Any]) -> bool:
-        """
-        Guarda el estado técnico operativo de un par. 
-        Resuelve el bug histórico de escritura atómica.
-        """
         try:
             state_file = self.state_dir / f"{symbol}_system_state.json"
-            
             data = {
                 "symbol": symbol,
                 "state": state,
@@ -228,8 +205,6 @@ class StateManager:
                 "timestamp": time.time(),
                 "datetime": datetime.now().isoformat()
             }
-            
-            # Corrección del bug: Usamos el escritor atómico certificado
             save_contract_atomic(data, state_file)
             return True
         except Exception as e:

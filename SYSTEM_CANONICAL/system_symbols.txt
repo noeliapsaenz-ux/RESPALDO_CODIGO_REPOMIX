@@ -32,7 +32,7 @@ class SymbolSpecification:
     min_buffer_ready: int    # Ticks mínimos requeridos para habilitar análisis
     is_risk_asset: bool      # Clasificación de activo de riesgo (F3 / Quant)
     is_safe_haven: bool      # Clasificación de activo de refugio seguro (F3 / Quant)
-
+    backpressure_multiplier: float  # Multiplicador canónico para control de flujo
 
 # ==========================================================================
 # REGLA ESTRUCTURAL: TUPLA INMUTABLE DE LOS 10 PARES EN PRODUCCIÓN
@@ -56,46 +56,55 @@ SYMBOLS: Tuple[str, ...] = (
 _CANONICAL_CATALOG: Dict[str, SymbolSpecification] = {
     "EURUSD": SymbolSpecification(
         symbol="EURUSD", digits=5, spread_limit=20.0, buffer_size=5000,
-        min_buffer_ready=500, is_risk_asset=False, is_safe_haven=False
+        min_buffer_ready=500, is_risk_asset=False, is_safe_haven=False,
+        backpressure_multiplier=1.0  # <-- Multiplicadores migrados aquí
     ),
     "GBPUSD": SymbolSpecification(
         symbol="GBPUSD", digits=5, spread_limit=25.0, buffer_size=5000,
-        min_buffer_ready=500, is_risk_asset=True, is_safe_haven=False
+        min_buffer_ready=500, is_risk_asset=True, is_safe_haven=False,
+        backpressure_multiplier=0.9
     ),
     "USDJPY": SymbolSpecification(
         symbol="USDJPY", digits=3, spread_limit=20.0, buffer_size=5000,
-        min_buffer_ready=500, is_risk_asset=False, is_safe_haven=True
+        min_buffer_ready=500, is_risk_asset=False, is_safe_haven=True,
+        backpressure_multiplier=0.9
     ),
     "USDCAD": SymbolSpecification(
         symbol="USDCAD", digits=5, spread_limit=25.0, buffer_size=2000,
-        min_buffer_ready=200, is_risk_asset=False, is_safe_haven=False
+        min_buffer_ready=200, is_risk_asset=False, is_safe_haven=False,
+        backpressure_multiplier=0.4
     ),
     "AUDUSD": SymbolSpecification(
         symbol="AUDUSD", digits=5, spread_limit=25.0, buffer_size=2000,
-        min_buffer_ready=200, is_risk_asset=True, is_safe_haven=False
+        min_buffer_ready=200, is_risk_asset=True, is_safe_haven=False,
+        backpressure_multiplier=0.5
     ),
     "NZDUSD": SymbolSpecification(
         symbol="NZDUSD", digits=5, spread_limit=30.0, buffer_size=1500,
-        min_buffer_ready=150, is_risk_asset=True, is_safe_haven=False
+        min_buffer_ready=150, is_risk_asset=True, is_safe_haven=False,
+        backpressure_multiplier=0.2
     ),
     "GBPJPY": SymbolSpecification(
         symbol="GBPJPY", digits=3, spread_limit=35.0, buffer_size=4000,
-        min_buffer_ready=400, is_risk_asset=True, is_safe_haven=False
+        min_buffer_ready=400, is_risk_asset=True, is_safe_haven=False,
+        backpressure_multiplier=0.8
     ),
     "EURJPY": SymbolSpecification(
         symbol="EURJPY", digits=3, spread_limit=25.0, buffer_size=3000,
-        min_buffer_ready=300, is_risk_asset=True, is_safe_haven=False
+        min_buffer_ready=300, is_risk_asset=True, is_safe_haven=False,
+        backpressure_multiplier=0.7
     ),
     "CHFJPY": SymbolSpecification(
         symbol="CHFJPY", digits=3, spread_limit=30.0, buffer_size=1500,
-        min_buffer_ready=150, is_risk_asset=False, is_safe_haven=False
+        min_buffer_ready=150, is_risk_asset=False, is_safe_haven=False,
+        backpressure_multiplier=0.25
     ),
     "CADJPY": SymbolSpecification(
         symbol="CADJPY", digits=3, spread_limit=30.0, buffer_size=1500,
-        min_buffer_ready=150, is_risk_asset=False, is_safe_haven=False
+        min_buffer_ready=150, is_risk_asset=False, is_safe_haven=False,
+        backpressure_multiplier=0.2
     )
 }
-
 
 # ==========================================================================
 # INTERFAZ DE CONSULTA DE LA CAPA CANÓNICA

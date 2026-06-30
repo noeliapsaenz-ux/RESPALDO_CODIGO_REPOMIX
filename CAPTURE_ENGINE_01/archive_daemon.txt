@@ -1,22 +1,22 @@
 """
 ==========================================================================
-ARCHIVE_DAEMON - Compresión y archivado de datos HFT
+ARCHIVE_DAEMON - Compresión, Verificación e Integridad de Históricos GZIP
 ==========================================================================
-Ubicación: CAPTURE_ENGINE_01
-Dependencias: common_logger, paths, settings, capture_config
-Responsabilidad: Monitorear archivos JSONL inactivos en RAMDisk/SSD,
-                 comprimirlos a GZIP, verificar integridad con SHA256,
-                 y moverlos al archivo seguro (SAFE) o cuarentena.
+Ubicación: CAPTURE_ENGINE_01/archive_daemon.py
+Dependencias:
+    - SYSTEM_SERVICES.system_logger (get_system_logger)
+    - SYSTEM_SERVICES.system_paths (PRIMARY_TICK_DIR, SSD_EVIDENCE_DIR, SAFE_DIR, QUARANTINE_DIR, AUDIT_STATE)
+    - SYSTEM_SERVICES.system_settings (send_telegram_alert)
+    - SYSTEM_CANONICAL.system_sessions (BROKER_TZ)
+    - CAPTURE_ENGINE_01.capture_config (VERIFY_RAMDISK_SSD_MATCH, QUARANTINE_SUFFIX, USAR_RAMDISK)
+Responsabilidad:
+    - Escanear periódicamente los directorios temporales de almacenamiento (RAMDisk/SSD).
+    - Consolidar y comprimir archivos inactivos `.jsonl` a `.gz` utilizando algoritmos no bloqueantes.
+    - Validar mediante SHA-256 la correspondencia binaria exacta entre el bloque primario y su espejo SSD.
+    - Aislar en la cuarentena centralizada (`QUARANTINE`) cualquier archivo corrupto o desalineado.
 ==========================================================================
 """
 import sys
-from pathlib import Path
-
-# Inyección de ruta del directorio superior (Single Source of Truth)
-raiz_proyecto = Path(__file__).parent.parent.resolve()
-if str(raiz_proyecto) not in sys.path:
-    sys.path.insert(0, str(raiz_proyecto))
-
 import argparse
 import asyncio
 import gzip
@@ -27,20 +27,25 @@ import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 
-# Importaciones desacopladas directas
-from common_logger import get_logger as init_logging
-from paths import (
-    HOT_RAM_DIR, SSD_EVIDENCE_DIR, ARCHIVE_SAFE_DIR, 
-    ARCHIVE_QUARANTINE_DIR, STATE_DIR
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_SERVICES.system_paths import (
+    PRIMARY_TICK_DIR as HOT_RAM_DIR,
+    SSD_EVIDENCE_DIR,
+    SAFE_DIR as ARCHIVE_SAFE_DIR, 
+    QUARANTINE_DIR as ARCHIVE_QUARANTINE_DIR,
+    AUDIT_STATE as STATE_DIR
 )
-from settings import USAR_RAMDISK, BROKER_TZ, send_telegram_alert
-from capture_config import VERIFY_RAMDISK_SSD_MATCH, QUARANTINE_SUFFIX
+from SYSTEM_SERVICES.system_settings import send_telegram_alert
+from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
+from CAPTURE_ENGINE_01.capture_config import VERIFY_RAMDISK_SSD_MATCH, QUARANTINE_SUFFIX, USAR_RAMDISK
+
 
 class ArchiveDaemon:
     def __init__(self, check_interval: float = 60.0, max_concurrent_compressions: int = 2):
-        self.logger = init_logging("archive_daemon", "01_CAPTURE_ENGINE")
+        self.logger = get_system_logger("archive_daemon", "01_CAPTURE")
         ARCHIVE_SAFE_DIR.mkdir(parents=True, exist_ok=True)
         ARCHIVE_QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
         self.check_interval = check_interval
@@ -54,11 +59,9 @@ class ArchiveDaemon:
             "errors": 0, "quarantined_files": 0, "last_archive_time": None
         }
         self.logger.info("=" * 70)
-        self.logger.info("🛡️ ARCHIVE DAEMON V2 INICIALIZADO")
+        self.logger.info("🛡️ ARCHIVE DAEMON M3 INICIALIZADO")
         self.logger.info("=" * 70)
 
-    # ... [El resto de los métodos _get_ramdisk_usage, _get_ntp_drift, etc. permanecen sin cambios] ...
-    # ... (Se omite por brevedad, el código interno de compresión es el mismo) ...
     def _get_ramdisk_usage(self) -> dict:
         if not USAR_RAMDISK: return {"space_free_pct": 100.0, "status": "NOT_USED"}
         try:
@@ -244,16 +247,19 @@ class ArchiveDaemon:
     def stop(self):
         self.running = False
 
+
 async def main():
-    parser = argparse.ArgumentParser(description="Archive Daemon V2")
+    parser = argparse.ArgumentParser(description="Archive Daemon V3")
     parser.add_argument("--single-pass", action='store_true', help="Ejecutar un único ciclo de archivado y salir.")
     args = parser.parse_args()
 
     daemon = ArchiveDaemon(check_interval=60.0, max_concurrent_compressions=2)
     await daemon.run(single_pass=args.single_pass)
 
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n🛑 Archive Daemon detenido.")
+        

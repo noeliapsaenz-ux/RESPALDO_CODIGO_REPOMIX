@@ -1,17 +1,21 @@
 """
 ==========================================================================
-MT5_GATEWAY - Conector singleton con MetaTrader 5
+MT5_GATEWAY - Conector Unificado y Reutilizable con MetaTrader 5 (Singleton)
 ==========================================================================
-Ubicación: CAPTURE_ENGINE_01
-Dependencias: settings (MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH)
-Responsabilidad: Mantener una conexión única y reutilizable con la terminal
-                 MT5, gestionar inicialización, login, shutdown, y
-                 proporcionar acceso a símbolos y ticks.
+Ubicación: CAPTURE_ENGINE_01/mt5_gateway.py
+Dependencias:
+    - SYSTEM_SERVICES.system_settings (MT5_LOGIN, MT5_PASSWORD, MT5_SERVER)
+    - MetaTrader5 (API de conectividad nativa en Windows)
+Responsabilidad:
+    - Implementar un Singleton global robusto (`MT5Connection`) que centralice
+      la conexión programática, autenticación de cuentas y liberación del terminal.
+    - Encapsular la lógica de reconexión y provisión de cotizaciones en tiempo real
+      por símbolo de manera segura mediante subprocesos controlados.
+    - Tolerar la ejecución en entornos sin la terminal instalada (fallback defensivo).
 ==========================================================================
 """
-import time
+import os
 import logging
-from pathlib import Path
 from typing import Optional, Any
 
 logger = logging.getLogger("mt5_wrapper")
@@ -25,7 +29,6 @@ except ImportError:
 
 
 class MT5Connection:
-    """Singleton para manejar la conexión global a MT5 con credenciales dinámicas."""
     _instance = None
     _initialized = False
     _connected = False
@@ -44,7 +47,6 @@ class MT5Connection:
         logger.info("✅ MT5Connection singleton creado")
 
     def initialize(self) -> bool:
-        """Inicializa la conexión de MT5 usando credenciales de settings.py."""
         if not MT5_AVAILABLE:
             logger.error("❌ Librería MetaTrader5 no disponible.")
             return False
@@ -54,16 +56,13 @@ class MT5Connection:
             return True
 
         try:
-            from settings import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER, MT5_PATH
+            from SYSTEM_SERVICES.system_settings import MT5_LOGIN, MT5_PASSWORD, MT5_SERVER
             
-            # FORZAR LA RUTA CORRECTA
-            mt5_path = str(MT5_PATH) if MT5_PATH else None
-            
+            mt5_path = os.getenv("MT5_PATH", None)
             logger.info(f"🔌 Inicializando MT5 con ruta: {mt5_path}")
             
-            # Intentar inicializar con la ruta
             if mt5_path:
-                success = mt5.initialize(path=mt5_path)
+                success = mt5.initialize(path=str(mt5_path))
             else:
                 success = mt5.initialize()
 
@@ -72,7 +71,6 @@ class MT5Connection:
                 logger.error(f"❌ Error inicializando terminal MT5: {self._last_error}")
                 return False
 
-            # Validar logueo si existen parámetros definidos
             if MT5_LOGIN and MT5_PASSWORD:
                 login_success = mt5.login(
                     login=int(MT5_LOGIN),
@@ -127,9 +125,8 @@ class MT5Wrapper:
         self.filtro_horario = filtro_horario
         self.low_liquidity_mode = low_liquidity_mode
 
-        # Importar SPREAD_LIMITS desde capture_config
         try:
-            from capture_config import SPREAD_LIMITS
+            from CAPTURE_ENGINE_01.capture_config import SPREAD_LIMITS
         except ImportError:
             SPREAD_LIMITS = {'DEFAULT': 25.0}
             
@@ -144,14 +141,14 @@ class MT5Wrapper:
         self._connection = connection
 
     def initialize_connection(self) -> bool:
-        """Inicializa la conexión con MT5."""
         return self._connection.initialize()
 
     def check_connection(self) -> bool:
         if not self._connection.is_connected() or not MT5_AVAILABLE:
             return False
         try:
-            info = mt5.symbol_info(self.symbol)
+            mt5_lib = self._connection.get_connection()
+            info = mt5_lib.symbol_info(self.symbol)
             if info is None:
                 return False
             return True
@@ -162,7 +159,8 @@ class MT5Wrapper:
         if not self._connection.is_connected() or not MT5_AVAILABLE:
             return None
         try:
-            tick = mt5.symbol_info_tick(self.symbol)
+            mt5_lib = self._connection.get_connection()
+            tick = mt5_lib.symbol_info_tick(self.symbol)
             if tick is None or not hasattr(tick, 'time_msc'):
                 return None
             if tick.bid <= 0 or tick.ask <= 0:
