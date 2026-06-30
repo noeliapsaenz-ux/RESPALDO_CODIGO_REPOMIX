@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 ORCH_LIVE_CAPTURE - Supervisor y Orquestador de Captura HFT
@@ -29,6 +28,8 @@ import time
 import os
 import signal
 import json
+# Se incorpora psutil para evitar NameError en la verificación de procesos vivos
+import psutil
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
 
@@ -60,6 +61,10 @@ from SYSTEM_CANONICAL.system_sessions import BROKER_TZ, classify_session, is_mar
 from SYSTEM_SERVICES.system_logger import get_system_logger
 
 # Importación del universo de captura local
+# NOTA DE INTEGRACIÓN: El módulo capture_config actualmente opera de forma 100% estática 
+# debido a que QUANT_ENGINE_03 aún no genera dynamic_symbol_config.json en el entorno de producción.
+# Por lo tanto, el supervisor de orquestación supervisa parámetros fijos y consistentes con los 
+# catálogos de SYSTEM_CANONICAL.system_symbols.
 from CAPTURE_ENGINE_01.capture_config import SYMBOLS_TO_CAPTURE, USAR_RAMDISK
 
 def init_logging(component: str = "launcher", category: str = "00_ORCHESTRATOR"):
@@ -372,9 +377,10 @@ class SmartLauncher:
             print(f"\n{Fore.CYAN}🔄 {symbol} finalizó de forma controlada — Re-iniciando...")
             return self.start_capturer_smart(symbol)
         
-        reicios = self.restart_count.get(symbol, 0) + 1
-        self.restart_count[symbol] = reicios
-        if reicios > MAX_REINICIOS:
+        # Corrección tipográfica unificando "reicios" a "reinicios" para evitar confusiones
+        reinicios = self.restart_count.get(symbol, 0) + 1
+        self.restart_count[symbol] = reinicios
+        if reinicios > MAX_REINICIOS:
             self.pausado_hasta[symbol] = ahora + BACKOFF_ESPERA_SEG
             self.restart_count[symbol] = 0
             msg = f"{symbol}: {MAX_REINICIOS} caídas detectadas — Captura pausada por {BACKOFF_ESPERA_SEG}s"
@@ -385,7 +391,7 @@ class SmartLauncher:
             return False
             
         print(f"\n{Fore.YELLOW}💀 PROCESO CAÍDO: {symbol} (Exit: {exit_code}, Uptime: {tiempo_vivo:.1f}s)")
-        print(f"{Fore.YELLOW} 🔄 Recuperando de forma asíncrona ({reicios}/{MAX_REINICIOS})...")
+        print(f"{Fore.YELLOW} 🔄 Recuperando de forma asíncrona ({reinicios}/{MAX_REINICIOS})...")
         self.logger.warning(f"💀 {symbol} caído en sesión. Re-lanzando de forma controlada...")
         return self.start_capturer_smart(symbol)
 
@@ -672,11 +678,9 @@ class SmartLauncher:
                 
         self.logger.info("💀 Supervisor finalizado de forma limpia.")
 
-
 def main():
     launcher = SmartLauncher()
     launcher.run()
-
 
 if __name__ == "__main__":
     main()

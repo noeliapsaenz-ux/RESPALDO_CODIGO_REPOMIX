@@ -13,8 +13,12 @@ from enum import Enum
 from typing import Dict, Any
 from dataclasses import dataclass
 
+# Se importa ContractType desde system_states para resolver el Hallazgo 1,
+# eliminando duplicidades y previniendo desalineaciones en la serialización.
+from SYSTEM_CANONICAL.system_states import ContractType
+
 # ==============================================================================
-# 🏛️ ENUMS CANÓNICOS (DEFINICIÓN ÚNICA E INMUTABLE)
+# 🏛️ ENUMS CANÓNICOS ÚNICOS Y REORGANIZADOS
 # ==============================================================================
 
 class SymbolCaptureStatus(str, Enum):
@@ -22,50 +26,16 @@ class SymbolCaptureStatus(str, Enum):
     CONFIABLE = "CONFIABLE"
     NO_CONFIABLE = "NO_CONFIABLE"
 
+
 class DataIntegrity(str, Enum):
     """Validez estructural booleana del archivo físico de ticks."""
     INTEGRO = "INTEGRO"
     CORRUPTO = "CORRUPTO"
 
-class MarketRegime(str, Enum):
-    """Clasificación estadística discreta de precios (Fase 3)."""
-    TRENDING_UP = "TRENDING_UP"
-    TRENDING_DOWN = "TRENDING_DOWN"
-    MEAN_REVERTING_HIGH_VOL = "MEAN_REVERTING_HIGH_VOL"
-    MEAN_REVERTING_LOW_VOL = "MEAN_REVERTING_LOW_VOL"
-    ILLIQUID_STATIC = "ILLIQUID_STATIC"
-
-class MarketActivityState(str, Enum):
-    """Estado operativo oficial del mercado (H-10). Distingue cierre de falla."""
-    ACTIVE = "ACTIVE"
-    INACTIVE_CLOSED_MARKET = "INACTIVE_CLOSED_MARKET"
-    HALTED = "HALTED"
-
-class MarketReadinessStatus(str, Enum):
-    """Viabilidad operativa agregada por símbolo."""
-    READY = "READY"
-    NOT_READY_DATA_GAP = "NOT_READY_DATA_GAP"
-    NOT_READY_HIGH_VOLATILITY = "NOT_READY_HIGH_VOLATILITY"
-    NOT_READY_LOW_LIQUIDITY = "NOT_READY_LOW_LIQUIDITY"
-    NOT_READY_MARKET_CLOSED = "NOT_READY_MARKET_CLOSED"
-
-class DecisionStatus(str, Enum):
-    """Veredicto final imperativo de ejecución."""
-    ALLOW = "ALLOW"
-    DENY = "DENY"
-    VETO = "VETO"
-
-class AuditSeverityLevel(str, Enum):
-    """Severidad dinámica de eventos de auditoría."""
-    INFO = "INFO"
-    WARNING = "WARNING"
-    CRITICAL = "CRITICAL"
-
-class ContractType(str, Enum):
-    """Naturaleza funcional del artefacto JSON en disco."""
-    AUDIT_CERTIFICATE = "AUDIT_CERTIFICATE"
-    QUANT_CERTIFICATE = "QUANT_CERTIFICATE"
-    DECISION_CONTRACT = "DECISION_CONTRACT"
+# NOTA: Los enums MarketRegime, MarketActivityState, MarketReadinessStatus,
+# DecisionStatus y AuditSeverityLevel han sido completamente eliminados de este archivo.
+# Toda consulta a dichos componentes de estado debe realizarse exclusivamente importando 
+# desde SYSTEM_CANONICAL.system_states para mantener una única fuente de verdad.
 
 # ==============================================================================
 # 📦 METADATA ENVELOPE (CABECERA DE GOBERNANZA OBLIGATORIA)

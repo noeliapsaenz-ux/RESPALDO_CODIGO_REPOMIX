@@ -17,7 +17,6 @@ import time
 import logging
 from typing import Dict, Any, Optional
 
-# Consumo de la Capa de Conocimiento unificada (Sin redundancias)
 from SYSTEM_CANONICAL.system_states import SystemState
 from SYSTEM_CANONICAL.system_symbols import get_symbol_specification
 
@@ -41,12 +40,10 @@ class StateMachine:
         self.symbol = symbol.upper()
         self.logger = logging.getLogger(f"state.{self.symbol}")
         
-        # Recuperar especificación técnica directamente del catálogo canónico
         spec = get_symbol_specification(self.symbol)
         self.multiplier = spec.backpressure_multiplier
-        self.min_buffer = spec.buffer_size  # Elimina la duplicidad del buffer hardcoded
+        self.min_buffer = spec.buffer_size
         
-        # Calcular los umbrales adaptativos basados en el multiplicador del canon
         self._dynamic_thresholds = self._calculate_dynamic_thresholds()
         
         self.current_state = SystemState.GREEN

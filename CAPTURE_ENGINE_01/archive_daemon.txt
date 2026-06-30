@@ -21,12 +21,10 @@ import argparse
 import asyncio
 import gzip
 import hashlib
-import json
 import os
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -39,7 +37,8 @@ from SYSTEM_SERVICES.system_paths import (
     AUDIT_STATE as STATE_DIR
 )
 from SYSTEM_SERVICES.system_settings import send_telegram_alert
-from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
+from SYSTEM_CANONICAL.system_sessions import get_current_broker_time
+from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic
 from CAPTURE_ENGINE_01.capture_config import VERIFY_RAMDISK_SSD_MATCH, QUARANTINE_SUFFIX, USAR_RAMDISK
 
 
@@ -126,7 +125,7 @@ class ArchiveDaemon:
 
     def _move_to_quarantine(self, ram_file: Path, ssd_file: Optional[Path], reason: str):
         self.stats["quarantined_files"] += 1
-        timestamp_str = datetime.now(BROKER_TZ).strftime('%H%M%S')
+        timestamp_str = get_current_broker_time().strftime('%H%M%S')
         q_ram_name = f"{ram_file.name}{QUARANTINE_SUFFIX}_{timestamp_str}"
         q_ram_path = ARCHIVE_QUARANTINE_DIR / q_ram_name
         try: shutil.move(str(ram_file), str(q_ram_path))
@@ -235,18 +234,21 @@ class ArchiveDaemon:
                 self._cached_drift = self._get_ntp_drift()
                 self._last_ntp_check = now
             elif not hasattr(self, "_cached_drift"): self._cached_drift = 0.0
-            serializable_stats = {**self.stats, "windows_telemetry": {"ramdisk_health": ram_health, "ntp_drift_ms": getattr(self, "_cached_drift", 0.0)}, "updated_at": datetime.now(BROKER_TZ).isoformat(), "pid": os.getpid()}
-            temp_file = state_file.with_suffix(".tmp")
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(serializable_stats, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            temp_file.replace(state_file)
+            
+            serializable_stats = {
+                **self.stats, 
+                "windows_telemetry": {
+                    "ramdisk_health": ram_health, 
+                    "ntp_drift_ms": getattr(self, "_cached_drift", 0.0)
+                }, 
+                "updated_at": get_current_broker_time().isoformat(), 
+                "pid": os.getpid()
+            }
+            save_contract_atomic(serializable_stats, state_file)
         except Exception as e: self.logger.error(f"Error guardando telemetría del daemon: {e}")
 
     def stop(self):
         self.running = False
-
 
 async def main():
     parser = argparse.ArgumentParser(description="Archive Daemon V3")
@@ -256,10 +258,8 @@ async def main():
     daemon = ArchiveDaemon(check_interval=60.0, max_concurrent_compressions=2)
     await daemon.run(single_pass=args.single_pass)
 
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n🛑 Archive Daemon detenido.")
-        

@@ -19,16 +19,17 @@ Responsabilidad:
 """
 import os
 import json
-from pathlib import Path
 from SYSTEM_SERVICES.system_settings import OPERATIONAL_MODE
-from SYSTEM_SERVICES.system_paths import QUANT_FEEDBACK
-from SYSTEM_CANONICAL.system_symbols import get_symbols, get_symbol_specification
-from SYSTEM_CANONICAL.system_sessions import BROKER_TZ, is_market_open, classify_session
 
-# Recuperar Universo de Símbolos Autorizados desde el Canon
+# NOTA DE INTEGRACIÓN (Hallazgo 2): 
+# Se removió la importación de QUANT_FEEDBACK ya que las anulaciones dinámicas 
+# no están activas en producción para el capturador actual.
+from SYSTEM_CANONICAL.system_symbols import get_symbols, get_symbol_specification
+from SYSTEM_CANONICAL.system_sessions import BROKER_TZ, classify_session
+
 SYMBOLS_TO_CAPTURE = list(get_symbols())
 
-# Extraer límites de spread base desde el catálogo canónico (puntos a pips según especificación)
+# Estructura estática derivada directamente de las especificaciones canónicas de símbolos
 SPREAD_LIMITS = {}
 SYMBOL_CONFIG = {}
 
@@ -37,41 +38,42 @@ for sym in SYMBOLS_TO_CAPTURE:
     SPREAD_LIMITS[sym] = spec.spread_limit
     SYMBOL_CONFIG[sym] = {'buffer_size': spec.buffer_size}
 
-# Parámetros del Demonio de Compresión (Compuerta Forense)
 VERIFY_RAMDISK_SSD_MATCH = True
 QUARANTINE_SUFFIX = ".QUARANTINE_MISMATCH"
 
-# Parámetro global de uso de RAMDisk
 USAR_RAMDISK = os.getenv("USAR_RAMDISK", "TRUE").upper() == "TRUE"
 
-# Ruta para configuración en caliente desde el Workspace de Quant
-DYNAMIC_SYMBOL_CONFIG_PATH = QUANT_FEEDBACK / "dynamic_symbol_config.json"
-
-# Carga dinámica de ajustes en caliente
-if DYNAMIC_SYMBOL_CONFIG_PATH.exists():
-    try:
-        with open(DYNAMIC_SYMBOL_CONFIG_PATH, 'r', encoding='utf-8') as f:
-            dynamic_cfg = json.load(f)
-            for sym, cfg in dynamic_cfg.items():
-                sym = sym.upper()
-                if sym not in SYMBOLS_TO_CAPTURE:
-                    continue
-                
-                # Saneamiento de límites de spread ajustados
-                if "spread_limit_pips" in cfg:
-                    val = float(cfg["spread_limit_pips"])
-                    if 5.0 <= val <= 200.0:
-                        SPREAD_LIMITS[sym] = val
-                
-                # Saneamiento de ajuste del buffer de persistencia
-                if "buffer_adjustment" in cfg and sym in SYMBOL_CONFIG:
-                    factor = float(cfg["buffer_adjustment"])
-                    if 0.1 <= factor <= 10.0:
-                        base_buffer = get_symbol_specification(sym).buffer_size
-                        SYMBOL_CONFIG[sym]['buffer_size'] = int(base_buffer * factor)
-    except Exception:
-        pass
-
+# ==========================================================================
+# 🛑 CONFIGURACIÓN DINÁMICA DE COMENTADO PREVENTIVO (PENDIENTE FASE QUANT_03)
+# ==========================================================================
+# Justificación: QUANT_ENGINE_03 aún no genera dynamic_symbol_config.json en 
+# QUANT_FEEDBACK en este entorno. Activar esta lectura de manera prematura 
+# introduce llamadas I/O no deseadas, efectos colaterales al importar y el 
+# riesgo de fallos silenciosos mitigados por bloques except.
+# El bloque se mantendrá comentado hasta la integración del feedback-loop de la IA.
+#
+# DYNAMIC_SYMBOL_CONFIG_PATH = QUANT_FEEDBACK / "dynamic_symbol_config.json"
+# if DYNAMIC_SYMBOL_CONFIG_PATH.exists():
+#     try:
+#         with open(DYNAMIC_SYMBOL_CONFIG_PATH, 'r', encoding='utf-8') as f:
+#             dynamic_cfg = json.load(f)
+#             for sym, cfg in dynamic_cfg.items():
+#                 sym = sym.upper()
+#                 if sym not in SYMBOLS_TO_CAPTURE:
+#                     continue
+#                 
+#                 if "spread_limit_pips" in cfg:
+#                     val = float(cfg["spread_limit_pips"])
+#                     if 5.0 <= val <= 200.0:
+#                         SPREAD_LIMITS[sym] = val
+#                 
+#                 if "buffer_adjustment" in cfg and sym in SYMBOL_CONFIG:
+#                     factor = float(cfg["buffer_adjustment"])
+#                     if 0.1 <= factor <= 10.0:
+#                         base_buffer = get_symbol_specification(sym).buffer_size
+#                         SYMBOL_CONFIG[sym]['buffer_size'] = int(base_buffer * factor)
+#     except Exception:
+#         pass
 
 def get_optimized_gc_interval() -> int:
     return 60 if USAR_RAMDISK else 45

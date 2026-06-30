@@ -17,10 +17,10 @@ Responsabilidad:
 import time
 import logging
 from typing import Dict, Any, Optional
-from datetime import datetime
 
 from SYSTEM_SERVICES.system_settings import send_telegram_alert
-from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
+from SYSTEM_CANONICAL.system_sessions import get_current_broker_time
+from SYSTEM_CANONICAL.system_states import AUDIT_THRESHOLDS
 
 
 class AlertEngine:
@@ -33,9 +33,10 @@ class AlertEngine:
         self._alert_count = 0
         self._last_alert_type = None
         
-        self.STALL_THRESHOLD = 15.0
+        # Umbrales operativos en sintonía con las advertencias tempranas del sistema
+        self.STALL_THRESHOLD = float(AUDIT_THRESHOLDS.get("max_heartbeat_age_sec", 120) / 8.0) # 15.0s
         self.OVERFLOW_THRESHOLD = 1.0
-        self.LOSS_THRESHOLD = 0.001
+        self.LOSS_THRESHOLD = float(AUDIT_THRESHOLDS.get("max_loss_rate_pct", 0.5)) / 100.0 / 5.0 # 0.001 (0.1%)
         
         self.logger.info(f"✅ AlertEngine iniciado para {self.symbol}")
 
@@ -98,7 +99,7 @@ class AlertEngine:
                     'overflow': f"{overflow_rate:.1f}/s",
                     'loss': f"{loss_rate*100:.2f}%",
                     'slope': f"{slope:.1f} ticks/s",
-                    'time': datetime.now(BROKER_TZ).strftime('%H:%M:%S')
+                    'time': get_current_broker_time().strftime('%H:%M:%S')
                 }
                 
                 full_msg = (f"{alert_msg} | {context['symbol']} @ {context['time']} | "

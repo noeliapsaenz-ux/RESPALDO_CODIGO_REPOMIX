@@ -18,6 +18,8 @@ import os
 import logging
 from typing import Optional, Any
 
+from SYSTEM_CANONICAL.system_sessions import is_market_open
+
 logger = logging.getLogger("mt5_wrapper")
 
 try:
@@ -125,12 +127,13 @@ class MT5Wrapper:
         self.filtro_horario = filtro_horario
         self.low_liquidity_mode = low_liquidity_mode
 
-        try:
-            from CAPTURE_ENGINE_01.capture_config import SPREAD_LIMITS
-        except ImportError:
-            SPREAD_LIMITS = {'DEFAULT': 25.0}
-            
-        base_limit = SPREAD_LIMITS.get(self.symbol, SPREAD_LIMITS.get('DEFAULT', 25.0))
+        # CIERRE (punto 1 pendiente): se consume el límite de spread desde
+        # CAPTURE_ENGINE_01.capture_config.SPREAD_LIMITS — fuente estática
+        # única del capturador — con fallback defensivo al valor canónico
+        # directo por si el símbolo no estuviera precargado en el diccionario.
+        from CAPTURE_ENGINE_01.capture_config import SPREAD_LIMITS
+        from SYSTEM_CANONICAL.system_symbols import get_spread_limit
+        base_limit = SPREAD_LIMITS.get(self.symbol, get_spread_limit(self.symbol))
         self.spread_limit_pips = base_limit * 1.5 if low_liquidity_mode else base_limit
 
         self._last_tick = None
@@ -144,6 +147,17 @@ class MT5Wrapper:
         return self._connection.initialize()
 
     def check_connection(self) -> bool:
+        # CIERRE (punto 2 pendiente): si el filtro horario está activo y el
+        # mercado está cerrado, evitamos también aquí el ping a MT5
+        # (symbol_info), igual que ya hacía get_next_tick(). Se retorna True
+        # —no False— para que el bucle de mt5_tick_engine.py NO dispare la
+        # cascada de reconexión (que asume pérdida real de conexión): el
+        # ciclo sigue su curso normal hacia get_next_tick(), que ya retorna
+        # None de forma silenciosa en este escenario, con el backoff
+        # estándar de "sin tick disponible".
+        if self.filtro_horario and not is_market_open():
+            return True
+
         if not self._connection.is_connected() or not MT5_AVAILABLE:
             return False
         try:
@@ -156,6 +170,13 @@ class MT5Wrapper:
             return False
 
     def get_next_tick(self) -> Optional[Any]:
+        # POLÍTICA DE FILTRADO HORARIO RECOMENDADA:
+        # Se mantiene el parámetro `self.filtro_horario` para control local o ejecución aislada.
+        # En caso de estar habilitado, se delega de manera directa a la autoridad de tiempo 
+        # is_market_open() para evitar llamadas I/O no deseadas a MetaTrader en fines de semana.
+        if self.filtro_horario and not is_market_open():
+            return None
+
         if not self._connection.is_connected() or not MT5_AVAILABLE:
             return None
         try:
