@@ -8,7 +8,8 @@ Dependencias:
     - SYSTEM_SERVICES.system_paths (AUDIT_STATE as STATE_DIR, AUDIT_FLOW as ACTIVE_DATA_DIR, LOGS_DIR)
     - SYSTEM_SERVICES.system_settings (OPERATIONAL_MODE)
     - SYSTEM_CANONICAL.system_sessions (BROKER_TZ)
-    - CAPTURE_ENGINE_01.capture_config (SYMBOL_CONFIG, get_optimized_gc_interval)
+    - SYSTEM_CANONICAL.system_symbols (get_symbol_specification)
+    - CAPTURE_ENGINE_01.capture_config (get_optimized_gc_interval)
     - CAPTURE_ENGINE_01.mt5_gateway (MT5Wrapper, get_mt5_connection)
     - CAPTURE_ENGINE_01.state_persistence (StateManager, read_last_valid_seq)
     - CAPTURE_ENGINE_01.disk_persistence_ledger (TickLedger)
@@ -62,7 +63,8 @@ from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_paths import AUDIT_STATE as STATE_DIR, AUDIT_FLOW as ACTIVE_DATA_DIR, LOGS_DIR
 from SYSTEM_SERVICES.system_settings import OPERATIONAL_MODE
 from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
-from CAPTURE_ENGINE_01.capture_config import SYMBOL_CONFIG, get_optimized_gc_interval
+from SYSTEM_CANONICAL.system_symbols import get_symbol_specification
+from CAPTURE_ENGINE_01.capture_config import get_optimized_gc_interval
 
 from CAPTURE_ENGINE_01.mt5_gateway import MT5Wrapper, get_mt5_connection
 from CAPTURE_ENGINE_01.state_persistence import StateManager, read_last_valid_seq
@@ -91,8 +93,10 @@ class TickCapturerV2:
         self._last_heartbeat = 0
         self._heartbeat_interval = 30
         
-        self.decimals = 3 if "JPY" in self.symbol else 5
-        self.multiplier = 100.0 if "JPY" in self.symbol else 10000.0
+        # Obtener especificación canónica del símbolo (fuente única de verdad)
+        self.symbol_spec = get_symbol_specification(self.symbol)
+        self.decimals = self.symbol_spec.digits
+        self.multiplier = 10.0 ** self.decimals
         
         gc.set_threshold(70000, 10, 5)
         self.last_gc_collect = time.time()
@@ -148,8 +152,9 @@ class TickCapturerV2:
         else:
             self.logger.info("Sin histórico de contadores métricos para este símbolo. Iniciando en cero.")
             
-        _dynamic_buffer = SYMBOL_CONFIG.get(self.symbol, {}).get('buffer_size', 2000)
-        self.ledger = TickLedger(self.symbol, max_buffer_size=_dynamic_buffer)
+        # Usar buffer_size canónico directamente desde la especificación del símbolo
+        _canonical_buffer = self.symbol_spec.buffer_size
+        self.ledger = TickLedger(self.symbol, max_buffer_size=_canonical_buffer)
         
         self.state_machine = StateMachine(self.symbol)
         self.slope_monitor = SlopeMonitor(self.symbol)
