@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 REGIME SEQUENCE TRACKER - ENRIQUECIMIENTO SECUENCIAL DEL RÉGIMEN
@@ -10,26 +9,23 @@ Responsabilidad: Enriquecer el market_state.parquet dentro de bars con
 ==========================================================================
 """
 import sys
+import argparse
 from pathlib import Path
+import pandas as pd
+import numpy as np
 
+# Inyección dinámica de la raíz del proyecto para resolver dependencias
 root_path = Path(__file__).resolve().parents[1]
 if str(root_path) not in sys.path:
     sys.path.insert(0, str(root_path))
 
-import argparse
-import pandas as pd
-import numpy as np
-from datetime import datetime
+# Imports directos desde las capas unificadas del sistema
+from SYSTEM_CANONICAL.system_symbols import get_symbols, get_spread_limit
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_SERVICES.system_paths import QUANT_BARS
+from SYSTEM_SERVICES.system_logger import get_system_logger
 
-from quant_config import (
-    QUANT_BARS_DIR,
-    SPREAD_LIMITS,
-    BROKER_TZ,
-    SYMBOLS_TO_QUANT,
-    init_quant_logging
-)
-
-logger = init_quant_logging("regime_sequence_tracker", "03_QUANT")
+logger = get_system_logger("regime_sequence_tracker", "03_QUANT")
 
 ANOMALY_VOL_THRESHOLD = 0.08
 SPREAD_EXTREME_MULTIPLIER = 1.5
@@ -65,7 +61,7 @@ def calculate_regime_age(df: pd.DataFrame) -> pd.Series:
 
 def calculate_minutes_since_anomalous(df: pd.DataFrame, symbol: str) -> pd.Series:
     if df.empty: return pd.Series([9999] * len(df), index=df.index)
-    limit = SPREAD_LIMITS.get(symbol, SPREAD_LIMITS.get('DEFAULT', 30.0))
+    limit = get_spread_limit(symbol)
     is_anomalous = pd.Series([False] * len(df), index=df.index)
     if 'minute_state' in df.columns:
         is_anomalous |= (df['minute_state'] == 'NEWS_LIKE')
@@ -143,7 +139,7 @@ def calculate_liquidity_changes(df: pd.DataFrame) -> pd.Series:
 
 def enrich_market_state(symbol: str, fecha: str) -> bool:
     symbol = symbol.upper()
-    state_file = QUANT_BARS_DIR / symbol / f"{symbol}_{fecha}_market_state.parquet"
+    state_file = QUANT_BARS / symbol / f"{symbol}_{fecha}_market_state.parquet"
     
     if not state_file.exists():
         logger.warning(f"⚠️ {symbol}: Parquet de estado ausente para {fecha}.")
@@ -162,8 +158,10 @@ def enrich_market_state(symbol: str, fecha: str) -> bool:
         
         temp_file = state_file.with_suffix(".tmp.parquet")
         df.to_parquet(temp_file, index=False)
-        temp_file.replace(state_file)
-        logger.info(f"✅ {symbol}: Enriquecimiento secuencial completado en bars.")
+        import os
+        if temp_file.exists():
+            os.replace(temp_file, state_file)
+        logger.info(f"✅ {symbol}: Enriquecimiento secuencial completado.")
         return True
     except Exception as e:
         logger.error(f"❌ {symbol}: Error enriqueciendo bars: {e}")
@@ -173,10 +171,10 @@ def main():
     parser = argparse.ArgumentParser(description="Regime Sequence Tracker V1.0")
     parser.add_argument("--date", type=str, default="latest")
     args = parser.parse_args()
-    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
     logger.info(f"🚀 Iniciando enriquecimiento secuencial de bars - FECHA: {fecha}")
-    enriched = sum(1 for s in SYMBOLS_TO_QUANT if enrich_market_state(s, fecha))
-    logger.info(f"📋 Enriquecidos: {enriched}/{len(SYMBOLS_TO_QUANT)} snapshots en bars.")
+    enriched = sum(1 for s in get_symbols() if enrich_market_state(s, fecha))
+    logger.info(f"📋 Enriquecidos: {enriched}/{len(get_symbols())} snapshots en bars.")
 
 if __name__ == "__main__":
     main()

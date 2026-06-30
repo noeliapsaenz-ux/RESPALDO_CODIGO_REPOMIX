@@ -25,7 +25,8 @@ from SYSTEM_CANONICAL.system_states import ContractType
 SCHEMA_VERSIONS: Dict[str, str] = {
     ContractType.AUDIT.value: "2.0",       # audit_execution_contract (F2)
     ContractType.PORTFOLIO.value: "2.0",   # portfolio_execution_contract (F3)
-    ContractType.EXECUTION.value: "3.0"    # decision_contract (F4)
+    ContractType.EXECUTION.value: "3.0",   # <-- SE AGREGÓ LA COMA AQUÍ
+    ContractType.READINESS.value: "2.0"    # readiness_report (F3 interna)
 }
 
 # Constantes de versión globales para compatibilidad del Motor de Auditoría

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 SYSTEM_CANONICAL - SYSTEM_STATES (ENUMERADORES Y CONFIGURACIONES DE CONTROL)
@@ -6,12 +5,9 @@ SYSTEM_CANONICAL - SYSTEM_STATES (ENUMERADORES Y CONFIGURACIONES DE CONTROL)
 Ubicación: SYSTEM_CANONICAL/system_states.py
 Responsabilidad: Centralizar los enumeradores de estado operativos, de calidad
                  y los umbrales numéricos de control del sistema.
-                 - No realiza operaciones de entrada/salida (I/O).
-                 - Libre de dependencias externas.
 ==========================================================================
 """
 from enum import Enum
-
 
 class CaptureProcessState(str, Enum):
     """Estados operativos de la ejecución física del hilo/proceso del capturador."""
@@ -20,7 +16,6 @@ class CaptureProcessState(str, Enum):
     STOPPED = "STOPPED"
     ERROR = "ERROR"
 
-
 class DatasetQuality(str, Enum):
     """Clasificación de la calidad e integridad de un archivo o lote de ticks."""
     MAESTRO = "MAESTRO"          # Datos crudos validados y ordenados
@@ -28,14 +23,12 @@ class DatasetQuality(str, Enum):
     QUARANTINE = "QUARANTINE"    # Datos con anomalías de secuencia o reloj
     CORRUPTED = "CORRUPTED"      # Datos ilegibles o dañados estructuralmente
 
-
 class AuditSeverityLevel(str, Enum):
     """Niveles de gravedad utilizados en las bitácoras y contratos de auditoría."""
     INFO = "INFO"
     WARNING = "WARNING"
     CRITICAL = "CRITICAL"
     FATAL = "FATAL"
-
 
 class MarketRegime(str, Enum):
     """Clasificación estadística discreta de precios (Estructura de Mercado)."""
@@ -45,20 +38,17 @@ class MarketRegime(str, Enum):
     MEAN_REVERTING_LOW_VOL = "MEAN_REVERTING_LOW_VOL"
     ILLIQUID_STATIC = "ILLIQUID_STATIC"
 
-
 class MarketActivityState(str, Enum):
     """Estados de actividad comercial generales del broker."""
     OPEN = "OPEN"
     CLOSED = "CLOSED"
     HOLIDAY = "HOLIDAY"
 
-
 class MarketReadinessStatus(str, Enum):
     """Evaluación de aptitud de un par para ser operado por el motor de quant."""
     OPERABLE = "OPERABLE"        # Cumple con requisitos de FCI y spread
     VETOED = "VETOED"            # Vetado operacionalmente por baja confianza
     INSUFFICIENT_DATA = "INSUFFICIENT_DATA"  # No hay suficientes ticks para análisis
-
 
 class DecisionStatus(str, Enum):
     """Estado de resolución de una propuesta de ejecución."""
@@ -67,14 +57,13 @@ class DecisionStatus(str, Enum):
     PASS = "PASS"                # Señal descartada / sin operación
     PENDING_REVIEW = "PENDING_REVIEW" # Requiere revisión humana
 
-
 class ContractType(str, Enum):
     """Tipos de contratos estructurados que se guardan en el sistema."""
     AUDIT = "audit_execution_contract"
     PORTFOLIO = "portfolio_execution_contract"
     EXECUTION = "decision_contract"
     LEARNING = "learning_contract"
-
+    READINESS = "readiness_report"  # Oficialización del reporte interno de Fase 3
 
 class SystemState(str, Enum):
     """Estado técnico operativo de presión en la adquisición de datos."""
@@ -83,27 +72,23 @@ class SystemState(str, Enum):
     ORANGE = "ORANGE"
     RED = "RED"
 
-
 # ==========================================================================
 # MAPPING CANÓNICO DE ESQUEMA DE TICKS (Optimización de espacio HFT)
 # ==========================================================================
-# Define la equivalencia oficial entre las claves ultra-cortas usadas en disco
-# y los nombres descriptivos de negocio de las variables de mercado.
 TICK_SCHEMA_MAPPING = {
-    "tm": "timestamp_msc",      # Unix Epoch en milisegundos del broker
-    "b": "bid",                 # Precio de venta (Bid) normalizado
-    "a": "ask",                 # Precio de compra (Ask) normalizado
-    "sp": "spread_pips",        # Spread en puntos/pips enteros del broker
-    "rs": "raw_spread",         # Spread en valor flotante real
-    "mp": "mid_price",          # Precio medio (Bid + Ask) / 2
-    "l": "last",                # Último precio transaccionado (si aplica)
-    "v": "volume_real",         # Volumen transaccional real (si aplica)
-    "f": "flags",               # Banderas de origen del tick (MT5)
-    "seq": "sequence",          # ID correlativo único de secuencia
-    "recv_ts": "received_ts",   # Timestamp local de recepción (milisegundos)
-    "sf": "spread_filter_flag"  # Bandera booleana de spread excedido (opcional)
+    "tm": "timestamp_msc",
+    "b": "bid",
+    "a": "ask",
+    "sp": "spread_pips",
+    "rs": "raw_spread",
+    "mp": "mid_price",
+    "l": "last",
+    "v": "volume_real",
+    "f": "flags",
+    "seq": "sequence",
+    "recv_ts": "received_ts",
+    "sf": "spread_filter_flag"
 }
-
 
 # ==========================================================================
 # UMBRALES DE VETO, AUDITORÍA Y CONTROL DE RIESGOS (F2-F3)
@@ -111,7 +96,6 @@ TICK_SCHEMA_MAPPING = {
 VETO_FCI_THRESHOLD = 70.0          # Por debajo de este FCI, el símbolo es NO_CONFIABLE
 VETO_QUALITY_THRESHOLD = 50.0      # Calidad mínima vectorial admitida para GOLD
 
-# Pesos de Confianza Consolidada para Auditoría y Análisis
 CONFIDENCE_WEIGHTS = {
     "fci": 0.60,
     "profile": 0.40,
@@ -122,11 +106,10 @@ CONFIDENCE_WEIGHTS = {
     "overall": 0.20
 }
 
-# Umbrales de Auditoría Forense y Tolerancia Sistémica
 AUDIT_THRESHOLDS = {
-    "max_loss_rate_pct": 0.5,          # Tasa máxima de pérdida de secuencias (0.5%)
-    "max_seq_gap": 10,                 # Gap máximo tolerado sin cuarentena
-    "max_heartbeat_age_sec": 120,      # Tiempo máximo sin ticks en horario activo
+    "max_loss_rate_pct": 0.5,
+    "max_seq_gap": 10,
+    "max_heartbeat_age_sec": 120,
     "min_gold_percentage": 5.0,
     "max_gold_percentage": 100.0,
     "completitud_minima": 70.0,
@@ -134,10 +117,55 @@ AUDIT_THRESHOLDS = {
     "confidence_minima": 40.0
 }
 
-# Umbrales para clasificación estadística de regímenes de volatilidad
 VOLATILITY_THRESHOLDS = {
     "QUIET": 0.7,
     "NORMAL": 1.3,
     "ACTIVE": 2.0,
     "EXPLOSIVE": 3.0
 }
+
+# ==========================================================================
+# ⚖️ CONSTANTES CUANTITATIVAS ADICIONALES INTEGRADAS (F3)
+# ==========================================================================
+READINESS_THRESHOLDS = {
+    "min_trade_readiness": 70.0,
+    "min_bars_sample_correlation": 30,
+    "fci_min_scalping": 85.0,
+    "fci_min_intraday": 70.0,
+    "fci_min_swing": 55.0,
+    "spread_score_min_scalping": 50.0,
+    "spread_score_min_intraday": 45.0,
+    "spread_score_min_swing": 40.0
+}
+
+READINESS_STYLE_WEIGHTS = {
+    "scalping": {
+        "spread": 0.40, "execution": 0.30, "volatility": 0.10, "anomaly": 0.20
+    },
+    "intraday": {
+        "spread": 0.20, "execution": 0.20, "volatility": 0.30, "anomaly": 0.30
+    },
+    "swing": {
+        "spread": 0.10, "execution": 0.10, "volatility": 0.35, "anomaly": 0.15, "persistence": 0.30
+    }
+}
+
+STYLE_VETO_RULES = {
+    "scalping": {"fci_min": 85.0, "spread_score_min": 50.0},
+    "intraday": {"fci_min": 70.0, "spread_score_min": 45.0},
+    "swing": {
+        "fci_min": 55.0, "spread_score_min": 40.0,
+        "trend_persistence_min": 55.0, "anomaly_max_level": "EXTREME"
+    }
+}
+
+ANOMALY_CONFIG = {
+    "windows_days": [7, 30, 90],
+    "ewma_lambda": 0.92,
+    "cold_start_score": 50.0,
+    "defensive_mode_min_assets": 3,
+    "defensive_multiplier": 1.25,
+    "p_value_alpha_limit": 0.05
+}
+
+LOOKBACK_DAYS = 30

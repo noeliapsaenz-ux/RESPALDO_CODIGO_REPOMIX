@@ -3,7 +3,7 @@
 RECOVERY FORENSICS - AUDITORÍA FORENSE DE RECUPERACIÓN POST-INCIDENTE
 ==========================================================================
 Ubicación: AUDIT_ENGINE_02
-Dependencias: audit_config (paths, symbols, logging, contracts)
+Dependencias: SYSTEMS(paths, symbols, logging, contracts)
 Responsabilidad: Auditar la continuidad de SEQ después de un incidente.
                  Detecta reinicios desde cero, saltos, duplicados y gaps.
 ==========================================================================

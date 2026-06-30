@@ -3,10 +3,9 @@
 ORCH_AUDIT - ORQUESTADOR DE AUDITORÍA FORENSE (FASE 2)
 ==========================================================================
 Ubicación: CARPETA_RAIZ (PYTHON_MT5)
-Dependencias: audit_config (paths, logging, contracts, settings)
-Responsabilidad: Ejecutar secuencialmente y bajo un aislamiento de fallos
-                 los módulos de auditoría forense y de reportes.
-                 Coordina la ejecución de todos los scripts de la Fase 2.
+Descripción: Ejecuta secuencialmente y bajo un aislamiento de fallos
+             los módulos de auditoría forense y de reportes.
+             Coordina la ejecución de todos los scripts de la Fase 2.
 ==========================================================================
 """
 import sys
@@ -24,26 +23,25 @@ import os
 import argparse
 from datetime import datetime, timezone
 
-# Importación desde audit_config (módulo de auditoría)
-from AUDIT_ENGINE_02.audit_config import (
-    AUDIT_STATE_DIR,
-    AUDIT_REPORTES_DIR,
-    get_fecha_broker_str,
-    init_audit_logging,
-    send_telegram_alert,
+# Importaciones oficiales del sistema centralizado (Ontología y Servicios Canónicos)
+from SYSTEM_SERVICES.system_paths import (
+    AUDIT_STATE as AUDIT_STATE_DIR,
+    AUDIT_REPORTS as AUDIT_REPORTES_DIR,
+    SSD_EVIDENCE_DIR
+)
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_SERVICES.system_settings import send_telegram_alert
+from SYSTEM_CONTRACTS.contract_manager import (
     save_contract_atomic,
     create_audit_contract_template
 )
 
-# Importación desde paths para SSD_EVIDENCE_DIR
-from paths import SSD_EVIDENCE_DIR
-
 # Inicializar logger con categoría de orquestador
-logger = init_audit_logging("orch_audit", "00_ORCHESTRATOR")
-
+logger = get_system_logger("orch_audit", "00_ORCHESTRATOR")
 
 # =============================================================================
-# CADENA DE EJECUCIÓN - FASE 2
+# CADENA DE EJECUCIÓN - FASE 2 (FILTRADA Y NORMALIZADA)
 # =============================================================================
 SCRIPTS_FASE_2 = [
     {"folder": "AUDIT_ENGINE_02", "name": "fci_evidence_calculator.py", "desc": "Reconciliación de Evidencia Física (FCI)"},
@@ -53,10 +51,8 @@ SCRIPTS_FASE_2 = [
     {"folder": "AUDIT_ENGINE_02", "name": "market_descriptive_stats.py", "desc": "Perfilado de Microestructura de Mercado"},
     {"folder": "AUDIT_ENGINE_02", "name": "crypto_lineage_auditor.py", "desc": "Trazabilidad Criptográfica (JSONL -> Gold)"},
     {"folder": "AUDIT_ENGINE_02", "name": "trust_score_consolidator.py", "desc": "Consolidador Unificado de Calidad (Trust Score)"},
-    {"folder": "AUDIT_ENGINE_02", "name": "historical_persistence.py", "desc": "Persistencia Histórica y Bitácora Forense"},
-    {"folder": "REPORT_ENGINE_04", "name": "audit_report_engine.py", "desc": "Generador de Reporte Ejecutivo Word"}
+    {"folder": "AUDIT_ENGINE_02", "name": "historical_persistence.py", "desc": "Persistencia Histórica y Bitácora Forense"}
 ]
-
 
 def get_adaptive_timeout(fecha: str) -> int:
     """
@@ -86,7 +82,6 @@ def get_adaptive_timeout(fecha: str) -> int:
     except Exception as e:
         logger.warning(f"⚠️ No se pudo calcular el timeout adaptativo ({e}). Se asignará valor base de {base_timeout}s.")
         return base_timeout
-
 
 def run_phase_script(folder: str, script_name: str, fecha: str, timeout: int) -> bool:
     """
@@ -137,7 +132,6 @@ def run_phase_script(folder: str, script_name: str, fecha: str, timeout: int) ->
         logger.error(f"❌ Excepción ejecutando {script_name}: {e}")
         return False
 
-
 def generate_execution_contract(fecha: str):
     """
     Genera el contrato de ejecución para la Fase 3, con esquema versionado.
@@ -163,7 +157,6 @@ def generate_execution_contract(fecha: str):
             conf = item.get("confidence", 0)
             contracts[sym] = {"status": status, "confidence": conf}
 
-        # Usar funciones desde audit_config
         contract_data = create_audit_contract_template(fecha, contracts)
         save_contract_atomic(contract_data, contract_path)
 
@@ -172,7 +165,6 @@ def generate_execution_contract(fecha: str):
 
     except Exception as e:
         logger.error(f"❌ Error generando contrato de auditoría: {e}")
-
 
 def send_audit_summary_telegram(fecha: str, results: dict, elapsed: float):
     """
@@ -196,7 +188,6 @@ def send_audit_summary_telegram(fecha: str, results: dict, elapsed: float):
     ]
     send_telegram_alert("\n".join(msg_lines))
 
-
 def main():
     parser = argparse.ArgumentParser(description="Orch Audit - Pipeline Orchestrator Fase 2")
     parser.add_argument("--date", type=str, default="latest",
@@ -214,16 +205,16 @@ def main():
     start_time = time.time()
     results = {}
 
-    # Calibrar timeout adaptativo
+    # Calibrar timeout adaptativo basado en peso físico de ticks
     timeout = get_adaptive_timeout(fecha)
 
     for script_info in SCRIPTS_FASE_2:
         folder, name = script_info["folder"], script_info["name"]
         results[name] = run_phase_script(folder, name, fecha, timeout)
 
-        # Puntos de control críticos
+        # Puntos de control críticos de infraestructura
         if not results[name] and name in ["fci_evidence_calculator.py", "market_etl.py", "trust_score_consolidator.py"]:
-            logger.critical(f"❌ FALLO CRÍTICO en {name}. Abortando pipeline de auditoría.")
+            logger.critical(f"❌ FALLO CRÍTICO en {name}. Abortando pipeline de auditoría de inmediato.")
             break
 
     generate_execution_contract(fecha)

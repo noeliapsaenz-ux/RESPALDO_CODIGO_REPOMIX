@@ -4,42 +4,42 @@
 ORCH_INTELLIGENCE - ORQUESTADOR DEL PIPELINE DE INTELIGENCIA (FASE 3)
 ==========================================================================
 Ubicación: CARPETA_RAIZ (PYTHON_MT5)
-Dependencias: quant_config (paths, logging, settings)
+Dependencias: SYSTEM_CANONICAL, SYSTEM_SERVICES
 Responsabilidad: Secuenciar la ejecución ordenada de los módulos de la
-                 fase operativa (Fase 3), controlando fallos críticos.
+                 fase operativa cuantitativa, controlando fallos críticos.
 ==========================================================================
 """
 import sys
 from pathlib import Path
-
-# Garantizar la resolución de rutas dinámicas de la raíz
-raiz_proyecto = Path(__file__).parent.resolve()
-if str(raiz_proyecto) not in sys.path:
-    sys.path.insert(0, str(raiz_proyecto))
-
-# Asegurar que la carpeta QUANT_ENGINE_03 esté en el path para importaciones
-quant_path = raiz_proyecto / "QUANT_ENGINE_03"
-if str(quant_path) not in sys.path:
-    sys.path.insert(0, str(quant_path))
-
 import subprocess
 import time
 import os
 import argparse
-from datetime import datetime
+import atexit
 
-# Importación desde quant_config (ahora en el path)
-from quant_config import (
-    BROKER_TZ,
-    get_fecha_broker_str,
-    init_quant_logging,
-    send_telegram_alert
-)
+# Garantizar la resolución de rutas dinámicas de la raíz del proyecto
+raiz_proyecto = Path(__file__).parent.resolve()
+if str(raiz_proyecto) not in sys.path:
+    sys.path.insert(0, str(raiz_proyecto))
 
-# Inicializar logger
-logger = init_quant_logging("orch_intelligence", "00_ORCHESTRATOR")
+# Asegurar que la carpeta QUANT_ENGINE_03 esté en el path para importaciones locales
+quant_path = raiz_proyecto / "QUANT_ENGINE_03"
+if str(quant_path) not in sys.path:
+    sys.path.insert(0, str(quant_path))
 
-# Cadena de ejecución secuencial ordenada de dependencias
+# Imports directos de las capas de control y servicios unificados
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str, BROKER_TZ
+from SYSTEM_SERVICES.system_logger import get_system_logger, stop_logger_listener
+from SYSTEM_SERVICES.system_settings import send_telegram_alert
+from SYSTEM_SERVICES.system_paths import SSD_EVIDENCE_DIR
+
+# Inicializar logger de orquestación centralizada
+logger = get_system_logger("orch_intelligence", "00_ORCHESTRATOR")
+
+# Registrar el apagado seguro del logger para evitar pérdidas de logs en colas asíncronas
+atexit.register(stop_logger_listener)
+
+# Cadena de ejecución secuencial depurada (Se elimina quant_report_engine)
 OPERATIONAL_PIPELINE = [
     {"folder": "AUDIT_ENGINE_02", "file": "market_etl.py", "desc": "Feature Engine Nivel 0 (ETL Maestros & GOLD)", "critical": True},
     {"folder": "QUANT_ENGINE_03", "file": "market_state_builder.py", "desc": "Snapshooter Multidimensional del Estado de Mercado", "critical": True},
@@ -49,16 +49,13 @@ OPERATIONAL_PIPELINE = [
     {"folder": "QUANT_ENGINE_03", "file": "multidimensional_anomaly.py", "desc": "Detector de Anomalías Multidimensional", "critical": False},
     {"folder": "QUANT_ENGINE_03", "file": "market_readiness_engine.py", "desc": "Motor de Gobernanza y Readiness de Activos", "critical": True},
     {"folder": "QUANT_ENGINE_03", "file": "portfolio_composer.py", "desc": "Optimización Combinatoria de Portafolio", "critical": True},
-    {"folder": "QUANT_ENGINE_03", "file": "quant_validator.py", "desc": "Certificación de Coherencia Matemática", "critical": True},
-    {"folder": "REPORT_ENGINE_04", "file": "quant_report_engine.py", "desc": "Generador de Reporte Ejecutivo Word (F3)", "critical": False}
+    {"folder": "QUANT_ENGINE_03", "file": "quant_validator.py", "desc": "Certificación de Coherencia Matemática", "critical": True}
 ]
 
-
 def get_adaptive_timeout(fecha: str) -> int:
-    """Calcula dinámicamente el tiempo límite de ejecución según el volumen en disco."""
+    """Calcula dinámicamente el tiempo límite de ejecución según el volumen en disco de evidencias."""
     base_timeout = 600
     try:
-        from paths import SSD_EVIDENCE_DIR
         total_bytes = 0
         if SSD_EVIDENCE_DIR.exists():
             for p in SSD_EVIDENCE_DIR.rglob(f"*{fecha}*"):
@@ -71,7 +68,6 @@ def get_adaptive_timeout(fecha: str) -> int:
         return total_timeout
     except Exception:
         return base_timeout
-
 
 def ejecutar_script_pipeline(folder: str, script_name: str, fecha: str, timeout: int = 600) -> bool:
     script_path = raiz_proyecto / folder / script_name
@@ -95,8 +91,8 @@ def ejecutar_script_pipeline(folder: str, script_name: str, fecha: str, timeout:
             logger.info(f"✅ {script_name} finalizado con éxito.")
             return True
         else:
-            stderr_summary = result.stderr[-400:] if result.stderr else "Sin detalles."
-            logger.error(f"❌ {script_name} devolvió código {result.returncode}.\nDetalle:\n{stderr_summary}")
+            stderr_summary = result.stderr[-800:] if result.stderr else "Sin detalles de error en el buffer de salida."
+            logger.error(f"❌ {script_name} devolvió código de error {result.returncode}.\nDetalle del error:\n{stderr_summary}")
             return False
     except subprocess.TimeoutExpired:
         logger.critical(f"🛑 TIMEOUT: {script_name} excedió el tiempo máximo de {timeout}s.")
@@ -105,21 +101,24 @@ def ejecutar_script_pipeline(folder: str, script_name: str, fecha: str, timeout:
         logger.error(f"❌ Error inesperado ejecutando {script_name}: {e}")
         return False
 
-
 def send_intelligence_summary_telegram(fecha: str, results: dict, elapsed: float):
     passed = sum(1 for v in results.values() if "PASS" in str(v))
     total = len(OPERATIONAL_PIPELINE)
     status_icon = "✅" if passed == total else "⚠️"
     
     msg_lines = [
-        f"{status_icon} *FASE 3 — INTELIGENCIA COMPLETADA*",
+        f"{status_icon} *FASE 3 — INTELIGENCIA OPERACIONAL COMPLETADA*",
         f"📅 Fecha: `{fecha}`",
-        f"📊 *Resumen de ejecución:*",
-        f"   • Módulos completados: {passed}/{total}",
-        f"   • Tiempo total: {elapsed:.1f}s",
+        f"📊 *Resumen de ejecución de módulos:*",
     ]
+    for script, status in results.items():
+        msg_lines.append(f"   • `{script}`: {status}")
+        
+    msg_lines.extend([
+        f"⏱️ Tiempo total de ejecución: {elapsed:.1f}s",
+        f"📊 Pasos completados: {passed}/{total}"
+    ])
     send_telegram_alert("\n".join(msg_lines))
-
 
 def main():
     parser = argparse.ArgumentParser(description="Operational Pipeline Orchestrator")
@@ -137,45 +136,49 @@ def main():
     results = {}
     abort_pipeline = False
     
-    timeout = get_adaptive_timeout(fecha)
-    
-    for step in OPERATIONAL_PIPELINE:
-        folder, name, desc, is_critical = step["folder"], step["file"], step["desc"], step["critical"]
+    try:
+        timeout = get_adaptive_timeout(fecha)
         
-        if abort_pipeline:
-            logger.warning(f"⏩ OMITIDO: {name} ({desc}) debido a fallo crítico previo.")
-            results[name] = "OMITIDO"
-            continue
+        for step in OPERATIONAL_PIPELINE:
+            folder, name, desc, is_critical = step["folder"], step["file"], step["desc"], step["critical"]
+            
+            if abort_pipeline:
+                logger.warning(f"⏩ OMITIDO: {name} ({desc}) debido a fallo crítico previo.")
+                results[name] = "OMITIDO"
+                continue
 
-        step_start = time.time()
-        success = ejecutar_script_pipeline(folder, name, fecha, timeout)
-        step_elapsed = time.time() - step_start
+            step_start = time.time()
+            success = ejecutar_script_pipeline(folder, name, fecha, timeout)
+            step_elapsed = time.time() - step_start
+            
+            if success:
+                results[name] = f"PASS ({step_elapsed:.1f}s)"
+            else:
+                results[name] = f"FAIL ({step_elapsed:.1f}s)"
+                if is_critical:
+                    logger.critical(f"🛑 FALLO CRÍTICO en '{name}' ({desc}). El orquestador detendrá el pipeline.")
+                    abort_pipeline = True
+                    
+        elapsed_total = time.time() - start_time
+        passed_steps = sum(1 for v in results.values() if "PASS" in str(v))
+        total_steps = len(OPERATIONAL_PIPELINE)
         
-        if success:
-            results[name] = f"PASS ({step_elapsed:.1f}s)"
-        else:
-            results[name] = f"FAIL ({step_elapsed:.1f}s)"
-            if is_critical:
-                logger.critical(f"🛑 FALLO CRÍTICO en '{name}' ({desc}). El pipeline se detendrá.")
-                abort_pipeline = True
-                
-    elapsed_total = time.time() - start_time
-    passed_steps = sum(1 for v in results.values() if "PASS" in str(v))
-    total_steps = len(OPERATIONAL_PIPELINE)
-    
-    logger.info("=" * 80)
-    logger.info(f"📋 RESUMEN EJECUTIVO FASE 3 - FECHA: {fecha}")
-    logger.info("=" * 80)
-    for script, status in results.items():
-        logger.info(f"  • {script:25} : {status}")
-    logger.info("-" * 70)
-    logger.info(f"⏱️ Tiempo total: {elapsed_total:.1f}s.")
-    logger.info(f"📊 Pasos completados: {passed_steps}/{total_steps}")
-    logger.info("=" * 80)
+        logger.info("=" * 80)
+        logger.info(f"📋 RESUMEN EJECUTIVO FASE 3 - FECHA: {fecha}")
+        logger.info("=" * 80)
+        for script, status in results.items():
+            logger.info(f"  • {script:25} : {status}")
+        logger.info("-" * 70)
+        logger.info(f"⏱️ Tiempo total: {elapsed_total:.1f}s.")
+        logger.info(f"📊 Pasos completados: {passed_steps}/{total_steps}")
+        logger.info("=" * 80)
 
-    if args.send_telegram:
-        send_intelligence_summary_telegram(fecha, results, elapsed_total)
-
+        if args.send_telegram:
+            send_intelligence_summary_telegram(fecha, results, elapsed_total)
+            
+    finally:
+        # Forzar el drenado y apagado del logger asíncrono antes de salir de la consola
+        stop_logger_listener()
 
 if __name__ == "__main__":
     main()

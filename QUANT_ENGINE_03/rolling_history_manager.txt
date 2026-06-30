@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 ROLLING HISTORY MANAGER - ADMINISTRADOR DE PERSISTENCIA HISTÓRICA
@@ -11,31 +10,28 @@ Responsabilidad: Tomar las barras de 1 minuto generadas diariamente en bars,
 ==========================================================================
 """
 import sys
+import argparse
 from pathlib import Path
+import pandas as pd
+import numpy as np
 
+# Inyección dinámica de la raíz del proyecto para resolver dependencias
 root_path = Path(__file__).resolve().parents[1]
 if str(root_path) not in sys.path:
     sys.path.insert(0, str(root_path))
 
-import argparse
-import pandas as pd
-import numpy as np
-from datetime import datetime
+# Imports directos desde las capas unificadas del sistema
+from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_CANONICAL.system_states import LOOKBACK_DAYS
+from SYSTEM_SERVICES.system_paths import QUANT_BARS, QUANT_HISTORY
+from SYSTEM_SERVICES.system_logger import get_system_logger
 
-from quant_config import (
-    QUANT_BARS_DIR,
-    QUANT_HISTORY_DIR,
-    SYMBOLS_TO_QUANT,
-    BROKER_TZ,
-    LOOKBACK_DAYS,
-    init_quant_logging
-)
-
-logger = init_quant_logging("rolling_history_manager", "03_QUANT")
+logger = get_system_logger("rolling_history_manager", "03_QUANT")
 
 def agregar_dia_al_historial(symbol: str, fecha: str) -> bool:
     symbol = symbol.upper()
-    bars_file = QUANT_BARS_DIR / symbol / f"{symbol}_{fecha}_market_state.parquet"
+    bars_file = QUANT_BARS / symbol / f"{symbol}_{fecha}_market_state.parquet"
 
     if not bars_file.exists():
         logger.warning(f"⚠️ {symbol}: No se encontraron las barras en bars/ para {fecha}.")
@@ -66,7 +62,7 @@ def agregar_dia_al_historial(symbol: str, fecha: str) -> bool:
     }
 
     df_new_row = pd.DataFrame([daily_record])
-    history_file = QUANT_HISTORY_DIR / "daily_history_30d.parquet"
+    history_file = QUANT_HISTORY / "daily_history_30d.parquet"
 
     df_history = pd.DataFrame()
     if history_file.exists():
@@ -88,7 +84,9 @@ def agregar_dia_al_historial(symbol: str, fecha: str) -> bool:
     temp_file = history_file.with_suffix(".tmp.parquet")
     try:
         df_truncated.to_parquet(temp_file, index=False)
-        temp_file.replace(history_file)
+        import os
+        if temp_file.exists():
+            os.replace(temp_file, history_file)
         logger.info(f"💾 {symbol}: Historial de 30 días actualizado con éxito.")
         return True
     except Exception as e:
@@ -100,10 +98,10 @@ def main():
     parser = argparse.ArgumentParser(description="History Manager - Sliding 30-Day Window")
     parser.add_argument("--date", type=str, default="latest")
     args = parser.parse_args()
-    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
     logger.info(f"🚀 Iniciando consolidación de historial para: {fecha}")
-    procesados = sum(1 for s in SYMBOLS_TO_QUANT if agregar_dia_al_historial(s, fecha))
-    logger.info(f"📋 Cierre diario de base de datos finalizado: {procesados}/{len(SYMBOLS_TO_QUANT)} actualizados.")
+    procesados = sum(1 for s in get_symbols() if agregar_dia_al_historial(s, fecha))
+    logger.info(f"📋 Cierre diario de base de datos finalizado: {procesados}/{len(get_symbols())} actualizados.")
     
 if __name__ == "__main__":
     main()

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 MULTIDIMENSIONAL ANOMALY - DETECTOR MULTIDIMENSIONAL DE ANOMALÍAS
@@ -10,46 +9,38 @@ Responsabilidad: Detectar anomalías multidimensionales en el mercado
 ==========================================================================
 """
 import sys
+import json
+import math
+import argparse
 from pathlib import Path
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Tuple
+import pandas as pd
+import numpy as np
 
-# Inyección de ruta raíz
+# Inyección dinámica de la raíz del proyecto para resolver dependencias
 root_path = Path(__file__).resolve().parents[1]
 if str(root_path) not in sys.path:
     sys.path.insert(0, str(root_path))
 
-import os
-import json
-import math
-import argparse
-from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
-import pandas as pd
-import numpy as np
+# Imports directos desde las capas unificadas del sistema
+from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_CANONICAL.system_states import ANOMALY_CONFIG
+from SYSTEM_SERVICES.system_paths import AUDIT_STATE, AUDIT_REPORTS, QUANT_PROCESSED_DATA, QUANT_ANOMALIES
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic, load_contract_safe, NumpySafeEncoder
 
-# Importación desde quant_config
-from quant_config import (
-    OI_OUTPUT_DIR,
-    AUDIT_STATE_DIR,
-    AUDIT_REPORTES_DIR,
-    PROCESSED_DATA_DIR,
-    QUANT_ANOMALIES_DIR,
-    SYMBOLS_TO_QUANT,
-    get_fecha_broker_str,
-    NumpySafeEncoder,
-    init_quant_logging,
-    ANOMALY_CONFIG
-)
-
-# Inicializar logger
-logger = init_quant_logging("multidimensional_anomaly", "03_QUANT")
-
+logger = get_system_logger("multidimensional_anomaly", "03_QUANT")
 
 class AnomalyDetectorV2:
     def __init__(self, fecha: str):
         self.fecha = fecha
-        self.historical_metrics_path = AUDIT_STATE_DIR / "anomaly_historical_metrics.parquet"
-        self.cold_start_score = 50.0
-        self.ewma_lambda = 0.92
+        self.historical_metrics_path = AUDIT_STATE / "anomaly_historical_metrics.parquet"
+        
+        # 🟢 PARAMETRIZACIÓN DIRECTAMENTE EXTRAÍDA DESDE SYSTEM_CANONICAL (H-02)
+        self.cold_start_score = ANOMALY_CONFIG["cold_start_score"]
+        self.ewma_lambda = ANOMALY_CONFIG["ewma_lambda"]
 
     def _calculate_mad_scaled(self, data: np.ndarray) -> Tuple[float, float]:
         median = float(np.median(data))
@@ -126,9 +117,13 @@ class AnomalyDetectorV2:
         }
 
     def process_batch_portfolio(self, batch_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # 🟢 CONSUMO DE LA CONFIGURACIÓN DE ANOMALÍAS CENTRAL PARA MÁXIMA PARAMETRIZACIÓN
+        limit_assets = ANOMALY_CONFIG["defensive_mode_min_assets"]
+        multiplier_val = ANOMALY_CONFIG["defensive_multiplier"]
+        
         elevated_count = sum(1 for item in batch_data if item["s_final_raw"] >= 50.0)
-        systemic_stress_active = elevated_count >= 3
-        multiplier = 1.25 if systemic_stress_active else 1.0
+        systemic_stress_active = elevated_count >= limit_assets
+        multiplier = multiplier_val if systemic_stress_active else 1.0
         final_portfolio_outputs = []
 
         for item in batch_data:
@@ -167,11 +162,10 @@ def main():
 
     fecha = args.date if args.date != "latest" else get_fecha_broker_str()
     logger.info("=" * 80)
-    logger.info(f"🧠 INICIANDO DETECTOR DE ANOMALÍAS V2 — EN ESTADO REAL")
-    logger.info(f"   Fecha: {fecha}")
+    logger.info(f"🧠 INICIANDO DETECTOR DE ANOMALÍAS V2 — FECHA: {fecha}")
     logger.info("=" * 80)
 
-    fase2_report_path = AUDIT_REPORTES_DIR / f"audit_certificate_{fecha}.json"
+    fase2_report_path = AUDIT_REPORTS / f"audit_certificate_{fecha}.json"
     fci_map = {}
     if fase2_report_path.exists():
         try:
@@ -180,16 +174,15 @@ def main():
             for res in f2_data.get("certificados_por_simbolo", []):
                 fci_map[res["symbol"].upper()] = float(res.get("quality_mean", 95.0))
         except Exception as e:
-            logger.warning(f"No se pudo leer el reporte de Fase 2 ({e}). Usando FCI por defecto.")
+            logger.warning(f"No se pudo leer el reporte de Fase 2. Usando FCI por defecto.")
 
     simulated_portfolio_input = []
     detector = AnomalyDetectorV2(fecha)
 
-    for symbol in SYMBOLS_TO_QUANT:
+    for symbol in get_symbols():
         symbol = symbol.upper()
-        state_file = PROCESSED_DATA_DIR / "market_state" / symbol / f"{symbol}_{fecha}_market_state.parquet"
+        state_file = QUANT_PROCESSED_DATA / "bars" / symbol / f"{symbol}_{fecha}_market_state.parquet"
         
-        # Extracción segura de la información de mercado unificada diaria
         if state_file.exists():
             try:
                 df_state = pd.read_parquet(state_file)
@@ -213,17 +206,23 @@ def main():
         simulated_portfolio_input.append(ind_eval)
 
     portfolio_outputs = detector.process_batch_portfolio(simulated_portfolio_input)
-    output_report_file = QUANT_ANOMALIES_DIR / f"anomaly_report_{fecha}.json"
-    output_report_file.parent.mkdir(parents=True, exist_ok=True)
+    output_report_file = QUANT_ANOMALIES / f"anomaly_report_{fecha}.json"
     
     stress_applied = portfolio_outputs[0]["systemic_stress_applied"] if portfolio_outputs else False
 
-    with open(output_report_file, "w", encoding="utf-8") as f:
-        json.dump(
-            {"fecha": fecha, "systemic_stress_detected": stress_applied, "results": portfolio_outputs},
-            f, indent=2, ensure_ascii=False, cls=NumpySafeEncoder
-        )
-    logger.info(f"💾 Reporte de anomalías guardado en: {output_report_file.name}")
+    # 🟢 RESOLVIENDO IMPORTS DE GOBERNANZA FÍSICOS DE FORMA SEGURA CONTRA "FAIL_CLOSED"
+    payload = {
+        "fecha": fecha,
+        "systemic_stress_detected": stress_applied,
+        "results": portfolio_outputs
+    }
+
+    try:
+        save_contract_atomic(payload, output_report_file)
+        logger.info(f"💾 Reporte de anomalías guardado de forma segura en: {output_report_file.name}")
+    except Exception as e:
+        logger.critical(f"🛑 Error crítico guardando reporte de anomalías de la sesión: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

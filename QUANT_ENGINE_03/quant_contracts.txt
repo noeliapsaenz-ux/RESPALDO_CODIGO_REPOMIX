@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 QUANT CONTRACTS - PUENTE DE CONTRATOS CANÓNICOS (FASE 3)
@@ -10,19 +9,31 @@ Responsabilidad: Proveer utilidades para la construcción estricta de
 REGLA: Todo concepto F3 debe pasar por estas funciones constructoras.
 ==========================================================================
 """
+import sys
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
-from quant_config import (
+# Inyección dinámica de la raíz del proyecto para resolver dependencias
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+# Imports directos desde la Capa Canónica Centralizada (Sin quant_config.py)
+from SYSTEM_CANONICAL.system_canonical import (
+    MetadataEnvelope,
+    validate_canonical_enum
+)
+from SYSTEM_CANONICAL.system_states import (
     MarketRegime,
     MarketActivityState,
     MarketReadinessStatus,
-    ContractType,
-    MetadataEnvelope,
-    validate_canonical_enum,
-    SCHEMA_VERSION_QUANT,
-    PRODUCER_QUANT
+    ContractType
 )
+
+# Constantes unificadas de la Fase 3
+SCHEMA_VERSION_QUANT = "2.0"
+PRODUCER_QUANT = "QUANT_ENGINE_03"
 
 
 def create_quant_symbol_entry(
@@ -50,10 +61,10 @@ def create_canonical_quant_certificate(
     symbols_data: List[Dict[str, Any]],
     systemic_metrics: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """Construye el QUANT_CERTIFICATE consolidado con envelope canónico."""
+    """Construye el QUANT_CERTIFICATE consolidado con cabecera de gobernanza."""
     envelope = MetadataEnvelope(
         schema_version=SCHEMA_VERSION_QUANT,
-        contract_type=ContractType.QUANT_CERTIFICATE,
+        contract_type=ContractType.PORTFOLIO,  # Utiliza el tipo canónico inmutable
         producer_identity=PRODUCER_QUANT,
         timestamp_emission=datetime.now(timezone.utc).isoformat()
     )
@@ -70,10 +81,10 @@ def create_canonical_readiness_certificate(
     fecha: str,
     readiness_entries: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """Construye el certificado de Readiness con envelope canónico."""
+    """Construye el certificado de Readiness con cabecera de gobernanza."""
     envelope = MetadataEnvelope(
         schema_version=SCHEMA_VERSION_QUANT,
-        contract_type=ContractType.QUANT_CERTIFICATE,
+        contract_type=ContractType.READINESS,  # Utiliza el tipo de reporte oficializado
         producer_identity=f"{PRODUCER_QUANT}/readiness",
         timestamp_emission=datetime.now(timezone.utc).isoformat()
     )
@@ -91,7 +102,7 @@ def create_readiness_entry(
     readiness_scores: Dict[str, float],
     capture_status: str
 ) -> Dict[str, Any]:
-    """Construye la entrada de readiness por símbolo con traza de veto."""
+    """Construye la entrada de readiness por símbolo."""
     if not validate_canonical_enum(market_readiness_status, MarketReadinessStatus):
         raise ValueError(f"market_readiness_status inválido: {market_readiness_status}")
 
@@ -104,11 +115,11 @@ def create_readiness_entry(
 
 
 def validate_quant_certificate(cert: Dict[str, Any]) -> bool:
-    """Valida que un Quant Certificate cumpla el esquema canónico V3."""
+    """Valida que un Quant Certificate cumpla la firma canónica."""
     required = {"schema_version", "contract_type", "producer_identity",
                 "timestamp_emission", "fecha", "symbols"}
     if not required.issubset(cert.keys()):
         return False
-    if cert.get("contract_type") != ContractType.QUANT_CERTIFICATE.value:
+    if cert.get("contract_type") != ContractType.PORTFOLIO.value:
         return False
     return True

@@ -1,45 +1,167 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 REPORT_ENGINE_04 - AI_GATEWAY (COMPONENTE DE INTELIGENCIA UNIFICADO)
 ==========================================================================
 Ubicación: REPORT_ENGINE_04/ai_gateway.py
-Responsabilidad: Servir de canal de consulta de red simplificado para LLMs.
-                 - Soporta de forma directa OpenAI y DeepSeek.
+Responsabilidad: Canal de consulta de red unificado para múltiples LLMs.
+                 - Soporta DeepSeek, OpenAI, Qwen, Gemini y Claude mediante
+                   un patrón de adaptador por proveedor (cada uno tiene su
+                   propio formato de payload/respuesta).
                  - Utiliza la librería nativa urllib de Python (sin dependencias).
+                 - Capa de SOLO LECTURA sobre contratos ya cerrados (F2-F4):
+                   no debe usarse como input de AUDIT_ENGINE_02, QUANT_ENGINE_03
+                   ni DECISION_ENGINE_04. Es narrativa, no determinista.
 ==========================================================================
 """
 import json
 import urllib.request
 import urllib.parse
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable, Tuple
 
-# Importamos la configuración de credenciales del sistema de forma segura
 from SYSTEM_SERVICES.system_settings import (
     DEEPSEEK_API_KEY,
     OPENAI_API_KEY,
-    OPERATIONAL_MODE
+    QWEN_API_KEY,
+    GEMINI_API_KEY,
+    ANTHROPIC_API_KEY,
+    AI_PROVIDER
 )
 
 # ==========================================================================
-# CONFIGURACIÓN DE ENDPOINTS ESTÁNDAR
+# ADAPTADORES POR FAMILIA DE API (build_request / parse_response)
 # ==========================================================================
-_PROVIDERS_CONFIG: Dict[str, Dict[str, str]] = {
+# Cada adaptador recibe (api_key, model, system_instruction, prompt, url)
+# y retorna (url_final, headers, payload). El parser recibe el JSON crudo
+# de respuesta y retorna únicamente el texto generado.
+
+def _build_openai_compatible(api_key: str, model: str, system_instruction: str,
+                              prompt: str, url: str) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
+    """Familia OpenAI-compatible: DeepSeek, OpenAI, Qwen (modo compatible de DashScope)."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2
+    }
+    return url, headers, payload
+
+def _parse_openai_compatible(response_json: Dict[str, Any]) -> str:
+    return response_json["choices"][0]["message"]["content"]
+
+def _build_gemini(api_key: str, model: str, system_instruction: str,
+                   prompt: str, url: str) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
+    """Gemini: la API key va como query param, no como header; esquema contents/parts."""
+    final_url = f"{url}/{model}:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": prompt}]}
+        ],
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "generationConfig": {"temperature": 0.2}
+    }
+    return final_url, headers, payload
+
+def _parse_gemini(response_json: Dict[str, Any]) -> str:
+    return response_json["candidates"][0]["content"]["parts"][0]["text"]
+
+def _build_anthropic(api_key: str, model: str, system_instruction: str,
+                      prompt: str, url: str) -> Tuple[str, Dict[str, str], Dict[str, Any]]:
+    """Claude (Anthropic Messages API): system es campo top-level, no un mensaje más."""
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "max_tokens": 1024,
+        "system": system_instruction,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2
+    }
+    return url, headers, payload
+
+def _parse_anthropic(response_json: Dict[str, Any]) -> str:
+    return response_json["content"][0]["text"]
+
+# ==========================================================================
+# REGISTRO DE PROVEEDORES (configuración + API key + adaptador)
+# ==========================================================================
+_PROVIDERS_CONFIG: Dict[str, Dict[str, Any]] = {
     "DEEPSEEK": {
+        "api_key": DEEPSEEK_API_KEY,
         "url": "https://api.deepseek.com/chat/completions",
-        "model": "deepseek-chat"
+        "model": "deepseek-chat",
+        "build_request": _build_openai_compatible,
+        "parse_response": _parse_openai_compatible,
     },
     "OPENAI": {
+        "api_key": OPENAI_API_KEY,
         "url": "https://api.openai.com/v1/chat/completions",
-        "model": "gpt-4o-mini"  # Modelo rápido y económico de OpenAI
-    }
+        "model": "gpt-4o-mini",
+        "build_request": _build_openai_compatible,
+        "parse_response": _parse_openai_compatible,
+    },
+    "QWEN": {
+        "api_key": QWEN_API_KEY,
+        # Modo compatible OpenAI de DashScope. Si tu cuenta es internacional,
+        # verifica si tu endpoint es dashscope-intl.aliyuncs.com en vez de .com
+        "url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model": "qwen-plus",
+        "build_request": _build_openai_compatible,
+        "parse_response": _parse_openai_compatible,
+    },
+    "GEMINI": {
+        "api_key": GEMINI_API_KEY,
+        "url": "https://generativelanguage.googleapis.com/v1beta/models",
+        "model": "gemini-2.0-flash",
+        "build_request": _build_gemini,
+        "parse_response": _parse_gemini,
+    },
+    "CLAUDE": {
+        "api_key": ANTHROPIC_API_KEY,
+        "url": "https://api.anthropic.com/v1/messages",
+        # ⚠️ Verifica el model string vigente en docs.claude.com antes de activar
+        # este proveedor — los identificadores de modelo cambian con el tiempo.
+        "model": "claude-sonnet-4-6",
+        "build_request": _build_anthropic,
+        "parse_response": _parse_anthropic,
+    },
 }
 
+_PRIORITY_ORDER = ["DEEPSEEK", "OPENAI", "QWEN", "GEMINI", "CLAUDE"]
+
+def _select_provider() -> Optional[str]:
+    """
+    Resuelve qué proveedor usar.
+    - Si AI_PROVIDER fuerza uno explícito: lo usa solo si tiene API key cargada;
+      si no la tiene, falla explícito (no cae en otro proveedor por sorpresa).
+    - Si AI_PROVIDER == "AUTO": usa el primero disponible según _PRIORITY_ORDER
+      (hoy en la práctica siempre será DEEPSEEK, porque es el único con key).
+    """
+    if AI_PROVIDER != "AUTO":
+        cfg = _PROVIDERS_CONFIG.get(AI_PROVIDER)
+        if cfg and cfg["api_key"]:
+            return AI_PROVIDER
+        return None
+
+    for name in _PRIORITY_ORDER:
+        if _PROVIDERS_CONFIG[name]["api_key"]:
+            return name
+    return None
 
 def call_llm(prompt: str, system_instruction: str = "Eres un analista experto en trading algorítmico.") -> str:
     """
-    Realiza una consulta a la API de Inteligencia Artificial utilizando urllib.
-    Selecciona de forma automática el proveedor configurado (DeepSeek u OpenAI).
+    Realiza una consulta a la API de Inteligencia Artificial seleccionada.
+    El proveedor se resuelve vía AI_PROVIDER (.env) o automáticamente según
+    qué API key esté presente, en el orden DEEPSEEK > OPENAI > QWEN > GEMINI > CLAUDE.
 
     Args:
         prompt: El contenido del análisis/datos que se enviarán al modelo.
@@ -48,57 +170,43 @@ def call_llm(prompt: str, system_instruction: str = "Eres un analista experto en
     Returns:
         str: Respuesta cualitativa del modelo de lenguaje en formato Markdown o texto.
     """
-    # 1. Determinar el proveedor activo según las API Keys presentes
-    # Se prioriza DeepSeek si su clave está presente; de lo contrario se cae en OpenAI
-    provider_name = "DEEPSEEK" if DEEPSEEK_API_KEY else ("OPENAI" if OPENAI_API_KEY else None)
+    provider_name = _select_provider()
 
     if not provider_name:
+        if AI_PROVIDER != "AUTO":
+            return (
+                f"⚠️ [AI_GATEWAY] AI_PROVIDER está fijado en '{AI_PROVIDER}' pero no se "
+                f"detectó su API key correspondiente en el .env."
+            )
         return (
             "⚠️ [AI_GATEWAY] No se pudo realizar el análisis cualitativo. "
-            "No se detectaron las credenciales de API (DEEPSEEK_API_KEY o OPENAI_API_KEY) "
-            "en su archivo de configuración .env."
+            "No se detectó ninguna API key de IA (DEEPSEEK, OPENAI, QWEN, GEMINI o CLAUDE) "
+            "en el archivo de configuración .env."
         )
 
     config = _PROVIDERS_CONFIG[provider_name]
-    api_key = DEEPSEEK_API_KEY if provider_name == "DEEPSEEK" else OPENAI_API_KEY
-    
-    # 2. Construir el payload de acuerdo al formato estándar OpenAI
-    payload = {
-        "model": config["model"],
-        "messages": [
-            {"role": "system", "content": system_instruction},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.2  # Temperatura baja para mantener un análisis determinista y técnico
-    }
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    # 3. Ejecutar la petición HTTP de forma segura
     try:
+        url, headers, payload = config["build_request"](
+            config["api_key"], config["model"], system_instruction, prompt, config["url"]
+        )
         data_bytes = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(config["url"], data=data_bytes, headers=headers, method="POST")
-        
-        # Timeout de 30 segundos debido a que las respuestas cualitativas pueden demorar
+        req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+
         with urllib.request.urlopen(req, timeout=30) as response:
             res_data = json.loads(response.read().decode("utf-8"))
-            
-        # Extraer la respuesta del texto de la respuesta estándar
-        return res_data["choices"][0]["message"]["content"]
-        
+
+        return config["parse_response"](res_data)
+
     except Exception as e:
         return f"⚠️ [AI_GATEWAY] Fallo en la llamada HTTP de red al proveedor {provider_name}: {e}"
-
 
 if __name__ == "__main__":
     print("=" * 80)
     print("SOPORTE DE REPORTES - VERIFICACIÓN DE LLM GATEWAY (INTEGRIDAD DE RED)")
     print("=" * 80)
-    
-    # Simulación de datos simples de prueba
+    print(f"Proveedor resuelto: {_select_provider() or 'NINGUNO (sin API keys configuradas)'}")
+
     prompt_prueba = (
         "Analiza el siguiente resumen operativo diario:\n"
         "   • Tasa de ticks perdidos (FCI): 99.8%\n"
@@ -106,12 +214,12 @@ if __name__ == "__main__":
         "   • Activos vetados: Ninguno\n"
         "Redacta una breve conclusión ejecutiva de un párrafo en formato Markdown."
     )
-    
+
     instruccion_sistema = "Eres un analista de soporte técnico experto en MT5."
-    
+
     print("Enviando consulta a la IA (Esto puede demorar unos segundos)...")
     respuesta = call_llm(prompt_prueba, instruccion_sistema)
-    
+
     print("\nRespuesta cualitativa recibida:")
     print("-" * 80)
     print(respuesta)

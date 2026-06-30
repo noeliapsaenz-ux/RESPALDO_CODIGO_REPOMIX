@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 MASTER STATE CONSOLIDATOR - REGIMEN GLOBAL & DECISIÓN DE GOBIERNO
@@ -11,59 +10,53 @@ Responsabilidad: Unificar los snapshots de los pares de bars/, calcular las
 """
 import sys
 from pathlib import Path
-
-# Inyección dinámica de la carpeta raíz del proyecto
-root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
-
-import os
-import json
 import argparse
 import numpy as np
 import pandas as pd
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
 
-# Importación desde quant_config
-from quant_config import (
-    QUANT_BARS_DIR,
-    QUANT_HISTORY_DIR,
-    AUDIT_STATE_DIR,
-    AUDIT_REPORTES_DIR,
-    SPREAD_LIMITS,
-    BROKER_TZ,
-    SYMBOLS_TO_QUANT,
-    RISK_ASSETS,
-    SAFE_HAVENS,
-    init_quant_logging,
-    send_telegram_alert,
-    save_contract_atomic,
-    load_contract_safe,
+# Inyección dinámica de la raíz del proyecto para resolver dependencias
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
+
+# Imports directos desde las capas unificadas del sistema
+from SYSTEM_CANONICAL.system_symbols import get_symbols, get_spread_limit, get_symbol_specification
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str, is_market_open
+from SYSTEM_CANONICAL.system_canonical import (
     SymbolCaptureStatus,
+    MetadataEnvelope
+)
+from SYSTEM_CANONICAL.system_states import (
+    #SymbolCaptureStatus,
     MarketRegime,
     MarketActivityState,
     ContractType,
-    MetadataEnvelope,
-    SCHEMA_VERSION_QUANT,
-    PRODUCER_QUANT,
-    is_market_open,
-    get_fecha_broker_str,
-    OI_OUTPUT_DIR
+    VOLATILITY_THRESHOLDS
+)
+from SYSTEM_SERVICES.system_paths import (
+    QUANT_PROCESSED_DATA,
+    AUDIT_STATE,
+    QUANT_OUTPUTS
+)
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_CONTRACTS.contract_manager import (
+    save_contract_atomic,
+    load_contract_safe,
+    validate_contract_schema
 )
 
-# Importación desde quant_contracts
 from quant_contracts import (
     create_quant_symbol_entry,
     create_canonical_quant_certificate,
     validate_quant_certificate
 )
 
-# Inicializar logger
-logger = init_quant_logging("master_state_consolidator", "03_QUANT")
+logger = get_system_logger("master_state_consolidator", "03_QUANT")
 
 def cargar_historial_volatilidad(history_file: Path) -> Dict[str, float]:
-    default_vol = {sym: 0.0015 for sym in SYMBOLS_TO_QUANT}
+    default_vol = {sym: 0.0015 for sym in get_symbols()}
     if not history_file.exists(): return default_vol
     try:
         df = pd.read_parquet(history_file)
@@ -78,9 +71,9 @@ def sincronizar_e_intersecar_estados(fecha: str) -> Tuple[pd.DataFrame, Dict[str
     series_map = {}
     closes_map = {}
     
-    for symbol in SYMBOLS_TO_QUANT:
+    for symbol in get_symbols():
         symbol = symbol.upper()
-        state_file = QUANT_BARS_DIR / symbol / f"{symbol}_{fecha}_market_state.parquet"
+        state_file = QUANT_PROCESSED_DATA / "bars" / symbol / f"{symbol}_{fecha}_market_state.parquet"
         
         if state_file.exists():
             try:
@@ -109,7 +102,7 @@ def calcular_volatilidad_sistémica(series_map: Dict[str, pd.DataFrame], vol_his
     if not vol_ratios: return {"score": 50.0, "regime": "NORMAL", "confidence": 0.0}
     svi = float(np.mean(vol_ratios)) * 100.0
     svi = float(np.clip(svi, 10.0, 300.0))
-    regime = "QUIET" if svi < 70.0 else ("NORMAL" if svi < 130.0 else ("ACTIVE" if svi < 200.0 else "STRESSED"))
+    regime = "QUIET" if svi < 70.0 else ("NORMAL" if svi < 130.0 else ("ACTIVE" if svi < 200.0 else "EXPLOSIVE"))
     return {"score": round(svi, 1), "regime": regime, "confidence": 100.0}
 
 def calcular_liquidez_sistémica(series_map: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
@@ -117,7 +110,7 @@ def calcular_liquidez_sistémica(series_map: Dict[str, pd.DataFrame]) -> Dict[st
     for symbol, df in series_map.items():
         if "spread_mean" in df.columns:
             last_spread = float(df["spread_mean"].iloc[-1])
-            limit = SPREAD_LIMITS.get(symbol, SPREAD_LIMITS.get('DEFAULT', 30.0))
+            limit = get_spread_limit(symbol)
             spread_ratios.append(last_spread / (limit + 1e-9))
             
     if not spread_ratios: return {"score": 50.0, "regime": "NORMAL", "confidence": 0.0}
@@ -146,8 +139,13 @@ def calcular_cohesion_sistémica(df_returns: pd.DataFrame) -> Dict[str, Any]:
 def evaluar_sentimiento_riesgo(df_returns: pd.DataFrame) -> Dict[str, Any]:
     if df_returns.empty: return {"score": 0.0, "regime": "NEUTRAL", "confidence": 0.0}
     accum_returns = df_returns.sum().to_dict()
-    risk_vals = [accum_returns[sym] for sym in RISK_ASSETS if sym in accum_returns]
-    safe_vals = [accum_returns[sym] for sym in SAFE_HAVENS if sym in accum_returns]
+    
+    # Clasificación cruzada dinámica basada en especificaciones
+    risk_assets = [s for s in get_symbols() if get_symbol_specification(s).is_risk_asset]
+    safe_havens = [s for s in get_symbols() if get_symbol_specification(s).is_safe_haven]
+    
+    risk_vals = [accum_returns[sym] for sym in risk_assets if sym in accum_returns]
+    safe_vals = [accum_returns[sym] for sym in safe_havens if sym in accum_returns]
     if not risk_vals or not safe_vals: return {"score": 0.0, "regime": "NEUTRAL", "confidence": 0.0}
     grai = (float(np.mean(risk_vals)) - float(np.mean(safe_vals))) * 100.0
     regime = "RISK_ON" if grai > 0.5 else ("RISK_OFF" if grai < -0.5 else "NEUTRAL")
@@ -167,7 +165,7 @@ def map_regime_to_canonical(regime_str: str) -> str:
         "QUIET": MarketRegime.MEAN_REVERTING_LOW_VOL.value,
         "NORMAL": MarketRegime.MEAN_REVERTING_LOW_VOL.value,
         "ACTIVE": MarketRegime.TRENDING_UP.value,
-        "STRESSED": MarketRegime.MEAN_REVERTING_HIGH_VOL.value,
+        "EXPLOSIVE": MarketRegime.MEAN_REVERTING_HIGH_VOL.value,
         "TRENDING_UP": MarketRegime.TRENDING_UP.value,
         "TRENDING_DOWN": MarketRegime.TRENDING_DOWN.value,
         "ILLIQUID_STATIC": MarketRegime.ILLIQUID_STATIC.value,
@@ -175,25 +173,29 @@ def map_regime_to_canonical(regime_str: str) -> str:
     return mapping.get(regime_str, MarketRegime.ILLIQUID_STATIC.value)
 
 def load_audit_certificate(fecha: str) -> Dict[str, str]:
-    cert_path = AUDIT_REPORTES_DIR / f"audit_certificate_{fecha}.json"
-    cert = load_contract_safe(cert_path)
+    audit_contract_path = AUDIT_STATE / "audit_execution_contract.json"
     status_map = {}
-    if cert and cert.get("certificados_por_simbolo"):
-        for entry in cert["certificados_por_simbolo"]:
-            status_map[entry.get("symbol", "").upper()] = entry.get("symbol_capture_status", SymbolCaptureStatus.NO_CONFIABLE.value)
+    if audit_contract_path.exists():
+        try:
+            audit_data = load_contract_safe(audit_contract_path)
+            for sym_key, sym_val in audit_data.get("contracts", {}).items():
+                status_map[sym_key.upper()] = sym_val.get("symbol_capture_status", SymbolCaptureStatus.NO_CONFIABLE.value)
+        except Exception as e:
+            logger.critical(f"🛑 Error de lectura en contrato macro: {e}")
+            for s in get_symbols(): status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
     else:
-        logger.critical(f"🛑 Fail-Closed: audit_certificate ausente. Marcando símbolos como NO_CONFIABLE.")
-        for s in SYMBOLS_TO_QUANT: status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
+        logger.critical(f"🛑 Fail-Closed: audit_execution_contract ausente.")
+        for s in get_symbols(): status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
     return status_map
 
-def determine_market_activity_state(symbol: str, capture_status: str, has_data: bool, is_market_hours: bool) -> str:
+def determine_market_activity_state(symbol: str, capture_status: str, has_data: bool) -> str:
     if capture_status == SymbolCaptureStatus.NO_CONFIABLE.value:
-        return MarketActivityState.HALTED.value if is_market_hours else MarketActivityState.INACTIVE_CLOSED_MARKET.value
-    return MarketActivityState.ACTIVE.value if has_data else MarketActivityState.INACTIVE_CLOSED_MARKET.value
+        return MarketActivityState.CLOSED.value
+    return MarketActivityState.OPEN.value if has_data else MarketActivityState.CLOSED.value
 
 def generar_contrato_estado_global(fecha: str) -> bool:
-    history_file = QUANT_HISTORY_DIR / "daily_history_30d.parquet"
-    output_file = OI_OUTPUT_DIR / f"global_regime_{fecha}.json"
+    history_file = QUANT_PROCESSED_DATA / "history" / "daily_history_30d.parquet"
+    output_file = QUANT_OUTPUTS / f"global_regime_{fecha}.json"
 
     logger.info(f"🔄 Iniciando consolidación de mercado unificada...")
     df_returns, series_map = sincronizar_e_intersecar_estados(fecha)
@@ -210,10 +212,10 @@ def generar_contrato_estado_global(fecha: str) -> bool:
     act_sys = evaluar_actividad_global(series_map)
 
     vol_reg, liq_reg, coh_reg = vol_sys["regime"], liq_sys["regime"], coh_sys["regime"]
-    allow_scalping = bool(vol_reg != "STRESSED" and liq_reg != "CRITICAL")
+    allow_scalping = bool(vol_reg != "EXPLOSIVE" and liq_reg != "CRITICAL")
     allow_swing = bool(vol_reg != "QUIET" and coh_reg != "COHESIVE / SYSTEMIC")
     allow_portfolio = bool(liq_reg != "CRITICAL")
-    leverage_mode = "DEFENSIVE (50%)" if (vol_reg == "STRESSED" or coh_reg == "COHESIVE / SYSTEMIC" or liq_reg == "CRITICAL") else ("REDUCED (75%)" if (vol_reg == "ACTIVE" or coh_reg == "COHESIVE / SYSTEMIC") else "STANDARD (100%)")
+    leverage_mode = "DEFENSIVE (50%)" if (vol_reg == "EXPLOSIVE" or coh_reg == "COHESIVE / SYSTEMIC" or liq_reg == "CRITICAL") else ("REDUCED (75%)" if (vol_reg == "ACTIVE" or coh_reg == "COHESIVE / SYSTEMIC") else "STANDARD (100%)")
 
     payload = {
         "fecha": fecha, "timestamp_generacion": datetime.now(timezone.utc).isoformat(),
@@ -221,16 +223,12 @@ def generar_contrato_estado_global(fecha: str) -> bool:
         "global_operational_permits": {"allow_scalping": allow_scalping, "allow_swing": allow_swing, "allow_portfolio": allow_portfolio, "leverage_execution_mode": leverage_mode}
     }
 
-    temp_file = output_file.with_suffix(".tmp.json")
     try:
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=4)
-            f.flush(); os.fsync(f.fileno())
-        temp_file.replace(output_file)
+        save_contract_atomic(payload, output_file)
         
         audit_status_map = load_audit_certificate(fecha)
         canonical_symbols = []
-        for symbol in SYMBOLS_TO_QUANT:
+        for symbol in get_symbols():
             sym_upper = symbol.upper()
             capture_status = audit_status_map.get(sym_upper, SymbolCaptureStatus.NO_CONFIABLE.value)
             
@@ -240,23 +238,29 @@ def generar_contrato_estado_global(fecha: str) -> bool:
                 raw_regime = "NORMAL"
                 if has_data and "realized_volatility" in sym_data.columns:
                     ratio = float(sym_data["realized_volatility"].iloc[-1]) / (vol_hist.get(sym_upper, 0.0015) + 1e-9)
-                    raw_regime = "QUIET" if ratio < 0.7 else ("NORMAL" if ratio < 1.3 else ("ACTIVE" if ratio < 2.0 else "STRESSED"))
+                    
+                    # 🟢 MAPEADO DIRECTO DESDE LOS UMBRALES CANÓNICOS CENTRALES SÍ SINCELADOS
+                    v_quiet = VOLATILITY_THRESHOLDS["QUIET"]
+                    v_normal = VOLATILITY_THRESHOLDS["NORMAL"]
+                    v_active = VOLATILITY_THRESHOLDS["ACTIVE"]
+                    raw_regime = "QUIET" if ratio < v_quiet else ("NORMAL" if ratio < v_normal else ("ACTIVE" if ratio < v_active else "EXPLOSIVE"))
+                
                 canonical_regime = map_regime_to_canonical(raw_regime)
-                liq_score = max(0.0, min(1.0, 1.0 - (float(sym_data["spread_mean"].iloc[-1]) / (SPREAD_LIMITS.get(sym_upper, 30.0) * 2.0)))) if (has_data and "spread_mean" in sym_data.columns) else 0.5
-                activity_state = determine_market_activity_state(sym_upper, capture_status, has_data, is_market_open())
+                limit = get_spread_limit(sym_upper)
+                liq_score = max(0.0, min(1.0, 1.0 - (float(sym_data["spread_mean"].iloc[-1]) / (limit * 2.0)))) if (has_data and "spread_mean" in sym_data.columns) else 0.5
+                activity_state = determine_market_activity_state(sym_upper, capture_status, has_data)
             else:
-                canonical_regime, liq_score, activity_state = MarketRegime.ILLIQUID_STATIC.value, 0.0, MarketActivityState.HALTED.value
+                canonical_regime, liq_score, activity_state = MarketRegime.ILLIQUID_STATIC.value, 0.0, MarketActivityState.CLOSED.value
             
             canonical_symbols.append(create_quant_symbol_entry(sym_upper, canonical_regime, liq_score, activity_state))
         
         quant_cert = create_canonical_quant_certificate(fecha, canonical_symbols, payload["global_market_regime"])
         assert validate_quant_certificate(quant_cert), "Quant Certificate inválido"
         
-        save_contract_atomic(quant_cert, OI_OUTPUT_DIR / f"quant_certificate_{fecha}.json")
-        logger.info(f"✅ QUANT CERTIFICATE CANÓNICO EMITIDO.")
+        save_contract_atomic(quant_cert, QUANT_OUTPUTS / f"quant_certificate_{fecha}.json")
+        logger.info(f"✅ QUANT CERTIFICATE CANÓNICO EMITIDO EN OUTPUTS.")
         return True
     except Exception as e:
-        if temp_file.exists(): temp_file.unlink()
         logger.error(f"❌ Error fatal escribiendo Master State: {e}")
         return False
 
@@ -264,7 +268,7 @@ def main():
     parser = argparse.ArgumentParser(description="Master State Consolidator V2.1")
     parser.add_argument("--date", type=str, default="latest")
     args = parser.parse_args()
-    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
+    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
     generar_contrato_estado_global(fecha)
 
 if __name__ == "__main__":

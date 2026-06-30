@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 MARKET READINESS ENGINE - MOTOR DE PREPARACIÓN OPERACIONAL (FASE 3)
@@ -11,87 +10,60 @@ Responsabilidad: Evaluar la preparación operacional de cada símbolo para
 ==========================================================================
 """
 import sys
-import os
 import argparse
 from pathlib import Path
-import traceback
+import pandas as pd
+import numpy as np
 
-# ==============================================================================
-# 🛡️ INYECCIÓN DEFENSIVA DE RUTAS (RESISTENTE A ENTORNOS VPS/LOCAL)
-# ==============================================================================
-try:
-    root_path = Path(__file__).resolve().parents[1]
-    if str(root_path) not in sys.path:
-        sys.path.insert(0, str(root_path))
+# Inyección dinámica de la raíz del proyecto para resolver dependencias
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
 
-    quant_path = root_path / "QUANT_ENGINE_03"
-    if str(quant_path) not in sys.path:
-        sys.path.insert(0, str(quant_path))
+# Imports directos desde las capas unificadas del sistema
+from SYSTEM_CANONICAL.system_symbols import get_symbols, get_spread_limit, get_symbol_specification
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_CANONICAL.system_canonical import (
+    SymbolCaptureStatus,
+    MetadataEnvelope
+)
+from SYSTEM_CANONICAL.system_states import (
+    #SymbolCaptureStatus,
+    MarketReadinessStatus,
+    ContractType,
+    READINESS_THRESHOLDS,
+    READINESS_STYLE_WEIGHTS,
+    STYLE_VETO_RULES
+)
+from SYSTEM_SERVICES.system_paths import AUDIT_STATE, QUANT_PROCESSED_DATA, QUANT_READINESS
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_SERVICES.system_settings import send_telegram_alert
+from SYSTEM_CONTRACTS.contract_manager import (
+    load_contract_safe,
+    save_contract_atomic,
+    validate_contract_schema
+)
 
-    import pandas as pd
-    import numpy as np
-    from datetime import datetime, timezone
-    from typing import Dict, Any, List
+import canonical_scores as cs
+from quant_contracts import create_readiness_entry, create_canonical_readiness_certificate
 
-    # Importación segura de configuraciones del pipeline
-    from quant_config import (
-        PROCESSED_DATA_DIR,
-        AUDIT_STATE_DIR,
-        AUDIT_REPORTES_DIR,
-        SYMBOLS_TO_QUANT,
-        SPREAD_LIMITS,
-        BROKER_TZ,
-        get_fecha_broker_str,
-        init_quant_logging,
-        send_telegram_alert,
-        load_contract_safe,
-        save_contract_atomic,
-        READINESS_STYLE_WEIGHTS,
-        STYLE_VETO_RULES,
-        SymbolCaptureStatus,
-        MarketReadinessStatus,
-        ContractType,
-        MetadataEnvelope,
-        SCHEMA_VERSION_QUANT,
-        PRODUCER_QUANT,
-        validate_canonical_enum
-    )
+logger = get_system_logger("market_readiness_engine", "03_QUANT")
 
-    # Importar scores canónicos
-    import canonical_scores as cs
-
-    # Importaciones desde el puente formal de contratos
-    from quant_contracts import (
-        create_readiness_entry,
-        create_canonical_readiness_certificate,
-        validate_quant_certificate
-    )
-
-except Exception as err:
-    print(f"❌ ERROR CRÍTICO DURANTE LA CARGA DE DEPENDENCIAS EN {Path(__file__).name}: {err}", file=sys.stderr)
-    traceback.print_exc(file=sys.stderr)
-    sys.exit(1)
-
-# Inicializar logger
-logger = init_quant_logging("market_readiness_engine", "03_QUANT")
-
-
-def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vol: float) -> Dict[str, Any]:
+def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vol: float) -> dict[str, any]:
     """Evalúa las métricas y calcula el readiness score por estilo de trading."""
     symbol = symbol.upper()
-    state_file = PROCESSED_DATA_DIR / "market_state" / symbol / f"{symbol}_{fecha}_market_state.parquet"
+    state_file = QUANT_PROCESSED_DATA / "bars" / symbol / f"{symbol}_{fecha}_market_state.parquet"
     
-    # Valores de contingencia ante fallas físicas de lectura
     default_metrics = {
         "spread_mean": 99.0, "jitter_mean_ms": 99.0, "tps_mean": 0.0, "quality_mean": 0.0
     }
     
-    # 1. Validación de Precondición de Captura (Veto H-03 de Auditoría)
+    # 🟢 VETO FAIL-CLOSED H-03: Bloqueo duro por fallo de confiabilidad técnica
     if audit_status != SymbolCaptureStatus.CONFIABLE.value:
-        logger.warning(f"❌ {symbol}: Veto por captura NO_CONFIABLE en Auditoría.")
+        logger.warning(f"❌ {symbol}: VETO DURO H-03 aplicado. No confiable para operar.")
         return {
             "symbol": symbol,
-            "market_readiness_status": MarketReadinessStatus.NOT_READY_DATA_GAP.value,
+            "market_readiness_status": MarketReadinessStatus.VETOED.value,
             "readiness_by_style": {
                 "scalping": {"status": "FAIL", "readiness_score": 0.0, "reason": "Capture Veto"},
                 "intraday": {"status": "FAIL", "readiness_score": 0.0, "reason": "Capture Veto"},
@@ -104,7 +76,7 @@ def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vo
         logger.warning(f"❌ {symbol}: No se encuentra el parquet de estado para {fecha}.")
         return {
             "symbol": symbol,
-            "market_readiness_status": MarketReadinessStatus.NOT_READY_DATA_GAP.value,
+            "market_readiness_status": MarketReadinessStatus.INSUFFICIENT_DATA.value,
             "readiness_by_style": {
                 "scalping": {"status": "FAIL", "readiness_score": 0.0, "reason": "No State Data"},
                 "intraday": {"status": "FAIL", "readiness_score": 0.0, "reason": "No State Data"},
@@ -121,7 +93,7 @@ def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vo
         logger.error(f"❌ {symbol}: Error leyendo el snapshot de estado: {e}")
         return {
             "symbol": symbol,
-            "market_readiness_status": MarketReadinessStatus.NOT_READY_DATA_GAP.value,
+            "market_readiness_status": MarketReadinessStatus.INSUFFICIENT_DATA.value,
             "readiness_by_style": {
                 "scalping": {"status": "FAIL", "readiness_score": 0.0, "reason": f"Read Error: {e}"},
                 "intraday": {"status": "FAIL", "readiness_score": 0.0, "reason": f"Read Error: {e}"},
@@ -130,14 +102,12 @@ def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vo
             "metadata": {"evaluated_metrics": default_metrics, "fci_captura": 100.0}
         }
 
-    # 2. Extracción de estadísticas promedio del snapshot diario
-    limit = SPREAD_LIMITS.get(symbol, SPREAD_LIMITS.get('DEFAULT', 30.0))
+    limit = get_spread_limit(symbol)
     tick_count = int(df["tick_count"].sum())
     spread_mean = float(df["spread_mean"].mean())
     spread_cv = float(df["spread_cv"].mean())
     spread_skew = float(df["spread_skew"].mean())
     tps_abs = float(df["tps_abs"].mean())
-    tps_effective = float(df["tps_effective"].mean())
     idle_ratio = float(df["idle_ratio"].mean())
     quote_balance = float(df["quote_balance"].mean())
     realized_vol = float(df["realized_volatility"].mean())
@@ -145,13 +115,11 @@ def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vo
     quality_mean = float(df["quality_score_mean"].mean())
     jitter = float(df["jitter_ms"].mean())
     
-    # Calcular scores de dimensiones canónicas
     s_spread = cs.calculate_spread_score(spread_mean, spread_cv, spread_skew, limit, tick_count)["score"]
     s_liq = cs.calculate_liquidity_score(tps_abs, spread_cv, idle_ratio, quote_balance, tick_count)["score"]
     s_vol = cs.calculate_volatility_score(realized_vol, burstiness, ref_vol, tick_count)["score"]
     s_integ = cs.calculate_integrity_score(quality_mean, tick_count)["score"]
 
-    # Cargar métricas secuenciales si existen
     persistence_val = 50.0
     if "regime_duration_bars" in df.columns:
         persistence_val = float(df["regime_duration_bars"].mean())
@@ -163,14 +131,12 @@ def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vo
         "quality_mean": round(quality_mean, 1)
     }
 
-    # 3. Evaluación de los estilos operativos
     readiness_by_style = {}
     any_pass = False
 
     for style in ["scalping", "intraday", "swing"]:
-        weights = READINESS_STYLE_WEIGHTS.get(style, READINESS_STYLE_WEIGHTS.get("scalping" if style != "swing" else "swing_full"))
+        weights = READINESS_STYLE_WEIGHTS[style]
         
-        # Mapeo ponderado de dimensiones
         score = 0.0
         if "spread" in weights: score += s_spread * weights["spread"]
         if "execution" in weights: score += s_liq * weights["execution"]
@@ -178,8 +144,7 @@ def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vo
         if "anomaly" in weights: score += s_integ * weights["anomaly"]
         if "persistence" in weights: score += min(100.0, persistence_val * 2.0) * weights["persistence"]
         
-        # Verificar reglas de veto específicas del estilo
-        veto_rules = STYLE_VETO_RULES.get(style, STYLE_VETO_RULES.get("scalping" if style != "swing" else "swing"))
+        veto_rules = STYLE_VETO_RULES[style]
         fci_min = veto_rules.get("fci_min", 70.0)
         spread_min = veto_rules.get("spread_score_min", 40.0)
         
@@ -193,11 +158,10 @@ def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vo
             status = "FAIL"
             reason = f"Spread Score por debajo de {spread_min}"
             
-        # Validación de umbral de superación de Readiness
         min_threshold = 60.0 if style == "swing" else (65.0 if style == "intraday" else 70.0)
         if status == "PASS" and score < min_threshold:
             status = "FAIL"
-            reason = f"Readiness Score {score:.1f} por debajo del límite {min_threshold}"
+            reason = f"Readiness Score {score:.1f} por debajo de {min_threshold}"
             
         if status == "PASS":
             any_pass = True
@@ -208,7 +172,7 @@ def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vo
             "reason": reason
         }
 
-    market_status = MarketReadinessStatus.READY.value if any_pass else MarketReadinessStatus.NOT_READY_LOW_LIQUIDITY.value
+    market_status = MarketReadinessStatus.OPERABLE.value if any_pass else MarketReadinessStatus.VETOED.value
 
     return {
         "symbol": symbol,
@@ -220,7 +184,6 @@ def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vo
         }
     }
 
-
 def main():
     parser = argparse.ArgumentParser(description="Market Readiness Engine V2.2")
     parser.add_argument("--date", type=str, default="latest")
@@ -228,27 +191,37 @@ def main():
 
     fecha = args.date if args.date != "latest" else get_fecha_broker_str()
     logger.info("=" * 80)
-    logger.info(f"🧠 INICIANDO EVALUACIÓN DE PREPARACIÓN (READINESS) OPERACIONAL: {fecha}")
+    logger.info(f"🧠 INICIANDO EVALUACIÓN DE PREPARACIÓN OPERACIONAL: {fecha}")
     logger.info("=" * 80)
 
-    # Cargar certificados del día actual desde la Fase 2 (Auditoría Forense)
-    audit_cert_path = AUDIT_REPORTES_DIR / f"audit_certificate_{fecha}.json"
+    # 🟢 CARGA COMPATIBLE CON EL CONTRATO UNIFICADO DE FASE 2 (AUDITORÍA FORENSE)
+    audit_contract_path = AUDIT_STATE / "audit_execution_contract.json"
     audit_status_map = {}
     
-    if audit_cert_path.exists():
+    if audit_contract_path.exists():
         try:
-            cert_data = load_contract_safe(audit_cert_path)
-            for entry in cert_data.get("certificados_por_simbolo", []):
-                audit_status_map[entry["symbol"].upper()] = entry["symbol_capture_status"]
-            logger.info(f"✅ Cargados {len(audit_status_map)} registros de fiabilidad desde la Fase 2.")
+            audit_data = load_contract_safe(audit_contract_path)
+            # Validación estricta H-03 de versión de esquema y fecha unificada de sesión
+            if validate_contract_schema(audit_data, ContractType.AUDIT.value, fecha):
+                for sym_key, sym_val in audit_data.get("contracts", {}).items():
+                    audit_status_map[sym_key.upper()] = sym_val.get("symbol_capture_status", SymbolCaptureStatus.NO_CONFIABLE.value)
+                logger.info(f"✅ Contrato auditado verificado de forma alineada para {fecha}.")
+            else:
+                logger.critical(f"🛑 Error de validación de contrato de auditoría (Desalineación temporal o esquema H-03).")
+                for s in get_symbols():
+                    audit_status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
         except Exception as e:
-            logger.error(f"❌ Error al cargar certificado de auditoría: {e}")
+            logger.error(f"❌ Error al evaluar contrato unificado de auditoría: {e}")
+            for s in get_symbols():
+                audit_status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
     else:
-        logger.warning("⚠️ No se encontró el certificado de auditoría en disco. Símbolos marcados como NO_CONFIABLE.")
+        logger.warning("⚠️ No se encontró el contrato de auditoría en disco. Todos los símbolos vetados en cascada.")
+        for s in get_symbols():
+            audit_status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
 
     # Cargar base de datos histórica para normalización de volatilidad
-    history_file = PROCESSED_DATA_DIR / "history" / "daily_history_30d.parquet"
-    default_vols = {sym: 0.0015 for sym in SYMBOLS_TO_QUANT}
+    history_file = QUANT_PROCESSED_DATA / "history" / "daily_history_30d.parquet"
+    default_vols = {sym: 0.0015 for sym in get_symbols()}
     if history_file.exists():
         try:
             df_hist = pd.read_parquet(history_file)
@@ -259,7 +232,7 @@ def main():
 
     readiness_results = []
     
-    for symbol in SYMBOLS_TO_QUANT:
+    for symbol in get_symbols():
         sym_upper = symbol.upper()
         audit_status = audit_status_map.get(sym_upper, SymbolCaptureStatus.NO_CONFIABLE.value)
         ref_vol = default_vols.get(sym_upper, 0.0015)
@@ -273,27 +246,31 @@ def main():
                     f"| Swing: {eval_data['readiness_by_style']['swing']['status']} "
                     f"--> Estado: {eval_data['market_readiness_status']}")
 
-    # Formular y serializar el reporte de gobernanza en el de Fase 3
-    payload = {
-        "schema_version": SCHEMA_VERSION_QUANT,
-        "contract_type": "readiness_report",
-        "producer": PRODUCER_QUANT,
-        "fecha": fecha,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "resultados_readiness": readiness_results
-    }
+    # Formular y serializar el reporte de gobernanza unificado
+    readiness_entries = []
+    for item in readiness_results:
+        scores = {k: v["readiness_score"] for k, v in item["readiness_by_style"].items()}
+        readiness_entries.append(
+            create_readiness_entry(
+                item["symbol"],
+                item["market_readiness_status"],
+                scores,
+                item["metadata"]["fci_captura"]
+            )
+        )
+    
+    readiness_cert = create_canonical_readiness_certificate(fecha, readiness_entries)
+    # Reestructuramos el reporte de preparación interna de la sesión
+    readiness_cert["resultados_readiness"] = readiness_results
+    readiness_cert["contract_type"] = ContractType.READINESS.value
 
-    readiness_dir = PROCESSED_DATA_DIR / "readiness"
-    readiness_dir.mkdir(parents=True, exist_ok=True)
-    output_file = readiness_dir / f"readiness_report_{fecha}.json"
+    output_file = QUANT_READINESS / f"readiness_report_{fecha}.json"
 
     try:
-        save_contract_atomic(payload, output_file)
-        logger.info("=" * 80)
-        logger.info(f"✅ Reporte de Readiness guardado con éxito en: {output_file.name}")
-        logger.info("=" * 80)
+        save_contract_atomic(readiness_cert, output_file)
+        logger.info(f"✅ Certificado de Readiness guardado con éxito en: {output_file.name}")
     except Exception as e:
-        logger.error(f"❌ Error guardando el reporte de Readiness: {e}")
+        logger.error(f"❌ Error guardando el certificado de Readiness: {e}")
         sys.exit(1)
 
 

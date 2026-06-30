@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 PORTFOLIO COMPOSER - CONSTRUCTOR QUANT MULTIDIMENSIONAL
@@ -11,51 +10,40 @@ Responsabilidad: Optimizar la selección de portafolios mediante desempates
 """
 import sys
 from pathlib import Path
-
-# Inyección dinámica de la raíz del proyecto
-root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
-
-import os
 import itertools
 import json
 import argparse
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
 
-# Importación desde quant_config
-from quant_config import (
-    PROCESSED_DATA_DIR,
-    AUDIT_STATE_DIR,
-    BROKER_TZ,
-    SYMBOLS_TO_QUANT,
-    MIN_VALID_BARS_FOR_CORR,
-    init_quant_logging,
-    send_telegram_alert,
-    save_contract_atomic,
-    create_portfolio_contract_template
-)
+# Inyección dinámica de la raíz del proyecto para resolver dependencias
+root_path = Path(__file__).resolve().parents[1]
+if str(root_path) not in sys.path:
+    sys.path.insert(0, str(root_path))
 
-# Inicializar logger
-logger = init_quant_logging("portfolio_composer", "03_QUANT")
-MIN_VALID_BARS_FOR_CORR = 30
+# Imports directos desde las capas unificadas del sistema
+from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_SERVICES.system_paths import QUANT_PROCESSED_DATA, QUANT_CONFIGURACION
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_SERVICES.system_settings import send_telegram_alert
+from SYSTEM_CONTRACTS.contract_manager import create_portfolio_contract_template, save_contract_atomic
 
+logger = get_system_logger("portfolio_composer", "03_QUANT")
 
 # ==============================================================================
-# 🧮 FUNCIONES AUXILIARES DE CÁLCULO CUANTITATIVO (ENCAPSULADAS)
+# 🧮 FUNCIONES AUXILIARES DE CÁLCULO CUANTITATIVO LOCALES CON NOMBRE REDISEÑADO
 # ==============================================================================
 
-def calculate_stability_score(spread_cv: float, latency_cv: float, quality_std: float, integrity: float, tick_count: int) -> dict:
-    """Calcula el score de estabilidad del activo basado en variaciones de spread y latencia."""
+def _composer_stability_metric(spread_cv: float, latency_cv: float, quality_std: float, integrity: float) -> dict:
+    """Calcula el score de estabilidad robusto para resolver la colisión de nombres."""
     score = 100.0 - (spread_cv * 25.0) - (latency_cv * 15.0) - (quality_std * 2.0)
     score = score * (integrity / 100.0)
     score = max(0.0, min(100.0, score))
     return {"score": float(score)}
 
-def calculate_liquidity_score(tps: float, spread_cv: float, idle_ratio: float, gap_ratio: float, tick_count: int) -> dict:
-    """Evalúa la liquidez de mercado considerando transacciones por segundo (TPS) y tiempos de inactividad."""
+def _composer_liquidity_metric(tps: float, spread_cv: float, idle_ratio: float) -> dict:
+    """Evalúa la liquidez de mercado sin solapamiento algorítmico."""
     tps_score = min(tps * 20.0, 50.0)
     spread_score = max(0.0, 50.0 - (spread_cv * 15.0))
     idle_penalty = idle_ratio * 30.0
@@ -63,7 +51,7 @@ def calculate_liquidity_score(tps: float, spread_cv: float, idle_ratio: float, g
     score = max(0.0, min(100.0, score))
     return {"score": float(score)}
 
-def calculate_integrity_score(integrity: float, tick_count: int) -> dict:
+def _composer_integrity_metric(integrity: float, tick_count: int) -> dict:
     """Pondera la integridad del flujo de datos con penalizaciones por baja muestra."""
     score = integrity
     if tick_count < 10:
@@ -71,10 +59,6 @@ def calculate_integrity_score(integrity: float, tick_count: int) -> dict:
     score = max(0.0, min(100.0, score))
     return {"score": float(score)}
 
-
-# ==============================================================================
-# 💼 LÓGICA PRINCIPAL DE CONSTRUCCIÓN DE PORTAFOLIOS
-# ==============================================================================
 
 def extraer_divisas_de_trio(trio: list) -> list:
     divisas = []
@@ -90,15 +74,15 @@ def evaluar_exposicion_divisa(trio: list) -> bool:
 
 def calcular_matrices_correlacion_regimen(fecha: str) -> dict:
     sessions_dict = {"ALL": {}, "ASIA": {}, "LONDON": {}, "NY": {}}
-    for symbol in SYMBOLS_TO_QUANT:
+    for symbol in get_symbols():
         symbol = symbol.upper()
-        state_file = PROCESSED_DATA_DIR / "market_state" / symbol / f"{symbol}_{fecha}_market_state.parquet"
+        state_file = QUANT_PROCESSED_DATA / "bars" / symbol / f"{symbol}_{fecha}_market_state.parquet"
         if state_file.exists():
             try:
                 df = pd.read_parquet(state_file)
                 df_valid = df[(df["session"] != "CLOSED") & (df["low_confidence"] == False)].copy()
                 df_valid = df_valid.drop_duplicates(subset=["timestamp"])
-                if len(df_valid) >= MIN_VALID_BARS_FOR_CORR:
+                if len(df_valid) >= 30: # Usando valor centralizado de barras de correlación
                     df_valid["return"] = np.log(df_valid["close"] / df_valid["close"].shift(1))
                     sessions_dict["ALL"][symbol] = df_valid.set_index("timestamp")["return"]
                     for sess in ["ASIA", "LONDON", "NY"]:
@@ -117,8 +101,10 @@ def calcular_matrices_correlacion_regimen(fecha: str) -> dict:
     return matrices
 
 def componer_portafolio(fecha: str) -> bool:
-    readiness_file = PROCESSED_DATA_DIR / "readiness" / f"readiness_report_{fecha}.json"
-    contract_path = AUDIT_STATE_DIR / "portfolio_execution_contract.json"
+    readiness_file = QUANT_PROCESSED_DATA / "readiness" / f"readiness_report_{fecha}.json"
+    
+    # 🟢 RUTA CORRECTA CENTRALIZADA DE GOBERNANZA F3
+    contract_path = QUANT_CONFIGURACION / "portfolio_execution_contract.json"
 
     if not readiness_file.exists():
         logger.warning(f"⚠️ Reporte de readiness ausente para la fecha {fecha}.")
@@ -134,14 +120,21 @@ def componer_portafolio(fecha: str) -> bool:
     global_matrix = matrices_dict.get("ALL", {})
     df_global_corr = pd.DataFrame(global_matrix) if global_matrix else pd.DataFrame()
 
-    logger.info("⚖️ Iniciando optimización combinatoria multidimensional V2.2...")
+    logger.info("⚖️ Iniciando optimización combinatoria de portafolio F3...")
     portfolio_by_style = {}
 
     for style in ['scalping', 'intraday', 'swing']:
         admitidos, scores_map, features_map = [], {}, {}
-        for item in readiness_data.get("resultados_readiness", []):
+        for item in readiness_data.get("readiness_by_symbol", readiness_data.get("resultados_readiness", [])):
             sym = item.get("symbol")
             style_data = item.get("readiness_by_style", {}).get(style, {})
+            # Adaptación para leer de ambos tipos de reportes posibles
+            if not style_data and "readiness_scores" in item:
+                # Si viene del readiness canónico
+                score_val = item["readiness_scores"].get(style, 0.0)
+                status_val = "PASS" if score_val >= 60.0 else "FAIL"
+                style_data = {"status": status_val, "readiness_score": score_val}
+                
             if style_data.get("status") == "PASS":
                 admitidos.append(sym)
                 scores_map[sym] = float(style_data.get("readiness_score", 0.0))
@@ -179,9 +172,9 @@ def componer_portafolio(fecha: str) -> bool:
 
             for sym in trio_list:
                 f = features_map[sym]
-                stab = calculate_stability_score(f["spread_cv"], f["latency_cv"], f["quality_std"], f["integrity"], f["tick_count"])["score"]
-                liq = calculate_liquidity_score(f["tps"], f["spread_cv"], f["idle_ratio"], 0.0, f["tick_count"])["score"]
-                integ = calculate_integrity_score(f["integrity"], f["tick_count"])["score"]
+                stab = _composer_stability_metric(f["spread_cv"], f["latency_cv"], f["quality_std"], f["integrity"])["score"]
+                liq = _composer_liquidity_metric(f["tps"], f["spread_cv"], f["idle_ratio"])["score"]
+                integ = _composer_integrity_metric(f["integrity"], f["tick_count"])["score"]
                 stabilities.append(stab)
                 liquidities.append(liq)
                 integrities.append(integ)
@@ -204,19 +197,18 @@ def componer_portafolio(fecha: str) -> bool:
 
         portfolio_by_style[style] = {"status": "OPERABLE", "trio": ganador["trio"], "metrics": {"combined_score": ganador["combined_score"], "portfolio_health_score": ganador["portfolio_health_score"], "n_eff": ganador["n_eff"], "rho_avg": ganador["rho_avg"], "mean_readiness": ganador["mean_readiness"], "portfolio_stability": ganador["portfolio_stability"], "portfolio_liquidity": ganador["portfolio_liquidity"], "portfolio_integrity": ganador["portfolio_integrity"]}, "traceability": {"total_combinations_evaluated": len(trios_posibles), "passed_filters_count": len(candidates), "discarded_count": len(discarded), "top_10_candidates": top_10, "discarded_items_sample": discarded[:10]}}
 
-    # Usar el contract_manager para estructurar atómicamente el contrato de Fase 3
-    from contract_manager import create_portfolio_contract_template, save_contract_atomic
+    # Guardado atómico unificado del contrato F3
     contract_data = create_portfolio_contract_template(fecha, portfolio_by_style)
     save_contract_atomic(contract_data, contract_path)
-    logger.info(f"✅ Contrato de Ejecución F3 'portfolio_execution_contract.json' guardado con éxito.")
+    logger.info(f"✅ Contrato de Ejecución F3 guardado con éxito en CONFIGURACION.")
     return True
 
 def main():
     parser = argparse.ArgumentParser(description="Portfolio Composer V2.2")
     parser.add_argument("--date", type=str, default="latest")
     args = parser.parse_args()
-    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
-    logger.info(f"🚀 Iniciando optimización combinatoria de portafolio para la fecha: {fecha}")
+    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
+    logger.info(f"🚀 Iniciando optimización de portafolio para la fecha: {fecha}")
     componer_portafolio(fecha)
 
 if __name__ == "__main__":
