@@ -7,7 +7,6 @@ Descripción: Analiza las tendencias y la evolución histórica de la calidad
              de los ticks para advertir degradaciones silenciosas en los feeds.
 ==========================================================================
 """
-
 import sys
 import json
 import argparse
@@ -22,18 +21,14 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# Importaciones desde audit_config
-from AUDIT_ENGINE_02.audit_config import (
-    AUDIT_REPORTS,
-    AUDIT_STATE,
-    get_fecha_broker_str,
-    init_audit_logging
-)
-
+# Importaciones oficiales del sistema
+from SYSTEM_SERVICES.system_paths import AUDIT_REPORTS, AUDIT_STATE
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_SERVICES.system_logger import get_system_logger
 from AUDIT_ENGINE_02.audit_contracts import resolve_target_date
 
 # Inicializar logger exclusivo
-logger = init_audit_logging("audit_quality_trend_analyzer", "02_AUDIT")
+logger = get_system_logger("audit_quality_trend_analyzer", "02_AUDIT")
 
 def analizar_tendencias_calidad(ventana_dias: int = 5) -> Dict[str, Any]:
     """Analiza la pendiente de la calidad unificada de datos a lo largo de un período."""

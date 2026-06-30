@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 AUDIT_ENGINE_02 - MARKET_ETL
@@ -8,7 +7,6 @@ Descripción: Compila y unifica los Parquets Maestro y Gold a partir de
              los buffers del capturador de ticks.
 ==========================================================================
 """
-
 import sys
 import gzip
 import json
@@ -23,18 +21,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# Importación desde audit_config
-from AUDIT_ENGINE_02.audit_config import (
-    SAFE_DIR,
-    SSD_EVIDENCE_DIR,
-    AUDIT_MAESTROS,
-    AUDIT_GOLD,
-    SYMBOLS_TO_AUDIT,
-    get_spread_limit,
-    get_broker_timezone,
-    init_audit_logging,
-    classify_session,
-    STRUCTURE_VALIDATION,
+# Importaciones oficiales del sistema
+from SYSTEM_SERVICES.system_paths import SAFE_DIR, SSD_EVIDENCE_DIR, AUDIT_MAESTROS, AUDIT_GOLD
+from SYSTEM_CANONICAL.system_symbols import get_symbols, get_spread_limit
+from SYSTEM_CANONICAL.system_sessions import get_broker_timezone, classify_session, get_fecha_broker_str
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_CONTRACTS.contract_manager import (
+    PARQUET_SCHEMAS,
     BIT_REVERSED_SPREAD,
     BIT_WIDE_SPREAD,
     BIT_STALE_TICK,
@@ -43,10 +36,10 @@ from AUDIT_ENGINE_02.audit_config import (
     BIT_DUPLICATE_SEQ
 )
 
-logger = init_audit_logging("market_etl", "02_AUDIT")
+logger = get_system_logger("market_etl", "02_AUDIT")
 
-MAESTRO_SCHEMA_V2 = STRUCTURE_VALIDATION.get("maestro_schema_v2", [])
-GOLD_SCHEMA_V2 = STRUCTURE_VALIDATION.get("gold_schema_v2", [])
+MAESTRO_SCHEMA_V2 = PARQUET_SCHEMAS["maestro_v2"]
+GOLD_SCHEMA_V2 = PARQUET_SCHEMAS["gold_v2"]
 
 def generar_parquet_gold(symbol: str, fecha: str, df_maestro: pd.DataFrame) -> bool:
     """Consolida el archivo certificado GOLD libre de duplicados con métricas de calidad."""
@@ -223,7 +216,6 @@ def compilar_parquet_maestro(symbol: str, fecha: str) -> bool:
         df.to_parquet(output_path, index=False)
         logger.info(f"✅ {symbol}: Parquet Maestro unificado guardado ({len(df):,} ticks).")
 
-        # Generación del archivo GOLD correspondiente
         generar_parquet_gold(symbol, fecha, df)
         return True
     except Exception as e:
@@ -235,15 +227,16 @@ def main():
     parser.add_argument("--date", type=str, default="latest")
     args = parser.parse_args()
 
-    fecha = args.date if args.date != "latest" else datetime.now(get_broker_timezone()).strftime("%Y%m%d")
+    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
     logger.info(f"🏭 Iniciando Compilador ETL Maestro de Auditoría - Fecha: {fecha}")
 
-    compilados = sum(1 for s in SYMBOLS_TO_AUDIT if compilar_parquet_maestro(s, fecha))
+    symbols = get_symbols()
+    compilados = sum(1 for s in symbols if compilar_parquet_maestro(s, fecha))
 
     if compilados == 0:
         logger.warning("⚠️ No se pudo compilar ningún archivo de auditoría.")
     else:
-        logger.info(f"🏭 Proceso ETL concluido. {compilados}/{len(SYMBOLS_TO_AUDIT)} datasets estructurados.")
+        logger.info(f"🏭 Proceso ETL concluido. {compilados}/{len(symbols)} datasets estructurados.")
 
 if __name__ == "__main__":
     main()

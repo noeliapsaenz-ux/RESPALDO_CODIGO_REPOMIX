@@ -7,7 +7,6 @@ Descripción: Valida y verifica que los esquemas estructurados de los
              archivos Parquets unificados cumplan con el diseño oficial v2.0.
 ==========================================================================
 """
-
 import sys
 import argparse
 from pathlib import Path
@@ -20,23 +19,18 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# Importación desde audit_config
-from AUDIT_ENGINE_02.audit_config import (
-    AUDIT_STATE,
-    AUDIT_MAESTROS,
-    AUDIT_GOLD,
-    SYMBOLS_TO_AUDIT,
-    get_fecha_broker_str,
-    STRUCTURE_VALIDATION,
-    init_audit_logging,
-    AUDIT_VERSION
-)
+# Importaciones oficiales del sistema
+from SYSTEM_SERVICES.system_paths import AUDIT_STATE, AUDIT_MAESTROS, AUDIT_GOLD
+from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_CONTRACTS.contract_manager import PARQUET_SCHEMAS, AUDIT_VERSION
 
 from AUDIT_ENGINE_02.audit_contracts import resolve_target_date
 
-logger = init_audit_logging("schema_validator", "02_AUDIT")
+logger = get_system_logger("schema_validator", "02_AUDIT")
 
-COLUMNAS_REQUERIDAS_MAESTRO = STRUCTURE_VALIDATION.get("parquet_required_columns")
+COLUMNAS_REQUERIDAS_MAESTRO = PARQUET_SCHEMAS["parquet_required_columns"]
 
 def verificar_parquet_completo(symbol: str, fecha: str) -> Dict[str, Any]:
     """Verifica físicamente la disponibilidad de archivos parquet y su estructura."""
@@ -90,10 +84,11 @@ def main():
     args = parser.parse_args()
 
     fecha = resolve_target_date(args.date, AUDIT_STATE, get_fecha_broker_str)
-    logger.info(f"📋 VERIFICANDO INTEGRIAD DE COLUMNAS DE ARCHIVOS - FECHA: {fecha}")
+    logger.info(f"📋 VERIFICANDO INTEGRIAD DE COLUMNAS DE ARCHIVOS - FECHA: {fecha} (V. {AUDIT_VERSION})")
 
     correctos = 0
-    for symbol in SYMBOLS_TO_AUDIT:
+    symbols = get_symbols()
+    for symbol in symbols:
         res = verificar_parquet_completo(symbol, fecha)
         if res['maestro_existe'] and res['estructura_ok']:
             correctos += 1
@@ -101,7 +96,7 @@ def main():
         else:
             logger.warning(f"  ❌ {symbol:8} | Errores de verificación de estructura: {res['errores']}")
 
-    logger.info(f"\n📊 Esquemas correctos evaluados: {correctos}/{len(SYMBOLS_TO_AUDIT)} archivos.")
+    logger.info(f"\n📊 Esquemas correctos evaluados: {correctos}/{len(symbols)} archivos.")
 
 if __name__ == "__main__":
     main()

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 AUDIT_ENGINE_02 - MARKET_DESCRIPTIVE_STATS
@@ -8,7 +7,6 @@ Descripción: Genera los descriptores y perfiles estadísticos detallados de
              microestructura de mercado (volatilidad, tendencias, spreads).
 ==========================================================================
 """
-
 import sys
 import json
 import argparse
@@ -32,17 +30,13 @@ if sys.platform == "win32":
     except AttributeError:
         pass
 
-# Importación desde audit_config
-from AUDIT_ENGINE_02.audit_config import (
-    AUDIT_REPORTS,
-    AUDIT_STATE,
-    AUDIT_MAESTROS,
-    SYMBOLS_TO_AUDIT,
-    get_fecha_broker_str,
-    classify_session,
-    NumpySafeEncoder,
-    init_audit_logging
-)
+# Importaciones oficiales del sistema
+from SYSTEM_SERVICES.system_paths import AUDIT_REPORTS, AUDIT_STATE, AUDIT_MAESTROS
+from SYSTEM_CANONICAL.system_symbols import get_symbols, get_symbol_specification
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str, classify_session
+from SYSTEM_CANONICAL.system_states import VOLATILITY_THRESHOLDS, AUDIT_THRESHOLDS
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_CONTRACTS.contract_manager import NumpySafeEncoder
 
 from AUDIT_ENGINE_02.audit_contracts import (
     create_audit_result_template,
@@ -51,12 +45,15 @@ from AUDIT_ENGINE_02.audit_contracts import (
 )
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-logger = init_audit_logging("market_descriptive_stats", "02_AUDIT")
+logger = get_system_logger("market_descriptive_stats", "02_AUDIT")
 
 def get_multiplier(symbol: str) -> float:
-    """Calcula el factor de escala para pips del símbolo unificado."""
-    return 100.0 if "JPY" in symbol.upper() else 10000.0
+    """Calcula el factor de escala para pips a partir de los decimales (digits) canónicos del símbolo."""
+    try:
+        specs = get_symbol_specification(symbol)
+        return 10.0 ** (specs.digits - 1)
+    except KeyError:
+        return 100.0 if "JPY" in symbol.upper() else 10000.0
 
 def calculate_spread_profile(df: pd.DataFrame) -> Dict[str, float]:
     """Obtiene el perfil general de spread de los ticks del día."""
@@ -109,6 +106,17 @@ def generate_market_profile(symbol: str, date_str: str, df: pd.DataFrame) -> Dic
     spread_prof = calculate_spread_profile(df)
     trend_data = calculate_trend(df, symbol)
 
+    # Clasificación estadística de volatilidad según VOLATILITY_THRESHOLDS canónicos
+    vol_scaled = tick_volatility * 100.0
+    if vol_scaled < VOLATILITY_THRESHOLDS["QUIET"]:
+        vol_state = "QUIET"
+    elif vol_scaled < VOLATILITY_THRESHOLDS["NORMAL"]:
+        vol_state = "NORMAL"
+    elif vol_scaled < VOLATILITY_THRESHOLDS["ACTIVE"]:
+        vol_state = "ACTIVE"
+    else:
+        vol_state = "EXPLOSIVE"
+
     return {
         "metadata": {
             "symbol": symbol.upper(),
@@ -123,7 +131,7 @@ def generate_market_profile(symbol: str, date_str: str, df: pd.DataFrame) -> Dic
         },
         "spread_profile": spread_prof,
         "descriptive_indicators": {"trend": trend_data},
-        "market_regime": {"state": "NORMAL" if tick_volatility > 0.01 else "QUIET"}
+        "market_regime": {"state": vol_state}
     }
 
 def validate_profile_results(profile: Dict[str, Any]) -> Dict[str, Any]:
@@ -143,7 +151,12 @@ def validate_profile_results(profile: Dict[str, Any]) -> Dict[str, Any]:
         penalty += 5.0
 
     result["confidence"] = max(0.0, 100.0 - penalty)
-    result["status"] = "FAIL" if (result["critical_errors"] or result["confidence"] < 40.0) else ("WARNING" if result["confidence"] < 70.0 else "PASS")
+    
+    # Mapeo de umbrales de decisión basados en especificaciones canónicas
+    min_confidence = AUDIT_THRESHOLDS["confidence_minima"]
+    warn_confidence = AUDIT_THRESHOLDS["completitud_minima"]
+    
+    result["status"] = "FAIL" if (result["critical_errors"] or result["confidence"] < min_confidence) else ("WARNING" if result["confidence"] < warn_confidence else "PASS")
 
     assert validate_audit_result(result)
     return result
@@ -158,8 +171,9 @@ def main():
 
     perfiles = []
     validation_results = {}
+    symbols = get_symbols()
 
-    for symbol in SYMBOLS_TO_AUDIT:
+    for symbol in symbols:
         maestro_path = AUDIT_MAESTROS / f"ticks_maestro_{symbol}_{fecha}.parquet"
         if not maestro_path.exists():
             continue

@@ -7,7 +7,6 @@ Descripción: Consolidador y emisor exclusivo de certificados diarios unificados
              para auditoría de datos, aplicando políticas de veto Fail-Closed (H-03).
 ==========================================================================
 """
-
 import sys
 import json
 import argparse
@@ -28,22 +27,22 @@ if sys.platform == "win32":
     except AttributeError:
         pass
 
-# Importación desde audit_config
-from AUDIT_ENGINE_02.audit_config import (
-    AUDIT_REPORTS,
-    AUDIT_STATE,
-    SYMBOLS_TO_AUDIT,
-    get_fecha_broker_str,
-    NumpySafeEncoder,
+# Importaciones canónicas y de servicios
+from SYSTEM_SERVICES.system_paths import AUDIT_REPORTS, AUDIT_STATE
+from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_CANONICAL.system_canonical import (
     SymbolCaptureStatus,
     DataIntegrity,
-    ContractType,
     MetadataEnvelope,
-    validate_canonical_enum,
+    validate_canonical_enum
+)
+from SYSTEM_CANONICAL.system_states import VETO_FCI_THRESHOLD, ContractType, CONFIDENCE_WEIGHTS, AUDIT_THRESHOLDS
+from SYSTEM_CONTRACTS.contract_manager import (
+    NumpySafeEncoder,
     SCHEMA_VERSION_AUDIT,
     PRODUCER_AUDIT,
-    VETO_FCI_THRESHOLD,
-    init_audit_logging,
     save_contract_atomic
 )
 
@@ -54,7 +53,7 @@ from AUDIT_ENGINE_02.audit_contracts import (
     validate_audit_certificate
 )
 
-logger = init_audit_logging("trust_score_consolidator", "02_AUDIT")
+logger = get_system_logger("trust_score_consolidator", "02_AUDIT")
 
 def find_capture_report(fecha: str) -> Path:
     """Intenta ubicar el reporte de captura del colector en las rutas físicas."""
@@ -96,9 +95,10 @@ def consolidate_symbol_quality(
         if infra_silence > 0:
             anomalies.append({"type": "HEARTBEAT_LOSS", "detail": f"{infra_silence} silencios de infraestructura."})
 
-        # Veto por tasa de pérdida de secuencia crítica (H-03)
+        # Sincronización del umbral conceptual de pérdida física límite de secuencia decimal
+        max_loss_rate_decimal = AUDIT_THRESHOLDS["max_loss_rate_pct"] / 100.0
         loss_rate = float(metrics.get("seq_loss_rate", 0.0))
-        if loss_rate > 0.005:  # Mayor al 0.5%
+        if loss_rate > max_loss_rate_decimal:
             anomalies.append({"type": "SEQUENCE_LOSS_CRITICAL", "detail": f"Tasa de pérdida física excesiva: {loss_rate * 100:.3f}%"})
 
         if fci <= 0 and total_ticks == 0:
@@ -118,10 +118,11 @@ def consolidate_symbol_quality(
     else:
         anomalies.append({"type": "MISSING_MARKET_PROFILE", "detail": "Falta reporte descriptivo de mercado."})
 
-    consolidated_confidence = (fci * 0.60) + (profile_conf * 0.40) if (capture_data and profile_data) else 0.0
+    # Consolidación basada en pesos inmutables centralizados
+    weight_fci = CONFIDENCE_WEIGHTS.get("fci", 0.60)
+    weight_profile = CONFIDENCE_WEIGHTS.get("profile", 0.40)
+    consolidated_confidence = (fci * weight_fci) + (profile_conf * weight_profile) if (capture_data and profile_data) else 0.0
 
-    # Lógica de veto duro Fail-Closed
-    # Si el FCI está por debajo de la barrera de confianza o se identifican anomalías de pérdida de secuencia crítica
     is_vetoed = False
     for anomaly in anomalies:
         if anomaly["type"] in ["SEQUENCE_LOSS_CRITICAL", "GAP_CONNECTIVITY"]:
@@ -175,8 +176,9 @@ def main():
     certificados_canonicos = []
     simbolos_certificados = []
     simbolos_vetados = []
+    symbols = get_symbols()
 
-    for symbol in SYMBOLS_TO_AUDIT:
+    for symbol in symbols:
         sym_upper = symbol.upper()
         cert = consolidate_symbol_quality(
             sym_upper,
@@ -193,7 +195,7 @@ def main():
 
     envelope = MetadataEnvelope(
         schema_version=SCHEMA_VERSION_AUDIT,
-        contract_type=ContractType.AUDIT_CERTIFICATE,
+        contract_type=ContractType.AUDIT,
         producer_identity=PRODUCER_AUDIT,
         timestamp_emission=datetime.now(timezone.utc).isoformat()
     )
@@ -202,7 +204,7 @@ def main():
         **envelope.to_dict(),
         "fecha": fecha,
         "resumen_ejecutivo": {
-            "total_simbolos": len(SYMBOLS_TO_AUDIT),
+            "total_simbolos": len(symbols),
             "certificados": len(simbolos_certificados),
             "vetados": len(simbolos_vetados)
         },
@@ -211,18 +213,16 @@ def main():
         "certificados_por_simbolo": certificados_canonicos
     }
 
-    # Escritura Atómica en el workspace de auditoría ("STATE")
     report_path = AUDIT_STATE / f"audit_certificate_{fecha}.json"
     save_contract_atomic(payload_final, report_path)
 
     logger.info(f"✅ CERTIFICADO CANÓNICO EMITIDO EXITOSAMENTE: {report_path.name}")
     logger.info(f"   • Certificados Admitidos: {len(simbolos_certificados)} | Vetados: {len(simbolos_vetados)}")
 
-    # Mantener el reporte consolidado legacy de reporte
     legacy_payload = {
         "fecha": fecha,
         "timestamp_generacion": datetime.now(timezone.utc).isoformat(),
-        "total_simbolos_analizados": len(SYMBOLS_TO_AUDIT),
+        "total_simbolos_analizados": len(symbols),
         "simbolos_certificados": simbolos_certificados,
         "simbolos_observacion": [],
         "simbolos_rechazados": simbolos_vetados,

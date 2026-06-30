@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 AUDIT_ENGINE_02 - FCI_EVIDENCE_CALCULATOR
@@ -9,7 +8,6 @@ Descripción: Compara los datos físicos recopilados, detecta brechas
              del flujo determinista.
 ==========================================================================
 """
-
 import sys
 import re
 import gzip
@@ -23,29 +21,25 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# Importaciones desde audit_config
-from AUDIT_ENGINE_02.audit_config import (
-    SSD_EVIDENCE_DIR,
-    SAFE_DIR,
-    AUDIT_REPORTS,
-    AUDIT_STATE,
-    SYMBOLS_TO_AUDIT,
-    BROKER_TZ,
-    init_audit_logging,
-    save_contract_atomic
-)
+# Importaciones oficiales del sistema
+from SYSTEM_SERVICES.system_paths import SSD_EVIDENCE_DIR, SAFE_DIR, AUDIT_REPORTS, AUDIT_STATE
+from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_CANONICAL.system_sessions import get_broker_timezone, get_fecha_broker_str, is_market_open_at
+from SYSTEM_CANONICAL.system_states import VETO_FCI_THRESHOLD
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic
 
-logger = init_audit_logging("fci_evidence_calculator", "02_AUDIT")
+logger = get_system_logger("fci_evidence_calculator", "02_AUDIT")
 
 STALL_THRESHOLD_MS = 5000
-SESSION_START_UTC_H = 6
-SESSION_END_UTC_H = 22
+BROKER_TZ = get_broker_timezone()
 
 def is_in_session(tm_ms: int) -> bool:
-    """Evalúa si el tick ocurrió dentro del horario activo (Filtro Forex standard)."""
+    """Evalúa si el tick ocurrió dentro del horario activo usando la zona y reglas canónicas del broker."""
     try:
-        hour = datetime.fromtimestamp(tm_ms / 1000, tz=timezone.utc).hour
-        return SESSION_START_UTC_H <= hour < SESSION_END_UTC_H
+        dt_utc = datetime.fromtimestamp(tm_ms / 1000, tz=timezone.utc)
+        dt_broker = dt_utc.astimezone(BROKER_TZ)
+        return is_market_open_at(dt_broker)
     except Exception:
         return False
 
@@ -76,7 +70,6 @@ def calculate_fci(ticks: int, missing_files: int, seq_loss_rate: float,
     base_seq = 100.0 * (1.0 - seq_loss_rate)
     s_seq = max(0.0, min(100.0, base_seq - min(15.0, seq_duplicates * 0.01) - (seq_inversions * 5.0) - (seq_resets * 10.0)))
 
-    # H-10: Penalización severa ante pérdidas o caídas de red local (silencios extendidos)
     s_temporal = max(0.0, 100.0 - (infrastructure_silence_count * 10.0) - (negative_gaps * 5.0))
     s_quality = max(0.0, 100.0 - (bid_ask_inversions * 1.0) - (max(0.0, stale_ticks_pct - 80.0) * 2.0))
 
@@ -125,9 +118,7 @@ def find_reconciliation_files(symbol: str, date_str: str) -> list:
     return sorted(list(dedup_dict.values()), key=lambda x: x.name)
 
 def analyze_evidence(date_str: str, symbols: list):
-    """Procesa secuencialmente los datos físicos del día calculando las métricas
-    operativas detalladas de conectividad e integridad para cada par.
-    """
+    """Procesa secuencialmente los datos físicos del día calculando las métricas."""
     logger.info(f"🔍 Iniciando Reconciliación Forense de Colectores - Fecha: {date_str}")
     integrity_summary = []
 
@@ -238,7 +229,7 @@ def analyze_evidence(date_str: str, symbols: list):
         integrity_summary.append({
             "symbol": symbol,
             "ticks": ticks_processed,
-            "status_operativo": "ADMITIDO" if fci_score >= 70.0 else "NO_CONFIABLE",
+            "status_operativo": "ADMITIDO" if fci_score >= VETO_FCI_THRESHOLD else "NO_CONFIABLE",
             "integrity_metrics": {
                 "feed_confidence_index": fci_score,
                 "infrastructure_silence_count": infrastructure_silence_count,
@@ -268,8 +259,8 @@ def main():
     parser = argparse.ArgumentParser(description="FCI Evidence Calculator")
     parser.add_argument("--date", type=str, default="latest")
     args = parser.parse_args()
-    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
-    analyze_evidence(fecha, SYMBOLS_TO_AUDIT)
+    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
+    analyze_evidence(fecha, get_symbols())
 
 if __name__ == "__main__":
     main()

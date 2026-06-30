@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
 """
-==========================================================================
+=========================================================================
 AUDIT_ENGINE_02 - FORENSIC_TRIBUNAL
 ==========================================================================
 Ubicación: AUDIT_ENGINE_02/forensic_tribunal.py
@@ -9,7 +8,6 @@ Descripción: Compara criptográficamente la coincidencia del búnker comprimido
              física de espacio.
 ==========================================================================
 """
-
 import os
 import sys
 import gzip
@@ -24,20 +22,17 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# Importación desde audit_config
-from AUDIT_ENGINE_02.audit_config import (
-    init_audit_logging,
-    SAFE_DIR,
-    SSD_EVIDENCE_DIR,
-    DELETE_SSD_ON_PASS,
-    get_fecha_broker_str
-)
+# Importaciones oficiales del sistema
+from SYSTEM_SERVICES.system_paths import SAFE_DIR, SSD_EVIDENCE_DIR
+from SYSTEM_SERVICES.system_settings import DELETE_SSD_ON_PASS
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_SERVICES.system_logger import get_system_logger
 
 class ArchiveValidator:
     """Tribunal de validación física de archivos históricos y purga controlada."""
 
     def __init__(self):
-        self.logger = init_audit_logging("archive_validator", "02_AUDIT")
+        self.logger = get_system_logger("archive_validator", "02_AUDIT")
 
         self.stats = {
             "total_evaluated": 0,
@@ -76,7 +71,7 @@ class ArchiveValidator:
             return ""
 
     def _safe_unlink_with_retry(self, file_path: Path, max_retries: int = 5, delay: float = 0.5):
-        """Intenta remover archivos retenidos por bloqueos del SO (común en Windows/VPS)."""
+        """Intenta remover archivos retenidos por bloqueos del SO."""
         for i in range(max_retries):
             try:
                 if file_path.exists():

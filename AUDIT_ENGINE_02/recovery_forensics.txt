@@ -21,26 +21,20 @@ import argparse
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
-# Importación desde audit_config
-from audit_config import (
-    BASE_DIR,
-    STATE_DIR,
-    AUDIT_RECOVERY_DIR,
-    SYMBOLS_TO_AUDIT,
-    get_fecha_broker_str,
-    init_audit_logging,
-    BROKER_TZ,
-    save_contract_atomic,
-    load_contract_safe
-)
+# Importaciones oficiales del sistema
+from SYSTEM_SERVICES.system_paths import MT5_DATA_DIR, AUDIT_STATE, AUDIT_RECOVERY, SSD_EVIDENCE_DIR
+from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str, get_broker_timezone
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic, load_contract_safe
 
 # Inicializar logger
-logger = init_audit_logging("recovery_forensics", "02_AUDIT")
+logger = get_system_logger("recovery_forensics", "02_AUDIT")
 
 # Umbrales para clasificación
 GAP_WARNING_SECONDS = 60
 GAP_CRITICAL_SECONDS = 300
-
+BROKER_TZ = get_broker_timezone()
 
 class TickAuditor:
     """Audita un archivo JSONL extrayendo primer y último tick."""
@@ -105,7 +99,7 @@ class SymbolRecoveryAuditor:
 
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
-        self.base_dir = BASE_DIR / "02_SSD_EVIDENCE" / self.symbol
+        self.base_dir = SSD_EVIDENCE_DIR / self.symbol
         self.files = []
         self.audited_files = []
         self.state = None
@@ -113,13 +107,12 @@ class SymbolRecoveryAuditor:
 
     def load_state(self) -> bool:
         """Carga state.json del símbolo."""
-        state_file = STATE_DIR / f"{self.symbol}_state.json"
+        state_file = AUDIT_STATE / f"{self.symbol}_state.json"
         if state_file.exists():
             try:
-                with open(state_file, 'r', encoding='utf-8') as f:
-                    self.state = json.load(f)
-                    self.state_seq = self.state.get('last_sequence')
-                    return True
+                self.state = load_contract_safe(state_file)
+                self.state_seq = self.state.get('last_sequence')
+                return True
             except Exception:
                 pass
         return False
@@ -162,7 +155,6 @@ class SymbolRecoveryAuditor:
                 "message": "Menos de 2 archivos para auditar"
             }
 
-        # Ordenar por timestamp
         sorted_files = sorted(self.audited_files, key=lambda f: f.first_tm or 0)
         valid_files = [f for f in sorted_files if f.is_valid]
 
@@ -178,8 +170,8 @@ class SymbolRecoveryAuditor:
         regressions_found = 0
         seq_jumps_found = 0
         reset_from_zero_found = False
-        total_gap_seconds = 0  # <--- CORREGIDO: estaba pegado con max_gap_seconds
-        max_gap_seconds = 0    # <--- CORREGIDO: ahora está en su propia línea
+        total_gap_seconds = 0
+        max_gap_seconds = 0
         capture_gaps = []
 
         prev_file = None
@@ -210,7 +202,6 @@ class SymbolRecoveryAuditor:
             total_gap_seconds += gap_seconds if gap_seconds > 0 else 0
             max_gap_seconds = max(max_gap_seconds, gap_seconds)
 
-            # Clasificar
             if has_reset_from_zero:
                 recovery_status = "CRITICAL_RESET"
             elif has_regression:
@@ -250,7 +241,6 @@ class SymbolRecoveryAuditor:
 
             prev_file = curr_file
 
-        # Determinar estado global
         if reset_from_zero_found:
             overall_status = "CRITICAL_RESET_DETECTED"
         elif duplicates_found > 0 or regressions_found > 0:
@@ -264,7 +254,6 @@ class SymbolRecoveryAuditor:
         else:
             overall_status = "PERFECT_RECOVERY"
 
-        # Comparar con state.json
         state_match = False
         state_reset_detected = False
         if self.state_seq is not None and valid_files:
@@ -331,13 +320,12 @@ def main():
                        help="Auditar solo un símbolo específico")
     args = parser.parse_args()
 
-    # Resolver fecha
     if args.date == "latest":
         fecha = get_fecha_broker_str()
     else:
         fecha = args.date
 
-    symbols = [args.symbol.upper()] if args.symbol else SYMBOLS_TO_AUDIT
+    symbols = [args.symbol.upper()] if args.symbol else get_symbols()
 
     logger.info("=" * 70)
     logger.info(f"🔍 RECOVERY FORENSICS - Fecha: {fecha}")
@@ -348,16 +336,14 @@ def main():
     for symbol in symbols:
         results[symbol] = audit_symbol(symbol, args.max_files)
 
-    # Guardar reporte individual por símbolo
-    AUDIT_RECOVERY_DIR.mkdir(parents=True, exist_ok=True)
+    AUDIT_RECOVERY.mkdir(parents=True, exist_ok=True)
 
     for symbol, result in results.items():
         if result.get("overall_status") != "NO_DATA":
-            output_file = AUDIT_RECOVERY_DIR / f"recovery_{symbol}_{fecha}.json"
+            output_file = AUDIT_RECOVERY / f"recovery_{symbol}_{fecha}.json"
             save_contract_atomic(result, output_file)
             logger.info(f"💾 Guardado: {output_file.name}")
 
-    # Guardar reporte consolidado
     consolidated = {
         "fecha": fecha,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -371,7 +357,7 @@ def main():
         }
     }
 
-    consolidated_file = AUDIT_RECOVERY_DIR / f"recovery_consolidated_{fecha}.json"
+    consolidated_file = AUDIT_RECOVERY / f"recovery_consolidated_{fecha}.json"
     save_contract_atomic(consolidated, consolidated_file)
 
     logger.info("=" * 70)

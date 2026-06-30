@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 AUDIT_ENGINE_02 - HISTORICAL_PERSISTENCE
@@ -8,7 +7,6 @@ Descripción: Registra y consolida la bitácora histórica diaria de los
              resultados de auditoría de forma consistente e idempotente.
 ==========================================================================
 """
-
 import sys
 import json
 import hashlib
@@ -23,21 +21,16 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# Importación desde audit_config
-from AUDIT_ENGINE_02.audit_config import (
-    AUDIT_REPORTS,
-    AUDIT_STATE,
-    AUDIT_LINEAGE,
-    SYMBOLS_TO_AUDIT,
-    get_fecha_broker_str,
-    init_audit_logging,
-    load_contract_safe,
-    save_contract_atomic
-)
+# Importaciones oficiales del sistema
+from SYSTEM_SERVICES.system_paths import AUDIT_REPORTS, AUDIT_STATE, AUDIT_LINEAGE
+from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_CONTRACTS.contract_manager import load_contract_safe, save_contract_atomic
 
 from AUDIT_ENGINE_02.audit_contracts import resolve_target_date
 
-logger = init_audit_logging("historical_persistence", "02_AUDIT")
+logger = get_system_logger("historical_persistence", "02_AUDIT")
 
 def generate_sha256(raw_str: str) -> str:
     """Genera una firma determinista para asegurar la idempotencia del registro."""
@@ -97,9 +90,7 @@ def find_capture_report(fecha: str) -> Path:
     return posibles_rutas[0]
 
 def update_history(fecha: str):
-    """Consolida todos los insumos de auditoría del día y los vuelca estructuradamente
-    dentro de la base parquet acumulativa de auditoría y la bitácora de eventos.
-    """
+    """Consolida todos los insumos de auditoría del día y los vuelca de forma estructurada."""
     capture_report_path = find_capture_report(fecha)
     profile_report_path = AUDIT_REPORTS / f"market_profile_report_{fecha}.json"
     lineage_report_path = AUDIT_LINEAGE / f"lineage_report_{fecha}.json"
@@ -116,8 +107,9 @@ def update_history(fecha: str):
     consolidated_map = {item.get("symbol", "").upper(): item for item in consolidated_report.get("resultados_auditoria", [])} if consolidated_report else {}
 
     history_rows, events_rows = [], []
+    symbols = get_symbols()
 
-    for symbol in SYMBOLS_TO_AUDIT:
+    for symbol in symbols:
         sym_upper = symbol.upper()
         c_item = capture_map.get(sym_upper, {})
         c_metrics = c_item.get("integrity_metrics", {})
@@ -170,7 +162,6 @@ def update_history(fecha: str):
     df_combined = df_combined.sort_values(by=["symbol", "fecha"]).reset_index(drop=True)
     df_combined.to_parquet(history_file_path, index=False)
 
-    # Registro de eventos en formato JSONL seguro
     events_file_path = AUDIT_STATE / "audit_events.jsonl"
     existing_event_ids = set()
     if events_file_path.exists():
