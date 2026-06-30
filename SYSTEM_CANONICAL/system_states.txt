@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 ==========================================================================
-SYSTEM_CANONICAL - SYSTEM_STATES (ENUMERADORES DE ESTADO CONSOLIDADOS)
+SYSTEM_CANONICAL - SYSTEM_STATES (ENUMERADORES Y CONFIGURACIONES DE CONTROL)
 ==========================================================================
 Ubicación: SYSTEM_CANONICAL/system_states.py
-Responsabilidad: Centralizar los enumeradores de estado de negocio y técnicos.
+Responsabilidad: Centralizar los enumeradores de estado operativos, de calidad
+                 y los umbrales numéricos de control del sistema.
                  - No realiza operaciones de entrada/salida (I/O).
                  - Libre de dependencias externas.
 ==========================================================================
@@ -12,8 +13,8 @@ Responsabilidad: Centralizar los enumeradores de estado de negocio y técnicos.
 from enum import Enum
 
 
-class SymbolCaptureStatus(str, Enum):
-    """Estados del proceso de captura en caliente para un símbolo."""
+class CaptureProcessState(str, Enum):
+    """Estados operativos de la ejecución física del hilo/proceso del capturador."""
     ACTIVE = "ACTIVE"
     PAUSED = "PAUSED"
     STOPPED = "STOPPED"
@@ -73,7 +74,8 @@ class ContractType(str, Enum):
     PORTFOLIO = "portfolio_execution_contract"
     EXECUTION = "decision_contract"
     LEARNING = "learning_contract"
-    
+
+
 class SystemState(str, Enum):
     """Estado técnico operativo de presión en la adquisición de datos."""
     GREEN = "GREEN"
