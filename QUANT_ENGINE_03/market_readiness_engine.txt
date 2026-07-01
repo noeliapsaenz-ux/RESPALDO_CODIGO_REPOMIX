@@ -28,16 +28,20 @@ from SYSTEM_CANONICAL.system_canonical import (
     MetadataEnvelope
 )
 from SYSTEM_CANONICAL.system_states import (
-    #SymbolCaptureStatus,
     MarketReadinessStatus,
     ContractType,
     READINESS_THRESHOLDS,
     READINESS_STYLE_WEIGHTS,
-    STYLE_VETO_RULES,
-    READINESS_THRESHOLDS
+    STYLE_VETO_RULES
 )
 
-from SYSTEM_SERVICES.system_paths import AUDIT_STATE, QUANT_PROCESSED_DATA, QUANT_READINESS
+from SYSTEM_SERVICES.system_paths import (
+    AUDIT_STATE, 
+    QUANT_PROCESSED_DATA, 
+    QUANT_READINESS, 
+    QUANT_BARS, 
+    QUANT_HISTORY
+)
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_settings import send_telegram_alert
 from SYSTEM_CONTRACTS.contract_manager import (
@@ -54,7 +58,7 @@ logger = get_system_logger("market_readiness_engine", "03_QUANT")
 def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vol: float) -> dict[str, any]:
     """Evalúa las métricas y calcula el readiness score por estilo de trading."""
     symbol = symbol.upper()
-    state_file = QUANT_PROCESSED_DATA / "bars" / symbol / f"{symbol}_{fecha}_market_state.parquet"
+    state_file = QUANT_BARS / symbol / f"{symbol}_{fecha}_market_state.parquet"
     
     default_metrics = {
         "spread_mean": 99.0, "jitter_mean_ms": 99.0, "tps_mean": 0.0, "quality_mean": 0.0
@@ -227,7 +231,7 @@ def main():
             audit_status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
 
     # Cargar base de datos histórica para normalización de volatilidad
-    history_file = QUANT_PROCESSED_DATA / "history" / "daily_history_30d.parquet"
+    history_file = QUANT_HISTORY / "daily_history_30d.parquet"
     default_vols = {sym: 0.0015 for sym in get_symbols()}
     if history_file.exists():
         try:

@@ -47,6 +47,9 @@ def analizar_tendencias_calidad(ventana_dias: int = 5) -> Dict[str, Any]:
     df = df.sort_values(by=["symbol", "fecha"])
     diagnosticos = {}
 
+    # 🟢 UMBRAL CANÓNICO DE TENDENCIA (SYSTEM_CANONICAL)
+    slope_threshold = AUDIT_THRESHOLDS["trend_slope_threshold"]
+
     for symbol in df["symbol"].unique():
         df_sym = df[df["symbol"] == symbol].tail(ventana_dias)
         if len(df_sym) < 3:
@@ -59,7 +62,7 @@ def analizar_tendencias_calidad(ventana_dias: int = 5) -> Dict[str, Any]:
         slope, _ = np.polyfit(x, overall_scores, 1)
         slope = float(slope)
 
-        direccion = "MEJORANDO" if slope > 1.5 else ("DETERIORANDO" if slope < -1.5 else "ESTABLE")
+        direccion = "MEJORANDO" if slope > slope_threshold else ("DETERIORANDO" if slope < -slope_threshold else "ESTABLE")
         caida_consecutiva = bool(overall_scores[-1] < overall_scores[-2] < overall_scores[-3]) if len(overall_scores) >= 3 else False
 
         diagnosticos[symbol] = {

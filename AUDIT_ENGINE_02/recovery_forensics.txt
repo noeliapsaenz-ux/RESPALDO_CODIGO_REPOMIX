@@ -165,6 +165,10 @@ class SymbolRecoveryAuditor:
                 "message": "Menos de 2 archivos válidos"
             }
 
+        # 🟢 UMBRALES CANÓNICOS DE GAP/SILENCIO (SYSTEM_CANONICAL)
+        gap_warning_sec = AUDIT_THRESHOLDS["gap_warning_sec"]
+        gap_critical_sec = AUDIT_THRESHOLDS["gap_critical_sec"]
+
         recovery_results = []
         duplicates_found = 0
         regressions_found = 0
@@ -211,16 +215,16 @@ class SymbolRecoveryAuditor:
             elif has_seq_jump:
                 recovery_status = "SEQ_JUMP"
             elif seq_diff == 1:
-                if gap_seconds > GAP_CRITICAL_SECONDS:
+                if gap_seconds > gap_critical_sec:
                     recovery_status = "SEQ_OK_WITH_LARGE_GAP"
-                elif gap_seconds > GAP_WARNING_SECONDS:
+                elif gap_seconds > gap_warning_sec:
                     recovery_status = "SEQ_OK_WITH_GAP"
                 else:
                     recovery_status = "SEQ_CONTINUOUS"
             else:
                 recovery_status = "UNKNOWN"
 
-            if gap_seconds > GAP_WARNING_SECONDS:
+            if gap_seconds > gap_warning_sec:
                 capture_gaps.append({
                     "from_file": prev_file.filepath.name,
                     "to_file": curr_file.filepath.name,
@@ -247,9 +251,9 @@ class SymbolRecoveryAuditor:
             overall_status = "SEQ_ANOMALY_DETECTED"
         elif seq_jumps_found > 0:
             overall_status = "SEQ_JUMP_DETECTED"
-        elif max_gap_seconds > GAP_CRITICAL_SECONDS:
+        elif max_gap_seconds > gap_critical_sec:
             overall_status = "RECOVERY_WITH_LARGE_GAP"
-        elif max_gap_seconds > GAP_WARNING_SECONDS:
+        elif max_gap_seconds > gap_warning_sec:
             overall_status = "RECOVERY_WITH_GAP"
         else:
             overall_status = "PERFECT_RECOVERY"

@@ -147,15 +147,19 @@ def auditar_flujo_captura(symbol: str) -> Dict[str, Any]:
 
     penalty = 0.0
 
-    if ram_mb > 250.0:
-        penalty += 15.0
+    # 🟢 Uso de umbrales y penalizaciones canónicas (SYSTEM_CANONICAL)
+    if ram_mb > AUDIT_THRESHOLDS["ram_overuse_mb"]:
+        penalty += AUDIT_PENALTIES["ram_overuse"]
         result["warnings"].append({
             "code": "high_process_memory_usage",
             "message": f"Consumo de RAM inusual para colector: {ram_mb} MB."
         })
 
     if conn_info["disconnects"] > 0:
-        penalty_disconnect = min(35.0, conn_info["disconnects"] * 10.0)
+        penalty_disconnect = min(
+            AUDIT_PENALTIES["collector_disconnect_max"], 
+            conn_info["disconnects"] * AUDIT_PENALTIES["collector_disconnect_per_unit"]
+        )
         penalty += penalty_disconnect
         result["warnings"].append({
             "code": "mt5_connection_lost",

@@ -118,9 +118,9 @@ def consolidate_symbol_quality(
     else:
         anomalies.append({"type": "MISSING_MARKET_PROFILE", "detail": "Falta reporte descriptivo de mercado."})
 
-    # Consolidación basada en pesos inmutables centralizados
-    weight_fci = CONFIDENCE_WEIGHTS.get("fci", 0.60)
-    weight_profile = CONFIDENCE_WEIGHTS.get("profile", 0.40)
+    # Consolidación basada en pesos inmutables centralizados (Modelo Auditoría)
+    weight_fci = CONFIDENCE_WEIGHTS_AUDIT.get("fci", 0.60)
+    weight_profile = CONFIDENCE_WEIGHTS_AUDIT.get("profile", 0.40)
     consolidated_confidence = (fci * weight_fci) + (profile_conf * weight_profile) if (capture_data and profile_data) else 0.0
 
     is_vetoed = False

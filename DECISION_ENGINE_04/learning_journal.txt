@@ -26,16 +26,16 @@ from typing import Dict, Any, List, Optional
 
 from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
 from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_CANONICAL.system_states import LEARNING_THRESHOLDS
 from SYSTEM_SERVICES.system_logger import get_system_logger
-from SYSTEM_SERVICES.system_paths import QUANT_PROCESSED_DATA, DECISION_CONTRACTS
-# IMPORTACIÓN CALIFICADA DESDE EL PAQUETE CANÓNICO
-from SYSTEM_CONTRACTS.contract_manager import load_contract_safe
 from SYSTEM_SERVICES.system_paths import QUANT_PROCESSED_DATA, DECISION_CONTRACTS, QUANT_BARS
+from SYSTEM_CONTRACTS.contract_manager import load_contract_safe
 
 logger = get_system_logger("learning_journal", "04_DECISION")
 
-LEARNING_JOURNAL_WINDOWS_MINUTES = 240
-LEARNING_JOURNAL_SUCCESS_PIPS = 10.0
+# Umbrales de evaluación retrospectiva heredados del canon (SYSTEM_CANONICAL)
+LEARNING_JOURNAL_WINDOWS_MINUTES = LEARNING_THRESHOLDS["evaluation_window_minutes"]
+LEARNING_JOURNAL_SUCCESS_PIPS = LEARNING_THRESHOLDS["success_pips"]
 
 def load_previous_day_contracts(fecha: str) -> List[Dict[str, Any]]:
     prev_date = (datetime.strptime(fecha, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")

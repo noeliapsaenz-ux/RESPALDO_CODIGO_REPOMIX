@@ -22,14 +22,16 @@ if str(root_path) not in sys.path:
 # Imports directos desde las capas unificadas del sistema
 from SYSTEM_CANONICAL.system_symbols import get_symbols, get_spread_limit
 from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_CANONICAL.system_states import REGIME_SEQUENCE_THRESHOLDS
 from SYSTEM_SERVICES.system_paths import QUANT_BARS
 from SYSTEM_SERVICES.system_logger import get_system_logger
 
 logger = get_system_logger("regime_sequence_tracker", "03_QUANT")
 
-ANOMALY_VOL_THRESHOLD = 0.08
-SPREAD_EXTREME_MULTIPLIER = 1.5
-LIQUIDITY_CHANGE_THRESHOLD = 0.50
+# Umbrales de régimen heredados del canon (SYSTEM_CANONICAL)
+ANOMALY_VOL_THRESHOLD = REGIME_SEQUENCE_THRESHOLDS["anomaly_vol_threshold"]
+SPREAD_EXTREME_MULTIPLIER = REGIME_SEQUENCE_THRESHOLDS["spread_extreme_multiplier"]
+LIQUIDITY_CHANGE_THRESHOLD = REGIME_SEQUENCE_THRESHOLDS["liquidity_change_threshold"]
 
 def calculate_regime_duration(df: pd.DataFrame) -> pd.Series:
     if df.empty or 'minute_state' not in df.columns:

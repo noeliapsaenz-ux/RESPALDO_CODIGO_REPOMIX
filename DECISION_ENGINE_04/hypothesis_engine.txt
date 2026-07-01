@@ -28,11 +28,10 @@ from typing import Dict, Any, List, Optional
 
 from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
 from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_CANONICAL.system_states import READINESS_THRESHOLDS
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_paths import DECISION_FEATURE_VECTORS, DECISION_EDGE_SCORES, DECISION_WORKSPACE
-# IMPORTACIÓN CALIFICADA DESDE EL PAQUETE CANÓNICO
 from SYSTEM_CONTRACTS.contract_manager import load_contract_safe, save_contract_atomic
-from SYSTEM_SERVICES.system_paths import DECISION_FEATURE_VECTORS, DECISION_EDGE_SCORES, DECISION_WORKSPACE
 
 logger = get_system_logger("hypothesis_engine", "04_DECISION")
 
@@ -42,7 +41,12 @@ except Exception as e:
     logger.critical(f"🛑 Falló la carga crítica de 'hypothesis_conditions.py': {e}")
     sys.exit(1)
 
-EDGE_MIN_THRESHOLD = {'scalping': 70.0, 'intraday': 65.0, 'swing': 60.0}
+# Umbrales mínimos de Edge heredados del canon (SYSTEM_CANONICAL)
+EDGE_MIN_THRESHOLD = {
+    'scalping': READINESS_THRESHOLDS["min_score_scalping"],
+    'intraday': READINESS_THRESHOLDS["min_score_intraday"],
+    'swing': READINESS_THRESHOLDS["min_score_swing"]
+}
 
 def load_feature_vector(symbol: str, fecha: str) -> Optional[Dict[str, Any]]:
     fv_file = DECISION_FEATURE_VECTORS / f"fv_{symbol.upper()}_{fecha}.json"

@@ -19,8 +19,10 @@ if str(root_path) not in sys.path:
 import argparse
 from datetime import datetime, timezone
 from typing import Dict, Any, List
-from SYSTEM_CANONICAL.system_states import DecisionStatus, ContractType
+
+from SYSTEM_CANONICAL.system_states import DecisionStatus, ContractType, DECISION_THRESHOLDS
 from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
+from SYSTEM_CANONICAL.system_symbols import get_symbols
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_paths import (
     DECISION_CONFIDENCE_SCORES,
@@ -47,7 +49,6 @@ def main():
     confidence_data = load_confidence_scores(fecha)
     if not confidence_data:
         logger.critical("❌ No se encontraron confidence_scores. Contrato con todos los símbolos en PASS.")
-        from SYSTEM_CANONICAL.system_symbols import get_symbols
         decisions = []
         for symbol in get_symbols():
             decisions.append(
@@ -73,7 +74,7 @@ def main():
             if data.get("veto_applied", False):
                 status = DecisionStatus.PASS.value
                 reason = data.get("veto_reason", "Veto activo")
-            elif score >= 50.0:
+            elif score >= DECISION_THRESHOLDS["min_confidence_score"]:
                 status = DecisionStatus.EXECUTE.value
                 reason = None
             else:

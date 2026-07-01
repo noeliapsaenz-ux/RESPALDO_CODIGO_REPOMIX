@@ -25,7 +25,8 @@ if str(root_path) not in sys.path:
 # Imports directos desde las capas unificadas del sistema
 from SYSTEM_CANONICAL.system_symbols import get_symbols
 from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
-from SYSTEM_SERVICES.system_paths import AUDIT_STATE, QUANT_PROCESSED_DATA, QUANT_ANOMALIES, QUANT_OUTPUTS
+from SYSTEM_CANONICAL.system_states import GOVERNANCE_THRESHOLDS
+from SYSTEM_SERVICES.system_paths import AUDIT_STATE, QUANT_PROCESSED_DATA, QUANT_ANOMALIES, QUANT_OUTPUTS, QUANT_READINESS
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic, load_contract_safe
 
@@ -34,7 +35,7 @@ logger = get_system_logger("quant_validator", "03_QUANT")
 class QuantValidator:
     def __init__(self, fecha: str):
         self.fecha = fecha
-        self.readiness_path = QUANT_PROCESSED_DATA / "readiness" / f"readiness_report_{fecha}.json"
+        self.readiness_path = QUANT_READINESS / f"readiness_report_{fecha}.json"
         self.anomaly_path = QUANT_ANOMALIES / f"anomaly_report_{fecha}.json"
         self.output_path = QUANT_OUTPUTS / f"quant_validation_report_{fecha}.json"
         
@@ -216,7 +217,7 @@ class QuantValidator:
         self.reporte_final["fail_count"] = critical_total
         self.reporte_final["warning_count"] = warning_total
 
-        limite_fallas = len(get_symbols()) * 0.40
+        limite_fallas = len(get_symbols()) * GOVERNANCE_THRESHOLDS["symbols_failure_ratio"]
         if critical_total >= limite_fallas:
             self.reporte_final["global_status"] = "SUSPENDED"
             logger.critical(f"🛑 GOBERNANZA: {critical_total} símbolos fallaron. Suspendiendo pipeline operativo global.")

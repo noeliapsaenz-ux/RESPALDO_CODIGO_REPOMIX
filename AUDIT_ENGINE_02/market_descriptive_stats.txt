@@ -143,12 +143,12 @@ def validate_profile_results(profile: Dict[str, Any]) -> Dict[str, Any]:
     total_ticks = profile.get("metadata", {}).get("total_ticks", 0)
     if total_ticks == 0:
         result["critical_errors"].append({"code": "empty_dataset", "message": "Dataset maestro del símbolo vacío."})
-        penalty += 30.0
+        penalty += AUDIT_PENALTIES["empty_dataset"]
 
     mean_spread = profile.get("spread_profile", {}).get("mean_pips", 0.0)
-    if mean_spread > 5.0:
+    if mean_spread > AUDIT_THRESHOLDS["wide_spread_mean"]:
         result["warnings"].append({"code": "wide_spreads", "message": f"Spreads amplios observados: {mean_spread} pips"})
-        penalty += 5.0
+        penalty += AUDIT_PENALTIES["wide_spread_dataset"]
 
     result["confidence"] = max(0.0, 100.0 - penalty)
     

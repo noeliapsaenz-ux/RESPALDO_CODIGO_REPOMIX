@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
 from SYSTEM_CANONICAL.system_canonical import SymbolCaptureStatus
-from SYSTEM_CANONICAL.system_states import MarketReadinessStatus
+from SYSTEM_CANONICAL.system_states import MarketReadinessStatus, ContractType
 from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
 from SYSTEM_CANONICAL.system_symbols import get_symbols, get_spread_limit
 from SYSTEM_SERVICES.system_logger import get_system_logger
@@ -80,7 +80,7 @@ def load_anomaly_report(symbol: str, fecha: str) -> Dict[str, Any]:
         return {"anomaly_score": 0.0, "classification_level": "NORMAL"}
 
 def load_portfolio_contract(fecha: str) -> Dict[str, Any]:
-    contract_file = QUANT_CONFIGURACION / "portfolio_execution_contract.json"
+    contract_file = QUANT_CONFIGURACION / f"{ContractType.PORTFOLIO.value}.json"
     return load_contract_safe(contract_file) if contract_file.exists() else {}
 
 def load_readiness_report(symbol: str, fecha: str) -> Dict[str, Any]:
