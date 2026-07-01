@@ -12,6 +12,7 @@ Regla de Oro: Todas las funciones son puras, deterministas y autoportantes.
 """
 import numpy as np
 from typing import Dict, Any
+from SYSTEM_CANONICAL.system_states import SCORE_CALIBRATION, SCORE_WEIGHTS
 
 # ==============================================================================
 # DOCUMENTACION DE RANGOS OPERATIVOS CANONICOS (CALIBRACION DEL SISTEMA)
@@ -23,232 +24,85 @@ from typing import Dict, Any
 # ==============================================================================
 
 def calculate_trend_score(returns: np.ndarray) -> Dict[str, Any]:
-    """
-    Dimension 1: Trend Score
-    Mide la consistencia lineal del movimiento de precios usando correlacion de Spearman.
-    Rango Operativo: >70 (Direccional), <50 (Sin tendencia clara / Lateral).
-    """
     N = len(returns)
-    if N < 3:
-        return {"dimension": "trend", "score": 0.0, "confidence": 0.0}
-
-    # Funcion interna para calcular rangos (ranks) nativamente sin SciPy
+    if N < 3: return {"dimension": "trend", "score": 0.0, "confidence": 0.0}
     def get_ranks(arr: np.ndarray) -> np.ndarray:
         temp = arr.argsort()
         ranks = np.empty_like(temp, dtype=float)
         ranks[temp] = np.arange(len(arr), dtype=float)
         return ranks + 1.0
-
-    # Spearman Rank Correlation contra una tendencia lineal perfecta [1, 2, ..., N]
     ranks_ret = get_ranks(returns)
     ranks_time = np.arange(1.0, N + 1.0)
-    
     d = ranks_ret - ranks_time
-    # Formula del coeficiente rs de Spearman
     rs = 1.0 - (6.0 * np.sum(d**2)) / (N * (N**2 - 1.0))
     score = abs(rs) * 100.0
-
-    # Confianza basada en el lookback de dias acumulados (optimo 15 dias)
     confidence = float(np.clip((N / 15.0) * 100.0, 0.0, 100.0))
-
-    return {
-        "dimension": "trend",
-        "score": round(score, 1),
-        "confidence": round(confidence, 1)
-    }
+    return {"dimension": "trend", "score": round(score, 1), "confidence": round(confidence, 1)}
 
 def calculate_spread_score(spread_mean: float, spread_cv: float, spread_skew: float, 
                            limit: float, tick_count: int) -> Dict[str, Any]:
-    """
-    Dimension 2: Spread Score
-    Pondera el nivel de costo transaccional, su dispersion y su simetria de picos.
-    Rango Operativo: >80 (Spreads estables y optimos), <50 (Asimetria o costo elevado).
-    """
-    # 1. Nivel comparado con el optimo (mitad del limite de pips)
+    w = SCORE_WEIGHTS["spread"]
+    c = SCORE_CALIBRATION
     r_spread = spread_mean / (limit * 0.5) if limit > 0 else 1.0
     s_level = np.clip(100.0 - (r_spread - 1.0) * 50.0, 0.0, 100.0)
-
-    # 2. Estabilidad de la dispersion
     s_dispersion = np.clip(100.0 - (spread_cv * 100.0), 0.0, 100.0)
-
-    # 3. PRIORIDAD MEDIA: Simetria de la distribucion del spread
     s_symmetry = np.clip(100.0 - (abs(spread_skew) * 20.0), 0.0, 100.0)
-
-    # Compuesto: 60% nivel, 20% estabilidad, 20% simetria
-    score = (s_level * 0.60) + (s_dispersion * 0.20) + (s_symmetry * 0.20)
-    confidence = float(np.clip((tick_count / 100.0) * 100.0, 0.0, 100.0))
-
-    return {
-        "dimension": "spread",
-        "score": round(score, 1),
-        "confidence": round(confidence, 1)
-    }
+    score = (s_level * w["level"]) + (s_dispersion * w["dispersion"]) + (s_symmetry * w["symmetry"])
+    confidence = float(np.clip((tick_count / c["lookback_spread_ticks"]) * 100.0, 0.0, 100.0))
+    return {"dimension": "spread", "score": round(score, 1), "confidence": round(confidence, 1)}
 
 def calculate_liquidity_score(tps: float, spread_cv: float, idle_ratio: float, 
                               quote_balance: float, tick_count: int) -> Dict[str, Any]:
-    """
-    Dimension 3: Liquidity Score
-    Mapea la profundidad y balance bid/ask del flujo.
-    Rango Operativo: >75 (Operacion fluida), <50 (Libro desequilibrado o silencios).
-    """
+    w = SCORE_WEIGHTS["liquidity"]
+    c = SCORE_CALIBRATION
     s_tps = min(100.0, (tps / 1.5) * 100.0)
     s_idle = max(0.0, 100.0 - (idle_ratio * 100.0))
     s_cv = max(0.0, 100.0 - (spread_cv * 50.0))
-
-    # PRIORIDAD MEDIA: Balance bid-ask (libro balanceado indica liquidez saludable)
     s_balance = max(0.0, (1.0 - abs(quote_balance)) * 100.0)
+    score = (s_tps * w["tps"]) + (s_idle * w["idle"]) + (s_cv * w["cv"]) + (s_balance * w["balance"])
+    confidence = float(np.clip((tick_count / c["lookback_liquidity_ticks"]) * 100.0, 0.0, 100.0))
+    return {"dimension": "liquidity", "score": round(score, 1), "confidence": round(confidence, 1)}
 
-    # Compuesto: 30% TPS, 30% silencios, 20% CV, 20% balance
-    score = (s_tps * 0.30) + (s_idle * 0.30) + (s_cv * 0.20) + (s_balance * 0.20)
-    confidence = float(np.clip((tick_count / 80.0) * 100.0, 0.0, 100.0))
-
-    return {
-        "dimension": "liquidity",
-        "score": round(score, 1),
-        "confidence": round(confidence, 1)
-    }
-
-def calculate_volatility_score(vol_realizada: float, burstiness: float, 
-                               ref_vol: float, quality_ticks: int) -> Dict[str, Any]:
-    """
-    Dimension 4: Volatility Score
-    Clasifica el regimen relativo y ajusta el ruido segun rafagas de tiempo.
-    Rango Operativo: 50-75 (Optimo para Scalping/Intraday), <25 o >90 (Peligro).
-    """
+def calculate_volatility_score(vol_realizada: float, burstiness: float, ref_vol: float, quality_ticks: int) -> Dict[str, Any]:
     vol_norm = vol_realizada / (ref_vol + 1e-9)
-    
-    if vol_norm < 0.7:
-        base_score = 25.0
-    elif vol_norm < 1.3:
-        base_score = 50.0
-    elif vol_norm < 2.0:
-        base_score = 75.0
-    else:
-        base_score = 100.0
-
+    if vol_norm < 0.7: base_score = 25.0
+    elif vol_norm < 1.3: base_score = 50.0
+    elif vol_norm < 2.0: base_score = 75.0
+    else: base_score = 100.0
     penalty = 10.0 if burstiness > 1.3 else (5.0 if burstiness > 1.0 else 0.0)
     score = float(np.clip(base_score - penalty, 10.0, 100.0))
-    confidence = float(np.clip((quality_ticks / 15.0) * 100.0, 0.0, 100.0))
-
-    return {
-        "dimension": "volatility",
-        "score": round(score, 1),
-        "confidence": round(confidence, 1)
-    }
+    confidence = float(np.clip((quality_ticks / SCORE_CALIBRATION["lookback_volatility_ticks"]) * 100.0, 0.0, 100.0))
+    return {"dimension": "volatility", "score": round(score, 1), "confidence": round(confidence, 1)}
 
 def calculate_integrity_score(integrity_score_raw: float, tick_count: int) -> Dict[str, Any]:
-    """
-    Dimension 5: Integrity Score
-    Evalua la correccion fisica de llegada de los paquetes del feed.
-    Rango Operativo: >95 (Transmision segura), <80 (Perdida de secuencias o duplicidad).
-    """
     confidence = float(np.clip((tick_count / 50.0) * 100.0, 0.0, 100.0))
-    return {
-        "dimension": "integrity",
-        "score": round(integrity_score_raw, 1),
-        "confidence": round(confidence, 1)
-    }
+    return {"dimension": "integrity", "score": round(integrity_score_raw, 1), "confidence": round(confidence, 1)}
 
-def calculate_infrastructure_score(latency_mean: float, jitter: float, 
-                                  clock_sync_ticks: int, tick_count: int) -> Dict[str, Any]:
-    """
-    Dimension 6: Infrastructure Score
-    Mide la salud y latencia exclusivamente a nivel de telecomunicacion.
-    Rango Operativo: >85 (Red fluida), <60 (Riesgo de retraso extremo o slippage).
-    """
+def calculate_infrastructure_score(latency_mean: float, jitter: float, clock_sync_ticks: int, tick_count: int) -> Dict[str, Any]:
+    w = SCORE_WEIGHTS["infrastructure"]
+    c = SCORE_CALIBRATION
     s_latency = np.clip(100.0 - (max(0.0, latency_mean - 40.0) * 0.4), 10.0, 100.0)
     s_jitter = np.clip(100.0 - (jitter * 2.5), 10.0, 100.0)
     sync_ratio = clock_sync_ticks / (tick_count + 1e-9)
     s_clock = float(np.clip(100.0 - (sync_ratio * 200.0), 0.0, 100.0))
+    score = (s_latency * w["latency"]) + (s_jitter * w["jitter"]) + (s_clock * w["clock"])
+    confidence = float(np.clip((tick_count / c["lookback_infrastructure_ticks"]) * 100.0, 0.0, 100.0))
+    return {"dimension": "infrastructure", "score": round(score, 1), "confidence": round(confidence, 1)}
 
-    score = (s_latency * 0.40) + (s_jitter * 0.40) + (s_clock * 0.20)
-    confidence = float(np.clip((tick_count / 60.0) * 100.0, 0.0, 100.0))
-
-    return {
-        "dimension": "infrastructure",
-        "score": round(score, 1),
-        "confidence": round(confidence, 1)
-    }
-
-def calculate_activity_score(tps_abs: float, tps_effective: float, 
-                             interval_mean: float, burstiness: float, tick_count: int) -> Dict[str, Any]:
-    """
-    Dimension 7: Activity Score
-    Describe la energia del flujo integrando el TPS Absoluto y el TPS Efectivo de rafaga.
-    Rango Operativo: >60 (Actividad saludable), <30 (Entorno dormido o muerto).
-    """
+def calculate_activity_score(tps_abs: float, tps_effective: float, interval_mean: float, burstiness: float, tick_count: int) -> Dict[str, Any]:
+    w = SCORE_WEIGHTS["activity"]
     s_tps_abs = min(100.0, (tps_abs / 1.5) * 100.0)
-    
-    # PRIORIDAD MEDIA: TPS Efectivo durante la rafaga de actividad
     s_tps_eff = min(100.0, (tps_effective / 2.0) * 100.0)
-    
     s_interval = max(0.0, 100.0 - (interval_mean / 1000.0) * 100.0)
     s_burst = max(0.0, 100.0 - (abs(burstiness - 1.0) * 50.0))
+    score = (s_tps_abs * w["tps_abs"]) + (s_tps_eff * w["tps_eff"]) + (s_interval * w["interval"]) + (s_burst * w["regularity"])
+    return {"dimension": "activity", "score": round(score, 1), "confidence": 100.0}
 
-    # Compuesto: 30% Absoluto, 30% Efectivo, 20% Intervalos, 20% Regularidad
-    score = (s_tps_abs * 0.30) + (s_tps_eff * 0.30) + (s_interval * 0.20) + (s_burst * 0.20)
-    confidence = float(np.clip((tick_count / 100.0) * 100.0, 0.0, 100.0))
-
-    return {
-        "dimension": "activity",
-        "score": round(score, 1),
-        "confidence": round(confidence, 1)
-    }
-
-def calculate_stability_score(spread_cv: float, latency_cv: float, quality_std: float, 
-                              integrity_score: float, tick_count: int) -> Dict[str, Any]:
-    """
-    Dimension 8: Stability Score
-    Mapea la certidumbre conjunta del flujo (esencial para cuentas Cent).
-    Rango Operativo: >85 (Estabilidad certificada), <60 (Alta fluctuacion de red o spreads).
-    """
+def calculate_stability_score(spread_cv: float, latency_cv: float, quality_std: float, integrity_score: float, tick_count: int) -> Dict[str, Any]:
+    w = SCORE_WEIGHTS["stability"]
     s_spread = max(0.0, 100.0 - (spread_cv * 100.0))
     s_latency = max(0.0, 100.0 - (latency_cv * 100.0))
     s_quality = max(0.0, 100.0 - (quality_std * 2.0))
-
-    # PRIORIDAD BAJA: Integrar la integridad fisica de la ingesta en la estabilidad
-    score = (s_spread * 0.30) + (s_latency * 0.30) + (s_quality * 0.20) + (integrity_score * 0.20)
-    confidence = float(np.clip((tick_count / 120.0) * 100.0, 0.0, 100.0))
-
-    return {
-        "dimension": "stability",
-        "score": round(score, 1),
-        "confidence": round(confidence, 1)
-    }
-
-def calculate_confidence_score(low_confidence: bool, vol_low_confidence: bool, 
-                               quality_ticks_for_vol: int, tick_count: int) -> Dict[str, Any]:
-    """
-    Dimension 9: Confidence Score
-    Mapea la credibilidad estadistica global de la lectura de datos.
-    Rango Operativo: >90 (Estadisticas solidas), <50 (Insuficiente volumen para inferir).
-    """
-    base_confidence = 100.0
-    if low_confidence:
-        base_confidence -= 50.0
-    if vol_low_confidence:
-        base_confidence -= 30.0
-
-    ratio_ticks = (quality_ticks_for_vol / (tick_count + 1e-9)) * 100.0
-    score = (base_confidence * 0.80) + (ratio_ticks * 0.20)
-
-    return {
-        "dimension": "confidence",
-        "score": round(score, 1),
-        "confidence": 100.0
-    }
-
-def calculate_portfolio_score(n_eff: float, matrix_calculated: bool) -> Dict[str, Any]:
-    """
-    Dimension 10: Portfolio Score
-    Expresa la fuerza o nivel de diversificacion real de la combinacion.
-    Rango Operativo: >75 (Excelente diversificacion), <40 (Alta concentracion).
-    """
-    score = (n_eff / 3.0) * 100.0
-    confidence = 100.0 if matrix_calculated else 50.0
-
-    return {
-        "dimension": "portfolio",
-        "score": round(score, 1),
-        "confidence": confidence
-    }
+    score = (s_spread * w["spread"]) + (s_latency * w["latency"]) + (s_quality * w["quality"]) + (integrity_score * w["integrity"])
+    confidence = float(np.clip((tick_count / SCORE_CALIBRATION["lookback_stability_ticks"]) * 100.0, 0.0, 100.0))
+    return {"dimension": "stability", "score": round(score, 1), "confidence": round(confidence, 1)}

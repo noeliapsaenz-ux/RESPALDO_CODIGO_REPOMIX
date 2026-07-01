@@ -15,28 +15,26 @@ Responsabilidad:
 ==========================================================================
 """
 import time
-import logging
 from typing import Dict, Any, Optional
 
+from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_settings import send_telegram_alert
 from SYSTEM_CANONICAL.system_sessions import get_current_broker_time
-from SYSTEM_CANONICAL.system_states import AUDIT_THRESHOLDS
-
+from SYSTEM_CANONICAL.system_states import AUDIT_THRESHOLDS, CAPTURE_THRESHOLDS, SystemState,VERIFY_RAMDISK_SSD_MATCH, QUARANTINE_SUFFIX 
 
 class AlertEngine:
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
-        self.logger = logging.getLogger(f"alerts.{self.symbol}")
+        self.logger = get_system_logger("alert_engine", "01_CAPTURE")
         
         self._last_alert_time = 0.0
-        self._alert_cooldown = 30.0
+        self._alert_cooldown = CAPTURE_THRESHOLDS["alert_cooldown_sec"]
         self._alert_count = 0
         self._last_alert_type = None
         
-        # Umbrales operativos en sintonía con las advertencias tempranas del sistema
-        self.STALL_THRESHOLD = float(AUDIT_THRESHOLDS.get("max_heartbeat_age_sec", 120) / 8.0) # 15.0s
+        self.STALL_THRESHOLD = float(AUDIT_THRESHOLDS["max_heartbeat_age_sec"]) / CAPTURE_THRESHOLDS["stall_divisor"]
         self.OVERFLOW_THRESHOLD = 1.0
-        self.LOSS_THRESHOLD = float(AUDIT_THRESHOLDS.get("max_loss_rate_pct", 0.5)) / 100.0 / 5.0 # 0.001 (0.1%)
+        self.LOSS_THRESHOLD = float(AUDIT_THRESHOLDS["max_loss_rate_pct"]) / 100.0 / CAPTURE_THRESHOLDS["loss_divisor"]
         
         self.logger.info(f"✅ AlertEngine iniciado para {self.symbol}")
 
@@ -58,10 +56,10 @@ class AlertEngine:
             return f"LOSS - {loss_rate*100:.2f}% de ticks perdidos"
         return None
 
-    def check_state(self, state: str) -> Optional[str]:
-        if state == 'RED':
+    def check_state(self, state: SystemState) -> Optional[str]:
+        if state == SystemState.RED:
             return f"STATE_RED - Sistema en estado crítico"
-        elif state == 'ORANGE':
+        elif state == SystemState.ORANGE:
             return f"STATE_ORANGE - Presión sostenida"
         return None
 
@@ -72,7 +70,7 @@ class AlertEngine:
             return f"PREDICTIVE - Slope {slope:.1f} ticks/seg"
         return None
 
-    def evaluate(self, state: str, last_tick_time: float, overflow_rate: float, 
+    def evaluate(self, state: SystemState, last_tick_time: float, overflow_rate: float, 
                  loss_rate: float, slope: float, acceleration: float, buffer_pct: float) -> Optional[str]:
         now = time.time()
         if now - self._last_alert_time < self._alert_cooldown:
@@ -94,7 +92,7 @@ class AlertEngine:
                 
                 context = {
                     'symbol': self.symbol,
-                    'state': state,
+                    'state': state.value if hasattr(state, 'value') else state,
                     'buffer': f"{buffer_pct:.1f}%",
                     'overflow': f"{overflow_rate:.1f}/s",
                     'loss': f"{loss_rate*100:.2f}%",

@@ -10,53 +10,41 @@ Responsabilidad: Almacenar la logica booleana discreta y las reglas de validacio
 ==========================================================================
 """
 from typing import Dict, Any, Callable, Optional
+from SYSTEM_CANONICAL.system_states import HYPOTHESIS_THRESHOLDS
 
 def check_stable_spread(fv: Dict[str, Any]) -> bool:
-    return float(fv.get("minutes_since_extreme_spread", 120.0)) >= 60.0
+    return float(fv.get("minutes_since_extreme_spread", 120.0)) >= HYPOTHESIS_THRESHOLDS["min_minutes_stable_spread"]
 
 def check_no_anomalies(fv: Dict[str, Any]) -> bool:
-    return float(fv.get("minutes_since_last_anomalous_minute", 120.0)) >= 60.0
+    return float(fv.get("minutes_since_last_anomalous_minute", 120.0)) >= HYPOTHESIS_THRESHOLDS["min_minutes_no_anomalies"]
 
 def check_strong_trend(fv: Dict[str, Any]) -> bool:
-    return float(fv.get("trend_persistence", 0.0)) >= 65.0
+    return float(fv.get("trend_persistence", 0.0)) >= HYPOTHESIS_THRESHOLDS["min_strong_trend_persistence"]
 
 def check_established_regime(fv: Dict[str, Any]) -> bool:
-    return int(fv.get("regime_duration_bars", 0)) >= 10
+    return int(fv.get("regime_duration_bars", 0)) >= HYPOTHESIS_THRESHOLDS["min_established_regime_bars"]
 
 def check_low_transitions(fv: Dict[str, Any]) -> bool:
-    return int(fv.get("regime_transitions_count", 0)) <= 3
+    return int(fv.get("regime_transitions_count", 0)) <= HYPOTHESIS_THRESHOLDS["max_low_transitions"]
 
 def check_high_fci(fv: Dict[str, Any]) -> bool:
-    return float(fv.get("fci", 0.0)) >= 85.0
+    return float(fv.get("fci", 0.0)) >= HYPOTHESIS_THRESHOLDS["min_high_fci"]
 
 def check_scalping_conditions(fv: Dict[str, Any]) -> bool:
     return check_stable_spread(fv) and check_high_fci(fv)
 
 def check_intraday_conditions(fv: Dict[str, Any]) -> bool:
-    return check_no_anomalies(fv) and float(fv.get("trend_persistence", 0.0)) >= 50.0
+    return check_no_anomalies(fv) and float(fv.get("trend_persistence", 0.0)) >= HYPOTHESIS_THRESHOLDS["min_intraday_trend_persistence"]
 
 def check_swing_conditions(fv: Dict[str, Any]) -> bool:
     return check_established_regime(fv) and check_strong_trend(fv)
 
-# Registro central de condiciones unificado compatible con hypothesis_rules.json
 CONDITION_REGISTRY: Dict[str, Callable[[Dict[str, Any]], bool]] = {
-    "check_stable_spread": check_stable_spread,
-    "check_no_anomalies": check_no_anomalies,
-    "check_strong_trend": check_strong_trend,
-    "check_established_regime": check_established_regime,
-    "check_low_transitions": check_low_transitions,
-    "check_high_fci": check_high_fci,
-    "check_scalping_conditions": check_scalping_conditions,
-    "check_intraday_conditions": check_intraday_conditions,
-    "check_swing_conditions": check_swing_conditions,
-    # Mapeo alternativo de alias para las reglas dinámicas del catálogo JSON
-    "regime_stable_short": check_stable_spread,
-    "post_anomaly_recovery": check_no_anomalies,
-    "high_liquidity_no_anomaly": check_scalping_conditions,
-    "stable_regime_mature": check_established_regime,
-    "volatile_recovery_stable": check_intraday_conditions,
-    "persistent_trend_low_transitions": check_swing_conditions,
-    "trending_market_high_persistence": check_strong_trend
+    "check_stable_spread": check_stable_spread, "check_no_anomalies": check_no_anomalies,
+    "check_strong_trend": check_strong_trend, "check_established_regime": check_established_regime,
+    "check_low_transitions": check_low_transitions, "check_high_fci": check_high_fci,
+    "check_scalping_conditions": check_scalping_conditions, "check_intraday_conditions": check_intraday_conditions,
+    "check_swing_conditions": check_swing_conditions
 }
 
 def get_condition_function(name: str) -> Optional[Callable[[Dict[str, Any]], bool]]:

@@ -25,13 +25,14 @@ if str(ROOT_DIR) not in sys.path:
 from SYSTEM_SERVICES.system_paths import SSD_EVIDENCE_DIR, SAFE_DIR, AUDIT_REPORTS, AUDIT_STATE
 from SYSTEM_CANONICAL.system_symbols import get_symbols
 from SYSTEM_CANONICAL.system_sessions import get_broker_timezone, get_fecha_broker_str, is_market_open_at
-from SYSTEM_CANONICAL.system_states import VETO_FCI_THRESHOLD
+from SYSTEM_CANONICAL.system_states import VETO_FCI_THRESHOLD, STALL_THRESHOLD_MS, FCI_WEIGHTS, FCI_PENALTY_MULTIPLIERS
+from SYSTEM_CONTRACTS.contract_manager import SCHEMA_VERSIONS
+from SYSTEM_CANONICAL.system_states import ContractType
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic
 
 logger = get_system_logger("fci_evidence_calculator", "02_AUDIT")
 
-STALL_THRESHOLD_MS = 5000
 BROKER_TZ = get_broker_timezone()
 
 def is_in_session(tm_ms: int) -> bool:
@@ -66,14 +67,16 @@ def calculate_fci(ticks: int, missing_files: int, seq_loss_rate: float,
     if ticks == 0:
         return 0.0
 
-    s_continuity = max(0.0, 100.0 - (missing_files * 20.0))
+    m = FCI_PENALTY_MULTIPLIERS
+    s_continuity = max(0.0, 100.0 - (missing_files * m["missing_file"]))
     base_seq = 100.0 * (1.0 - seq_loss_rate)
-    s_seq = max(0.0, min(100.0, base_seq - min(15.0, seq_duplicates * 0.01) - (seq_inversions * 5.0) - (seq_resets * 10.0)))
+    s_seq = max(0.0, min(100.0, base_seq - min(m["seq_duplicates_max_penalty"], seq_duplicates * m["seq_duplicates_divisor"]) - (seq_inversions * m["seq_inversions"]) - (seq_resets * m["seq_resets"])))
 
-    s_temporal = max(0.0, 100.0 - (infrastructure_silence_count * 10.0) - (negative_gaps * 5.0))
-    s_quality = max(0.0, 100.0 - (bid_ask_inversions * 1.0) - (max(0.0, stale_ticks_pct - 80.0) * 2.0))
+    s_temporal = max(0.0, 100.0 - (infrastructure_silence_count * m["infra_silence"]) - (negative_gaps * m["negative_gap"]))
+    s_quality = max(0.0, 100.0 - (bid_ask_inversions * m["bid_ask_inversion"]) - (max(0.0, stale_ticks_pct - m["stale_ticks_baseline"]) * m["stale_ticks_multiplier"]))
 
-    return round(max(0.0, min(100.0, (s_continuity * 0.40) + (s_seq * 0.30) + (s_temporal * 0.20) + (s_quality * 0.10))), 2)
+    w = FCI_WEIGHTS
+    return round(max(0.0, min(100.0, (s_continuity * w["continuity"]) + (s_seq * w["sequence"]) + (s_temporal * w["temporal"]) + (s_quality * w["quality"]))), 2)
 
 def find_reconciliation_files(symbol: str, date_str: str) -> list:
     """Encuentra y valida los archivos fuente físicos del día."""
@@ -249,7 +252,7 @@ def analyze_evidence(date_str: str, symbols: list):
         "metadata": {
             "date": date_str,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "schema_version": "2.0"
+            "schema_version": SCHEMA_VERSIONS[ContractType.AUDIT.value]
         },
         "integrity_summary": integrity_summary
     }, report_file)

@@ -27,7 +27,9 @@ from SYSTEM_CANONICAL.system_canonical import (
     MetadataEnvelope,
     validate_canonical_enum
 )
-from SYSTEM_CANONICAL.system_states import ContractType
+
+from SYSTEM_CANONICAL.system_states import ContractType, AUDIT_PENALTIES
+
 from SYSTEM_CONTRACTS.contract_manager import (
     SCHEMA_VERSION_AUDIT,
     PRODUCER_AUDIT,
@@ -37,18 +39,18 @@ from SYSTEM_CONTRACTS.contract_manager import (
 
 # Constantes de penalización para cálculo de estabilidad
 CRITICAL_ERRORS = {
-    "state_red_alert": {"message": "Estado crítico detectado en post-cierre", "penalty": 30.0},
-    "loss_rate_exceeded": {"message": "Tasa de pérdida física superior al límite", "penalty": 20.0},
-    "overflow_rate_exceeded": {"message": "Saturación física de buffers con descartes de memoria", "penalty": 20.0},
-    "seq_inversion": {"message": "Inversión de secuencia física en base de datos", "penalty": 25.0}
+    "state_red_alert": {"message": "Estado crítico detectado en post-cierre", "penalty": AUDIT_PENALTIES["state_red_alert"]},
+    "loss_rate_exceeded": {"message": "Tasa de pérdida física superior al límite", "penalty": AUDIT_PENALTIES["loss_rate_exceeded"]},
+    "overflow_rate_exceeded": {"message": "Saturación física de buffers con descartes de memoria", "penalty": AUDIT_PENALTIES["overflow_rate_exceeded"]},
+    "seq_inversion": {"message": "Inversión de secuencia física en base de datos", "penalty": AUDIT_PENALTIES["seq_inversion"]}
 }
 
 WARNING_CONDITIONS = {
-    "state_yellow_warning": {"message": "Semáforo del capturador en observación (YELLOW)", "penalty": 15.0},
-    "moderate_loss": {"message": "Tasa de pérdida moderada de ticks detectada", "penalty": 5.0},
-    "moderate_overflow": {"message": "Desborde menor de buffers en RAM detectado", "penalty": 5.0},
-    "high_buffer_pct": {"message": "Ocupación de colas en memoria excesiva (>80%)", "penalty": 5.0},
-    "no_shutdown_ok": {"message": "Falta la firma de apagado limpio en el SSD", "penalty": 5.0}
+    "state_yellow_warning": {"message": "Semáforo del capturador en observación (YELLOW)", "penalty": AUDIT_PENALTIES["state_yellow_warning"]},
+    "moderate_loss": {"message": "Tasa de pérdida moderada de ticks detectada", "penalty": AUDIT_PENALTIES["moderate_loss"]},
+    "moderate_overflow": {"message": "Desborde menor de buffers en RAM detectado", "penalty": AUDIT_PENALTIES["moderate_overflow"]},
+    "high_buffer_pct": {"message": "Ocupación de colas en memoria excesiva (>80%)", "penalty": AUDIT_PENALTIES["high_buffer_pct"]},
+    "no_shutdown_ok": {"message": "Falta la firma de apagado limpio en el SSD", "penalty": AUDIT_PENALTIES["no_shutdown_ok"]}
 }
 
 def load_json_safe(filepath: Path) -> Dict[str, Any]:

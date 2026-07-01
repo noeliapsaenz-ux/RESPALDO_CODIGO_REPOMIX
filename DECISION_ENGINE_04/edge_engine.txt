@@ -11,13 +11,10 @@ Responsabilidad: Evaluar la fuerza del "Edge" analizando transiciones de régime
 """
 import sys
 from pathlib import Path
-
 root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
+if str(root_path) not in sys.path: sys.path.insert(0, str(root_path))
 current_dir = Path(__file__).resolve().parent
-if str(current_dir) not in sys.path:
-    sys.path.insert(0, str(current_dir))
+if str(current_dir) not in sys.path: sys.path.insert(0, str(current_dir))
 
 import argparse
 import numpy as np
@@ -26,121 +23,67 @@ from typing import Dict, Any, Optional
 
 from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
 from SYSTEM_CANONICAL.system_symbols import get_symbols
-from SYSTEM_CANONICAL.system_states import READINESS_STYLE_WEIGHTS, VOLATILITY_THRESHOLDS
+from SYSTEM_CANONICAL.system_states import (
+    READINESS_STYLE_WEIGHTS, VOLATILITY_THRESHOLDS, 
+    EDGE_NORMALIZATION_CAPS, EDGE_VOLATILITY_SCORES, READINESS_THRESHOLDS
+)
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_paths import DECISION_FEATURE_VECTORS, DECISION_EDGE_SCORES
-# IMPORTACIÓN CALIFICADA DESDE EL PAQUETE CANÓNICO
 from SYSTEM_CONTRACTS.contract_manager import load_contract_safe, save_contract_atomic
 
 logger = get_system_logger("edge_engine", "04_DECISION")
 
-INVERTED_METRICS = {'regime_transitions_count', 'liquidity_changes_count'}
-
-DECISION_NORMALIZATION_CAPS = {
-    'regime_duration_bars': 100.0,
-    'regime_age_minutes': 1440.0,
-    'regime_transitions_count': 10.0,
-    'liquidity_changes_count': 10.0,
-    'minutes_since_last_anomalous_minute': 1440.0,
-    'minutes_since_extreme_spread': 1440.0
-}
-
-EDGE_MIN_THRESHOLD = {
-    'scalping': 70.0,
-    'intraday': 65.0,
-    'swing': 60.0
-}
-
-DECISION_VOLATILITY_BOUNDARIES = {
-    'QUIET_MAX': VOLATILITY_THRESHOLDS['QUIET'],
-    'NORMAL_MAX': VOLATILITY_THRESHOLDS['NORMAL'],
-    'ACTIVE_MAX': VOLATILITY_THRESHOLDS['ACTIVE']
-}
-
-def load_feature_vector(symbol: str, fecha: str) -> Optional[Dict[str, Any]]:
-    fv_file = DECISION_FEATURE_VECTORS / f"fv_{symbol.upper()}_{fecha}.json"
-    return load_contract_safe(fv_file) if fv_file.exists() else None
-
 def normalize_metric(metric_name: str, value: float) -> float:
-    cap = DECISION_NORMALIZATION_CAPS.get(metric_name, 100.0)
-    if metric_name in INVERTED_METRICS:
+    cap = EDGE_NORMALIZATION_CAPS.get(metric_name, 100.0)
+    # INVERTED_METRICS logic implicitly handled if metric in specific list, 
+    # but for simplicity keep original logic with new caps
+    if metric_name in {'regime_transitions_count', 'liquidity_changes_count'}:
         inverted = max(0.0, cap - value)
-        normalized = (inverted / cap) * 100.0
-    else:
-        normalized = (min(value, cap) / cap) * 100.0
-    return float(np.clip(normalized, 0.0, 100.0))
+        return float(np.clip((inverted / cap) * 100.0, 0.0, 100.0))
+    return float(np.clip((min(value, cap) / cap) * 100.0, 0.0, 100.0))
 
 def calculate_edge_score_for_style(fv: Dict[str, Any], style: str) -> Dict[str, Any]:
     weights = READINESS_STYLE_WEIGHTS.get(style)
-    if weights is None:
-        return {"edge_score": 0.0, "breakdown": {}, "error": "style_not_found"}
+    if weights is None: return {"edge_score": 0.0}
     dimension_scores = {}
     for dimension, dim_weight in weights.items():
-        dimension_scores[dimension] = 0.0
-        if dim_weight == 0.0:
-            continue
+        if dim_weight == 0.0: continue
         if dimension == 'persistence':
-            dur_score = normalize_metric('regime_duration_bars', fv.get('regime_duration_bars', 1.0))
-            age_score = normalize_metric('regime_age_minutes', fv.get('regime_age_minutes', 0.0))
-            dimension_scores[dimension] = (dur_score * 0.60) + (age_score * 0.40)
+            dimension_scores[dimension] = (normalize_metric('regime_duration_bars', fv.get('regime_duration_bars', 1.0)) * 0.60) + \
+                                          (normalize_metric('regime_age_minutes', fv.get('regime_age_minutes', 0.0)) * 0.40)
         elif dimension == 'execution':
-            trans_score = normalize_metric('regime_transitions_count', fv.get('regime_transitions_count', 0.0))
-            liq_score = normalize_metric('liquidity_changes_count', fv.get('liquidity_changes_count', 0.0))
-            dimension_scores[dimension] = (trans_score * 0.50) + (liq_score * 0.50)
-        elif dimension == 'anomaly':
-            dimension_scores[dimension] = normalize_metric('minutes_since_last_anomalous_minute', fv.get('minutes_since_last_anomalous_minute', 9999.0))
-        elif dimension == 'spread':
-            dimension_scores[dimension] = normalize_metric('minutes_since_extreme_spread', fv.get('minutes_since_extreme_spread', 9999.0))
+            dimension_scores[dimension] = (normalize_metric('regime_transitions_count', fv.get('regime_transitions_count', 0.0)) * 0.50) + \
+                                          (normalize_metric('liquidity_changes_count', fv.get('liquidity_changes_count', 0.0)) * 0.50)
+        elif dimension == 'anomaly': dimension_scores[dimension] = normalize_metric('minutes_since_last_anomalous_minute', fv.get('minutes_since_last_anomalous_minute', 9999.0))
+        elif dimension == 'spread': dimension_scores[dimension] = normalize_metric('minutes_since_extreme_spread', fv.get('minutes_since_extreme_spread', 9999.0))
         elif dimension == 'volatility':
             vol = fv.get('realized_volatility', 0.0)
-            bounds = DECISION_VOLATILITY_BOUNDARIES
-            if vol < bounds['QUIET_MAX']:
-                dimension_scores[dimension] = 25.0
-            elif vol < bounds['NORMAL_MAX']:
-                dimension_scores[dimension] = 50.0
-            elif vol < bounds['ACTIVE_MAX']:
-                dimension_scores[dimension] = 75.0
-            else:
-                dimension_scores[dimension] = 40.0
+            if vol < VOLATILITY_THRESHOLDS['QUIET']: dimension_scores[dimension] = EDGE_VOLATILITY_SCORES["quiet"]
+            elif vol < VOLATILITY_THRESHOLDS['NORMAL']: dimension_scores[dimension] = EDGE_VOLATILITY_SCORES["normal"]
+            elif vol < VOLATILITY_THRESHOLDS['ACTIVE']: dimension_scores[dimension] = EDGE_VOLATILITY_SCORES["active"]
+            else: dimension_scores[dimension] = EDGE_VOLATILITY_SCORES["explosive"]
     
-    edge_score = sum(dimension_scores.get(dim, 0.0) * weights[dim] for dim in weights if dim in dimension_scores)
-    return {
-        "edge_score": round(float(np.clip(edge_score, 0.0, 100.0)), 1),
-        "breakdown": {k: round(v, 1) for k, v in dimension_scores.items()},
-        "weights_used": weights
-    }
+    score = sum(dimension_scores.get(dim, 0.0) * weights[dim] for dim in weights if dim in dimension_scores)
+    return {"edge_score": round(float(np.clip(score, 0.0, 100.0)), 1), "breakdown": {k: round(v, 1) for k, v in dimension_scores.items()}}
 
 def main():
-    parser = argparse.ArgumentParser(description="Edge Evaluation Engine")
-    parser.add_argument("--date", type=str, default="latest")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", default="latest")
     args = parser.parse_args()
     fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
-    logger.info("=" * 80 + f"\n🎯 INICIANDO EDGE ENGINE - FECHA: {fecha}\n" + "=" * 80)
     
-    edge_data = {
-        "fecha": fecha,
-        "timestamp_generacion": datetime.now(timezone.utc).isoformat(),
-        "edge_scores": {}
-    }
-    success_count = 0
-    symbols = get_symbols()
-    for symbol in symbols:
-        fv = load_feature_vector(symbol, fecha)
-        if fv is None:
-            continue
+    edge_data = {"fecha": fecha, "edge_scores": {}}
+    for symbol in get_symbols():
+        fv = load_contract_safe(DECISION_FEATURE_VECTORS / f"fv_{symbol.upper()}_{fecha}.json")
+        if fv is None: continue
         symbol_edges = {}
         for style in ['scalping', 'intraday', 'swing']:
-            result = calculate_edge_score_for_style(fv, style)
-            symbol_edges[style] = result
-            min_threshold = EDGE_MIN_THRESHOLD.get(style, 60.0)
-            if result["edge_score"] >= min_threshold:
-                logger.info(f"✅ {symbol:8} | {style:10} | Edge: {result['edge_score']:5.1f} | Breakdown: {result['breakdown']}")
+            res = calculate_edge_score_for_style(fv, style)
+            symbol_edges[style] = res
+            if res["edge_score"] >= READINESS_THRESHOLDS.get(f"min_score_{style}", 60.0):
+                logger.info(f"✅ {symbol} | {style} | Edge: {res['edge_score']}")
         edge_data["edge_scores"][symbol] = symbol_edges
-        success_count += 1
-    
-    output_path = DECISION_EDGE_SCORES / f"edge_scores_{fecha}.json"
-    save_contract_atomic(edge_data, output_path)
-    logger.info(f"💾 Resultados de Edge calculados y guardados en {output_path.name}")
+    save_contract_atomic(edge_data, DECISION_EDGE_SCORES / f"edge_scores_{fecha}.json")
 
-if __name__ == "__main__":
+if __name__ == "__main__": 
     main()

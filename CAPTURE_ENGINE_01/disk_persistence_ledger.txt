@@ -16,37 +16,44 @@ Responsabilidad:
 ==========================================================================
 """
 import json
-import logging
 import os
 import shutil
 import threading
 import time
 from collections import deque
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
+from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_paths import PRIMARY_TICK_DIR, SSD_EVIDENCE_DIR
 from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
+from SYSTEM_CANONICAL.system_symbols import get_symbol_specification
+from SYSTEM_CANONICAL.system_states import CAPTURE_THRESHOLDS
 from CAPTURE_ENGINE_01.capture_config import USAR_RAMDISK
 
 if USAR_RAMDISK:
-    ACTIVE_DATA_DIR = PRIMARY_TICK_DIR      # M:\TICK_DATA
-    SSD_BACKUP_DIR = SSD_EVIDENCE_DIR       # C:\MT5_DATA\02_SSD_EVIDENCE
+    ACTIVE_DATA_DIR = PRIMARY_TICK_DIR      
+    SSD_BACKUP_DIR = SSD_EVIDENCE_DIR       
 else:
-    ACTIVE_DATA_DIR = SSD_EVIDENCE_DIR      # C:\MT5_DATA\02_SSD_EVIDENCE
+    ACTIVE_DATA_DIR = SSD_EVIDENCE_DIR      
     SSD_BACKUP_DIR = None
 
 class TickLedger:
-    def __init__(self, symbol: str, max_buffer_size: int = 10000, batch_size: int = 1000, flush_interval_ms: int = 100):
+    def __init__(self, symbol: str):
         self.symbol = symbol.upper()
-        self.max_buffer_size = max_buffer_size
-        self.batch_size = batch_size
-        self.flush_interval = flush_interval_ms / 1000.0
-        self.logger = logging.getLogger(f"ledger.{self.symbol}")
+        
+        # Consumo estricto del catálogo canónico
+        spec = get_symbol_specification(self.symbol)
+        self.max_buffer_size = spec.buffer_size
+        
+        self.batch_size = CAPTURE_THRESHOLDS["batch_size"]
+        self.flush_interval = CAPTURE_THRESHOLDS["flush_interval_ms"] / 1000.0
+        self.min_free_gb = CAPTURE_THRESHOLDS["min_free_gb"]
+        
+        self.logger = get_system_logger("disk_ledger", "01_CAPTURE")
         
         self._buffer: deque = deque()
         self._lock = threading.Lock()
-        
         self._flush_event = threading.Event()
         self._running = True
         
@@ -68,80 +75,59 @@ class TickLedger:
         self._max_write_failures = 3
         self._circuit_breaker_open = False
         
-        self._writer_thread = threading.Thread(
-            target=self._writer_loop, 
-            daemon=True, 
-            name=f"ledger_writer_{self.symbol}"
-        )
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True, name=f"ledger_writer_{self.symbol}")
         self._writer_thread.start()
-        self.logger.info(f"✅ Ledger de Escritor Único iniciado para {self.symbol}")
+        self.logger.info(f"✅ Ledger de Escritor Único iniciado para {self.symbol} (Buffer: {self.max_buffer_size})")
 
     def append(self, tick_data: Dict[str, Any]) -> bool:
-        if not self._running or self._circuit_breaker_open:
-            return False
+        if not self._running or self._circuit_breaker_open: return False
             
         try:
             with self._lock:
-                if len(self._buffer) >= self.max_buffer_size:
-                    return False
+                if len(self._buffer) >= self.max_buffer_size: return False
                     
                 self._buffer.append(tick_data)
                 self._total_appended += 1
-                
-                if len(self._buffer) >= self.batch_size:
-                    self._flush_event.set()
-                    
+                if len(self._buffer) >= self.batch_size: self._flush_event.set()
             return True
         except Exception as e:
             self.logger.error(f"Error en operación append de {self.symbol}: {e}")
             return False
-
-    def _flush(self):
-        self._flush_event.set()
 
     def _writer_loop(self):
         while self._running or len(self._buffer) > 0:
             try:
                 self._flush_event.wait(self.flush_interval)
                 self._flush_event.clear()
-                
                 batch = []
                 with self._lock:
                     if len(self._buffer) > 0:
                         batch = list(self._buffer)
                         self._buffer.clear()
-                        
-                if batch:
-                    self._writer_thread_work(batch)
-                    
+                if batch: self._writer_thread_work(batch)
             except Exception as e:
                 self.logger.error(f"Error en bucle de escritor único para {self.symbol}: {e}")
                 time.sleep(0.1)
 
     def _writer_thread_work(self, batch: List[Dict]):
-        if not batch:
-            return
+        if not batch: return
             
         if not self._check_disk_space():
             self.logger.critical(f"⛔ Almacenamiento crítico para {self.symbol}. Cancelando persistencia.")
             self._circuit_breaker_open = True
-            with self._lock:
-                self._buffer.extendleft(reversed(batch))
+            with self._lock: self._buffer.extendleft(reversed(batch))
             return
             
         try:
             first_tick = batch[0]
             timestamp_ms = first_tick.get("tm", int(time.time() * 1000))
-            
             dt = datetime.fromtimestamp(timestamp_ms / 1000, BROKER_TZ)
             date_str = dt.strftime("%Y%m%d")
-            
             epoch_hour = (int(timestamp_ms / 1000) // 3600) * 3600
             
             lines = []
             for tick in batch:
-                if "seq" not in tick:
-                    self.logger.warning(f"⚠️ Alerta de integridad: Tick sin SEQ por el ledger de {self.symbol}")
+                if "seq" not in tick: self.logger.warning(f"⚠️ Alerta de integridad: Tick sin SEQ por el ledger de {self.symbol}")
                 lines.append(json.dumps(tick, separators=(",", ":")) + "\n")
             block_data = "".join(lines)
             
@@ -157,66 +143,45 @@ class TickLedger:
                 try:
                     ssd_file_path = self._ssd_dir / date_str / f"{self.symbol}_{epoch_hour}.jsonl"
                     ssd_file_path.parent.mkdir(parents=True, exist_ok=True)
-                    
                     with open(ssd_file_path, "a", encoding="utf-8") as f_ssd:
                         f_ssd.write(block_data)
                         f_ssd.flush()
                         os.fsync(f_ssd.fileno())
                 except Exception as ssd_err:
-                    self.logger.warning(
-                        f"⚠️ Fallo de escritura en la unidad de backup SSD para {self.symbol}: {ssd_err}."
-                    )
+                    self.logger.warning(f"⚠️ Fallo de escritura en la unidad de backup SSD para {self.symbol}: {ssd_err}.")
                     
             self._total_flushed += len(batch)
             self._write_failures = 0
-            
         except Exception as e:
             self._write_failures += 1
             self.logger.error(f"Error escribiendo batch a disco para {self.symbol}: {e}")
-            
-            if self._write_failures >= self._max_write_failures:
-                self._circuit_breaker_open = True
-                
+            if self._write_failures >= self._max_write_failures: self._circuit_breaker_open = True
             try:
-                with self._lock:
-                    self._buffer.extendleft(reversed(batch))
-            except Exception:
-                pass
+                with self._lock: self._buffer.extendleft(reversed(batch))
+            except Exception: pass
 
-    def _check_disk_space(self, min_free_gb: float = 0.5) -> bool:
+    def _check_disk_space(self) -> bool:
         try:
             stat = shutil.disk_usage(self._data_dir)
-            free_gb = stat.free / (1024 ** 3)
-            if free_gb < min_free_gb:
-                return False
-                
+            if (stat.free / (1024 ** 3)) < self.min_free_gb: return False
             if self.dual_write_enabled:
                 stat_ssd = shutil.disk_usage(self._ssd_dir)
-                free_ssd_gb = stat_ssd.free / (1024 ** 3)
-                if free_ssd_gb < min_free_gb:
-                    return False
+                if (stat_ssd.free / (1024 ** 3)) < self.min_free_gb: return False
             return True
-        except Exception:
-            return True
+        except Exception: return True
 
     def get_status(self) -> Dict[str, Any]:
         current_size = len(self._buffer)
         return {
-            "symbol": self.symbol,
-            "buffer_size": current_size,
-            "max_buffer": self.max_buffer_size,
+            "symbol": self.symbol, "buffer_size": current_size, "max_buffer": self.max_buffer_size,
             "buffer_pct": (current_size / self.max_buffer_size) * 100.0 if self.max_buffer_size > 0 else 0.0,
-            "total_appended": self._total_appended,
-            "total_flushed": self._total_flushed,
-            "pending": self._total_appended - self._total_flushed,
-            "is_running": self._running,
-            "circuit_breaker": self._circuit_breaker_open,
-            "write_failures": self._write_failures,
+            "total_appended": self._total_appended, "total_flushed": self._total_flushed,
+            "pending": self._total_appended - self._total_flushed, "is_running": self._running,
+            "circuit_breaker": self._circuit_breaker_open, "write_failures": self._write_failures,
             "dual_write_active": self.dual_write_enabled
         }
 
     def shutdown(self):
         self._running = False
         self._flush_event.set()
-        if self._writer_thread.is_alive():
-            self._writer_thread.join(timeout=5.0)
+        if self._writer_thread.is_alive(): self._writer_thread.join(timeout=5.0)

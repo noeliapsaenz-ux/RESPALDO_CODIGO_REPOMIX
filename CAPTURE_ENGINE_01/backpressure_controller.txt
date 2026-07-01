@@ -14,31 +14,16 @@ Responsabilidad:
 ==========================================================================
 """
 import time
-import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
-from SYSTEM_CANONICAL.system_states import SystemState
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_CANONICAL.system_states import SystemState, BACKPRESSURE_THRESHOLDS, BACKPRESSURE_SPEEDS
 from SYSTEM_CANONICAL.system_symbols import get_symbol_specification
 
-
 class StateMachine:
-    BASE_THRESHOLDS = {
-        'GREEN': {'buffer_pct': 30, 'overflow_rate': 0, 'slope': 0},
-        'YELLOW': {'buffer_pct': 60, 'overflow_rate': 1, 'slope': 5},
-        'ORANGE': {'buffer_pct': 85, 'overflow_rate': 5, 'slope': 20},
-        'RED': {'buffer_pct': 95, 'overflow_rate': 10, 'slope': 50}
-    }
-    
-    SPEEDS = {
-        'GREEN': 1.0,
-        'YELLOW': 0.85,
-        'ORANGE': 0.60,
-        'RED': 0.30
-    }
-
     def __init__(self, symbol: str):
         self.symbol = symbol.upper()
-        self.logger = logging.getLogger(f"state.{self.symbol}")
+        self.logger = get_system_logger("backpressure", "01_CAPTURE")
         
         spec = get_symbol_specification(self.symbol)
         self.multiplier = spec.backpressure_multiplier
@@ -60,13 +45,12 @@ class StateMachine:
 
     def _calculate_dynamic_thresholds(self) -> Dict[str, Dict[str, float]]:
         thresholds = {}
-        for state, values in self.BASE_THRESHOLDS.items():
+        for state, values in BACKPRESSURE_THRESHOLDS.items():
             thresholds[state] = {
                 'buffer_pct': values['buffer_pct'],
                 'overflow_rate': values['overflow_rate'] * (0.5 + 0.5 * self.multiplier),
                 'slope': values['slope'] * (0.3 + 0.7 * self.multiplier)
             }
-        self.logger.debug(f"📊 Umbrales dinámicos adaptados para {self.symbol}: {thresholds}")
         return thresholds
 
     def update(self, buffer_pct: float, overflow_rate: float, slope: float, loss_rate: float = 0.0) -> SystemState:
@@ -82,11 +66,8 @@ class StateMachine:
         now = time.time()
         
         self._state_history_window.append({
-            'time': now,
-            'state': new_state.value,
-            'buffer': buffer_pct,
-            'slope': slope,
-            'overflow': overflow_rate
+            'time': now, 'state': new_state.value, 'buffer': buffer_pct, 
+            'slope': slope, 'overflow': overflow_rate
         })
         
         cutoff = now - self._history_max
@@ -124,8 +105,7 @@ class StateMachine:
         return SystemState.GREEN
 
     def _is_oscillating(self) -> bool:
-        if len(self._state_history_window) < 10:
-            return False
+        if len(self._state_history_window) < 10: return False
         states = [h['state'] for h in self._state_history_window[-10:]]
         transitions = sum(1 for i in range(1, len(states)) if states[i] != states[i-1])
         return transitions > 3
@@ -134,38 +114,23 @@ class StateMachine:
         old_state = self.current_state
         self.current_state = new_state
         self._last_transition_time = time.time()
-        self.state_history.append({
-            'time': time.time(),
-            'from': old_state.value,
-            'to': new_state.value,
-            'metrics': self.get_metrics()
-        })
-        if len(self.state_history) > 1000:
-            self.state_history = self.state_history[-1000:]
+        self.state_history.append({'time': time.time(), 'from': old_state.value, 'to': new_state.value, 'metrics': self.get_metrics()})
+        if len(self.state_history) > 1000: self.state_history = self.state_history[-1000:]
             
-        self.logger.info(
-            f"🔀 {self.symbol}: {old_state.value} → {new_state.value} | "
-            f"Buffer: {self._buffer_pct:.1f}% | Overflow: {self._overflow_rate:.1f}/s | Slope: {self._slope:.1f}"
-        )
+        self.logger.info(f"🔀 {self.symbol}: {old_state.value} → {new_state.value} | Buffer: {self._buffer_pct:.1f}% | Overflow: {self._overflow_rate:.1f}/s | Slope: {self._slope:.1f}")
         if new_state == SystemState.RED:
             self.logger.warning(f"🔴 {self.symbol} en estado CRÍTICO (RED) — Reduciendo velocidad de encolamiento.")
 
     def get_speed(self) -> float:
-        base_speed = self.SPEEDS.get(self.current_state.value, 1.0)
+        base_speed = BACKPRESSURE_SPEEDS.get(self.current_state.value, 1.0)
         speed_factor = 0.7 + 0.3 * self.multiplier
         return base_speed * speed_factor
 
     def get_metrics(self) -> Dict[str, Any]:
         return {
-            'symbol': self.symbol,
-            'state': self.current_state.value,
-            'speed': self.get_speed(),
-            'buffer_pct': self._buffer_pct,
-            'overflow_rate': self._overflow_rate,
-            'slope': self._slope,
-            'loss_rate': self._loss_rate,
-            'state_duration': time.time() - self._last_transition_time,
-            'multiplier': self.multiplier
+            'symbol': self.symbol, 'state': self.current_state.value, 'speed': self.get_speed(),
+            'buffer_pct': self._buffer_pct, 'overflow_rate': self._overflow_rate, 'slope': self._slope,
+            'loss_rate': self._loss_rate, 'state_duration': time.time() - self._last_transition_time, 'multiplier': self.multiplier
         }
 
     def is_critical(self) -> bool:

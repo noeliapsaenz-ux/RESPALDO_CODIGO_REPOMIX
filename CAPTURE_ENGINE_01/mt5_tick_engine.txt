@@ -154,7 +154,7 @@ class TickCapturerV2:
         # en vez del spec canónico directo, dejando un único punto de ajuste
         # para cuando se reconecte el feedback dinámico de QUANT_ENGINE_03.
         _canonical_buffer = SYMBOL_CONFIG.get(self.symbol, {}).get('buffer_size', self.symbol_spec.buffer_size)
-        self.ledger = TickLedger(self.symbol, max_buffer_size=_canonical_buffer)
+        self.ledger = TickLedger(symbol=self.symbol)
         
         self.state_machine = StateMachine(self.symbol)
         self.slope_monitor = SlopeMonitor(self.symbol)
@@ -500,7 +500,7 @@ class TickCapturerV2:
                     )
                     
                     self.alert_engine.evaluate(
-                        state=state.value,
+                        state=state,
                         last_tick_time=last_tick_time_sec,
                         overflow_rate=overflow_rate,
                         loss_rate=loss_rate,

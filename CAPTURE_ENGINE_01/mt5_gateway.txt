@@ -15,12 +15,12 @@ Responsabilidad:
 ==========================================================================
 """
 import os
-import logging
+from SYSTEM_SERVICES.system_logger import get_system_logger
 from typing import Optional, Any
 
 from SYSTEM_CANONICAL.system_sessions import is_market_open
 
-logger = logging.getLogger("mt5_wrapper")
+logger = get_system_logger("mt5_gateway", "01_CAPTURE")
 
 try:
     import MetaTrader5 as mt5

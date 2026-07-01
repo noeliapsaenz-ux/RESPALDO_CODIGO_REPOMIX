@@ -27,8 +27,8 @@ from SYSTEM_CANONICAL.system_symbols import get_symbols
 from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_CONTRACTS.contract_manager import load_contract_safe, save_contract_atomic
-
 from AUDIT_ENGINE_02.audit_contracts import resolve_target_date
+from SYSTEM_CANONICAL.system_states import STALE_TICKS_EVENT_THRESHOLD
 
 logger = get_system_logger("historical_persistence", "02_AUDIT")
 
@@ -64,7 +64,7 @@ def extract_events_for_symbol(symbol: str, fecha: str, capture_item: Optional[Di
             events.append(_create_event("negative_timestamps", neg_gaps))
 
         stale_pct = metrics.get("stale_ticks_pct", 0.0)
-        if stale_pct > 80.0:
+        if stale_pct > STALE_TICKS_EVENT_THRESHOLD:
             events.append(_create_event("stale_ticks_burst", int(stale_pct)))
 
     if lineage_item:

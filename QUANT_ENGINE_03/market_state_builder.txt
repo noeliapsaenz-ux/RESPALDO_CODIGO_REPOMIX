@@ -23,6 +23,7 @@ if str(root_path) not in sys.path:
 # Imports directos desde las capas unificadas del sistema
 from SYSTEM_CANONICAL.system_symbols import get_symbols, get_spread_limit
 from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str, BROKER_TZ
+from SYSTEM_CANONICAL.system_states import STATE_BUILDER_THRESHOLDS, STATE_BUILDER_PENALTIES
 from SYSTEM_SERVICES.system_paths import AUDIT_GOLD, QUANT_BARS
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_CONTRACTS.contract_manager import (
@@ -35,9 +36,6 @@ from SYSTEM_CONTRACTS.contract_manager import (
 )
 
 logger = get_system_logger("market_state_builder", "03_QUANT")
-
-MIN_TICKS_FOR_CONFIDENCE = 15
-MIN_TICKS_FOR_VOLATILITY = 10
 
 def clasificar_estado_minuto(tps: float, spread_mean: float, realized_vol: float, limit: float) -> str:
     """🟢 CAPA 10: Clasificación del Estado Operacional del Minuto"""
@@ -117,7 +115,7 @@ def construir_market_state(symbol: str, fecha: str) -> bool:
     quality_std = resampler['quality_score'].std().fillna(0.0).round(1)
     quality_min = resampler['quality_score'].min().fillna(100.0).round(1)
     quality_p10 = resampler['quality_score'].quantile(0.10).fillna(100.0).round(1)
-    quality_ticks_for_vol = resampler['quality_score'].apply(lambda x: int(np.sum(x >= 70.0)))
+    quality_ticks_for_vol = resampler['quality_score'].apply(lambda x: int(np.sum(x >= STATE_BUILDER_THRESHOLDS["min_quality_score_for_vol"])))
 
     latency_mean = resampler['latency_ms'].mean().round(1)
     latency_max = resampler['latency_ms'].max().round(0)
@@ -147,23 +145,26 @@ def construir_market_state(symbol: str, fecha: str) -> bool:
     zero_spread_ticks = resampler['is_zero'].sum()
     duplicate_ticks = resampler['is_duplicate'].sum()
 
-    penalties = (duplicate_ticks * 5.0 + stale_ticks * 0.5 + reversed_spread_ticks * 10.0 +
-                 zero_spread_ticks * 10.0 + clock_issue_ticks * 5.0)
-    integrity_score = np.clip(100.0 - (penalties / (tick_count + 1e-9) * 100.0), 0.0, 100.0).round(1)
+    p = STATE_BUILDER_PENALTIES
+    penalties = (duplicate_ticks * p["duplicate_tick"] + 
+                 stale_ticks * p["stale_tick"] + 
+                 reversed_spread_ticks * p["reversed_spread"] +
+                 zero_spread_ticks * p["zero_spread"] + 
+                 clock_issue_ticks * p["clock_issue"])
 
     realized_volatility = []
     median_return = []
     mad_return = []
     
     for _, group in resampler:
-        if len(group) < MIN_TICKS_FOR_VOLATILITY:
+        if len(group) < STATE_BUILDER_THRESHOLDS["min_ticks_volatility"]:
             realized_volatility.append(0.0)
             median_return.append(0.0)
             mad_return.append(0.0)
             continue
         
-        quality_ticks = group[group['quality_score'] >= 70.0]
-        if len(quality_ticks) < MIN_TICKS_FOR_VOLATILITY:
+        quality_ticks = group[group['quality_score'] >= STATE_BUILDER_THRESHOLDS["min_quality_score_for_vol"]]
+        if len(quality_ticks) < STATE_BUILDER_THRESHOLDS["min_ticks_volatility"]:
             realized_volatility.append(0.0)
             median_return.append(0.0)
             mad_return.append(0.0)
@@ -244,8 +245,8 @@ def construir_market_state(symbol: str, fecha: str) -> bool:
     limit = get_spread_limit(symbol)
     df_bars['minute_state'] = [clasificar_estado_minuto(t, s, v, limit) for t, s, v in zip(df_bars['tps_abs'], df_bars['spread_mean'], df_bars['realized_volatility'])]
 
-    df_bars['low_confidence'] = df_bars['tick_count'] < MIN_TICKS_FOR_CONFIDENCE
-    df_bars['vol_low_confidence'] = df_bars['quality_ticks_for_vol'] < MIN_TICKS_FOR_VOLATILITY
+    df_bars['low_confidence'] = df_bars['tick_count'] < STATE_BUILDER_THRESHOLDS["min_ticks_confidence"]
+    df_bars['vol_low_confidence'] = df_bars['quality_ticks_for_vol'] < STATE_BUILDER_THRESHOLDS["min_ticks_volatility"]
 
     df_bars['close'] = df_bars['close'].ffill()
     df_bars['open'] = df_bars['open'].fillna(df_bars['close'])

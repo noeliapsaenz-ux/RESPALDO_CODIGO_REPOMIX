@@ -43,7 +43,7 @@ from SYSTEM_SERVICES.system_paths import (
 )
 from SYSTEM_CANONICAL.system_symbols import get_symbols
 from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
-from SYSTEM_CANONICAL.system_states import AUDIT_THRESHOLDS
+from SYSTEM_CANONICAL.system_states import AUDIT_THRESHOLDS, AUDIT_PENALTIES
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_CONTRACTS.contract_manager import (
     PARQUET_SCHEMAS,
@@ -211,7 +211,7 @@ def auditar_lineage(symbol: str, fecha: str) -> Dict[str, Any]:
                 "code": "cryptographic_tamper_detected",
                 "message": "Fallo de cadena de custodia: El hash colectivo actual no coincide con la firma inicial."
             })
-            penalty += 50.0
+            penalty += AUDIT_PENALTIES["cryptographic_tamper_detected"]
     else:
         state[symbol][fecha] = collective_hash
         save_contract_atomic(state, state_file)
@@ -221,7 +221,7 @@ def auditar_lineage(symbol: str, fecha: str) -> Dict[str, Any]:
             "code": "invalid_structure",
             "message": "Esquema del Parquet Maestro no coincide con las columnas requeridas canónicas."
         })
-        penalty += 25.0
+        penalty += AUDIT_PENALTIES["invalid_structure"]
 
     result["confidence"] = max(0.0, 100.0 - penalty)
     

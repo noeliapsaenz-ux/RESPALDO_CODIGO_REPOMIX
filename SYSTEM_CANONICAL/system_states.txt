@@ -7,6 +7,7 @@ Responsabilidad: Centralizar los enumeradores de estado operativos, de calidad
                  y los umbrales numéricos de control del sistema.
 ==========================================================================
 """
+import os
 from enum import Enum
 
 class CaptureProcessState(str, Enum):
@@ -135,7 +136,10 @@ READINESS_THRESHOLDS = {
     "fci_min_swing": 55.0,
     "spread_score_min_scalping": 50.0,
     "spread_score_min_intraday": 45.0,
-    "spread_score_min_swing": 40.0
+    "spread_score_min_swing": 40.0,
+    "min_score_scalping": 70.0,
+    "min_score_intraday": 65.0,
+    "min_score_swing": 60.0
 }
 
 READINESS_STYLE_WEIGHTS = {
@@ -169,3 +173,203 @@ ANOMALY_CONFIG = {
 }
 
 LOOKBACK_DAYS = 30
+
+# ==========================================================================
+# UMBRALES Y PARAMETROS DEL MOTOR DE CAPTURA (F0)
+# ==========================================================================
+CAPTURE_THRESHOLDS = {
+    "alert_cooldown_sec": 30.0,
+    "stall_divisor": 8.0,
+    "loss_divisor": 5.0,
+    "min_free_gb": 0.5,
+    "flush_interval_ms": 100,
+    "batch_size": 1000
+}
+# ==========================================================================
+# UMBRALES Y PESOS FORENSES DEL MOTOR DE AUDITORÍA (F2)
+# ==========================================================================
+AUDIT_PENALTIES = {
+    "state_red_alert": 30.0,
+    "loss_rate_exceeded": 20.0,
+    "overflow_rate_exceeded": 20.0,
+    "seq_inversion": 25.0,
+    "cryptographic_tamper_detected": 50.0,
+    "invalid_structure": 25.0,
+    "state_yellow_warning": 15.0,
+    "moderate_loss": 5.0,
+    "moderate_overflow": 5.0,
+    "high_buffer_pct": 5.0,
+    "no_shutdown_ok": 5.0
+}
+
+FCI_WEIGHTS = {
+    "continuity": 0.40,
+    "sequence": 0.30,
+    "temporal": 0.20,
+    "quality": 0.10
+}
+
+FCI_PENALTY_MULTIPLIERS = {
+    "missing_file": 20.0,
+    "seq_duplicates_divisor": 0.01,
+    "seq_duplicates_max_penalty": 15.0,
+    "seq_inversions": 5.0,
+    "seq_resets": 10.0,
+    "infra_silence": 10.0,
+    "negative_gap": 5.0,
+    "bid_ask_inversion": 1.0,
+    "stale_ticks_multiplier": 2.0,
+    "stale_ticks_baseline": 80.0
+}
+
+STALL_THRESHOLD_MS = 5000
+STALE_TICKS_EVENT_THRESHOLD = 80.0
+
+# ==========================================================================
+# UMBRALES Y PESOS DEL MOTOR CUANTITATIVO (F3)
+# ==========================================================================
+SCORE_CALIBRATION = {
+    "lookback_trend_days": 15,
+    "lookback_spread_ticks": 100,
+    "lookback_liquidity_ticks": 80,
+    "lookback_activity_ticks": 100,
+    "lookback_stability_ticks": 120,
+    "tps_optimal_target": 1.5,
+    "tps_burst_target": 2.0
+}
+
+SCORE_WEIGHTS = {
+    "spread": {"level": 0.60, "dispersion": 0.20, "symmetry": 0.20},
+    "liquidity": {"tps": 0.30, "idle": 0.30, "cv": 0.20, "balance": 0.20},
+    "activity": {"tps_abs": 0.30, "tps_eff": 0.30, "interval": 0.20, "burst": 0.20},
+    "stability": {"spread": 0.30, "latency": 0.30, "quality": 0.20, "integrity": 0.20},
+    "infrastructure": {"latency": 0.40, "jitter": 0.40, "clock": 0.20},
+    "confidence": {"base": 0.80, "ratio": 0.20},
+    "volatility": {"base_quiet": 25.0, "base_normal": 50.0, "base_active": 75.0, "base_explosive": 100.0}
+}
+
+STATE_BUILDER_THRESHOLDS = {
+    "min_ticks_confidence": 15,
+    "min_ticks_volatility": 10,
+    "min_quality_score_for_vol": 70.0
+}
+
+STATE_BUILDER_PENALTIES = {
+    "duplicate_tick": 5.0,
+    "stale_tick": 0.5,
+    "reversed_spread": 10.0,
+    "zero_spread": 10.0,
+    "clock_issue": 5.0
+}
+
+SYSTEMIC_THRESHOLDS = {
+    "volatility_svi_quiet": 70.0,
+    "volatility_svi_normal": 130.0,
+    "volatility_svi_active": 200.0,
+    "liquidity_gli_optimal": 85.0,
+    "liquidity_gli_normal": 60.0,
+    "cohesion_idiosyncratic": 0.40,
+    "cohesion_rotation": 0.70,
+    "risk_appetite_on": 0.5,
+    "risk_appetite_off": -0.5,
+    "activity_quiet_tps": 3.0,
+    "activity_normal_tps": 15.0
+}
+BACKPRESSURE_THRESHOLDS = {
+    'GREEN': {'buffer_pct': 30, 'overflow_rate': 0, 'slope': 0},
+    'YELLOW': {'buffer_pct': 60, 'overflow_rate': 1, 'slope': 5},
+    'ORANGE': {'buffer_pct': 85, 'overflow_rate': 5, 'slope': 20},
+    'RED': {'buffer_pct': 95, 'overflow_rate': 10, 'slope': 50}
+}
+
+BACKPRESSURE_SPEEDS = {
+    'GREEN': 1.0,
+    'YELLOW': 0.85,
+    'ORANGE': 0.60,
+    'RED': 0.30
+}
+
+SLOPE_THRESHOLDS = {
+    "warning": 5.0,
+    "critical": 20.0
+}
+
+# ==========================================================================
+# CONFIGURACIÓN DE INFRAESTRUCTURA DE ARCHIVOS (F0 - Almacenamiento)
+# ==========================================================================
+VERIFY_RAMDISK_SSD_MATCH = os.getenv("VERIFY_RAMDISK_SSD_MATCH", "True").upper() == "TRUE"
+QUARANTINE_SUFFIX = ".QUARANTINE_MISMATCH"
+
+#MODULO DE DECISION_ENGINE
+
+# CONFIGURACIÓN PARA CANONICAL_SCORES
+SCORE_CALIBRATION = {
+    "lookback_spread_ticks": 100.0,
+    "lookback_liquidity_ticks": 80.0,
+    "lookback_volatility_ticks": 15.0,
+    "lookback_infrastructure_ticks": 60.0,
+    "lookback_stability_ticks": 120.0
+}
+
+SCORE_WEIGHTS = {
+    "spread": {"level": 0.60, "dispersion": 0.20, "symmetry": 0.20},
+    "liquidity": {"tps": 0.30, "idle": 0.30, "cv": 0.20, "balance": 0.20},
+    "activity": {"tps_abs": 0.30, "tps_eff": 0.30, "interval": 0.20, "regularity": 0.20},
+    "stability": {"spread": 0.30, "latency": 0.30, "quality": 0.20, "integrity": 0.20},
+    "infrastructure": {"latency": 0.40, "jitter": 0.40, "clock": 0.20}
+}
+
+# UMBRALES PARA MASTER_STATE_CONSOLIDATOR
+SYSTEMIC_THRESHOLDS = {
+    "volatility_svi_quiet": 70.0,
+    "volatility_svi_normal": 130.0,
+    "volatility_svi_active": 200.0,
+    "liquidity_gli_optimal": 85.0,
+    "liquidity_gli_normal": 60.0,
+    "cohesion_idiosyncratic": 0.40,
+    "cohesion_rotation": 0.70,
+    "risk_appetite_on": 0.5,
+    "risk_appetite_off": -0.5,
+    "activity_quiet_tps": 3.0,
+    "activity_normal_tps": 15.0
+}
+
+# UMBRALES Y PESOS DEL MOTOR DE DECISIÓN (F4)
+DECISION_THRESHOLDS = {
+    "min_confidence_score": 50.0,
+    "min_history_days_trend": 5,
+    "lookback_trend_persistence_days": 15
+}
+
+CONFIDENCE_WEIGHTS = {
+    "edge_score": 0.40,
+    "fci": 0.30,
+    "anomaly_score": 0.15,
+    "readiness": 0.15
+}
+
+EDGE_NORMALIZATION_CAPS = {
+    'regime_duration_bars': 100.0,
+    'regime_age_minutes': 1440.0,
+    'regime_transitions_count': 10.0,
+    'liquidity_changes_count': 10.0,
+    'minutes_since_last_anomalous_minute': 1440.0,
+    'minutes_since_extreme_spread': 1440.0
+}
+
+EDGE_VOLATILITY_SCORES = {
+    "quiet": 25.0,
+    "normal": 50.0,
+    "active": 75.0,
+    "explosive": 40.0
+}
+
+HYPOTHESIS_THRESHOLDS = {
+    "min_minutes_stable_spread": 60.0,
+    "min_minutes_no_anomalies": 60.0,
+    "min_strong_trend_persistence": 65.0,
+    "min_intraday_trend_persistence": 50.0,
+    "min_established_regime_bars": 10,
+    "max_low_transitions": 3,
+    "min_high_fci": 85.0
+}
