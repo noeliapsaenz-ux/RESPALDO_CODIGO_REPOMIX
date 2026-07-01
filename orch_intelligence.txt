@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 ORCH_INTELLIGENCE - ORQUESTADOR DEL PIPELINE DE INTELIGENCIA (FASE 3)

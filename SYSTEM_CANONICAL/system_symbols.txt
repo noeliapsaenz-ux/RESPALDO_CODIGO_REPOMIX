@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 SYSTEM_CANONICAL - SYSTEM_SYMBOLS (AUTORIDAD DE SÍMBOLOS DEFINITIVA)

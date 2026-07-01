@@ -1,4 +1,11 @@
-# -*- coding: utf-8 -*-
+"""
+==========================================================================
+DECISION ORCHESTRATOR - EL DIRECTOR DE LA FASE 4 (DECISION ENGINE)
+==========================================================================
+Ubicación: Carpeta raíz del proyecto (Python_MT5/)
+Responsabilidad: Secuenciar la ejecución de los 6 módulos de la Fase 4.
+==========================================================================
+"""
 """
 ==========================================================================
 DECISION ORCHESTRATOR - EL DIRECTOR DE LA FASE 4 (DECISION ENGINE)
@@ -20,17 +27,12 @@ import os
 import argparse
 from datetime import datetime
 
-# Importación segura desde el nuevo puente encapsulado
-from DECISION_ENGINE_04.decision_config import (
-    init_logging, get_fecha_broker_str, BROKER_TZ, send_telegram_alert
-)
+from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
+from SYSTEM_SERVICES.system_logger import get_system_logger, stop_logger_listener
+from SYSTEM_SERVICES.system_paths import SSD_EVIDENCE_DIR, DECISION_CONTRACTS
 
-logger = init_logging("decision_orchestrator", "00_ORCHESTRATOR")
+logger = get_system_logger("decision_orchestrator", "00_ORCHESTRATOR")
 
-
-# ==============================================================================
-# 🔗 CADENA DE EJECUCIÓN - ORDEN CRÍTICO DE FASE 4 (SIN NÚMEROS EN ARCHIVOS)
-# ==============================================================================
 DECISION_PIPELINE = [
     {"folder": "DECISION_ENGINE_04", "file": "learning_journal.py", "desc": "Validación Retrospectiva de Hipótesis", "critical": False},
     {"folder": "DECISION_ENGINE_04", "file": "feature_fusion.py", "desc": "Fusión de Features Certificados", "critical": True},
@@ -41,17 +43,16 @@ DECISION_PIPELINE = [
 ]
 
 def get_adaptive_timeout(fecha: str) -> int:
-    """Calcula dinámicamente el tiempo límite de ejecución según el volumen en disco."""
     base_timeout = 600
     try:
-        from paths import SSD_EVIDENCE_DIR
         total_bytes = sum(p.stat().st_size for p in SSD_EVIDENCE_DIR.rglob(f"*{fecha}*") if p.is_file())
         size_mb = total_bytes / (1024 * 1024)
         adaptive_bonus = int(size_mb * 30)
         total_timeout = base_timeout + adaptive_bonus
         logger.info(f"⏱️ Timeout adaptativo calibrado en {total_timeout}s.")
         return total_timeout
-    except Exception:
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo calcular el timeout adaptativo: {e}")
         return base_timeout
 
 def ejecutar_script_pipeline(folder: str, script_name: str, fecha: str, timeout: int = 600) -> bool:
@@ -76,7 +77,7 @@ def ejecutar_script_pipeline(folder: str, script_name: str, fecha: str, timeout:
             logger.info(f"✅ {script_name} finalizado con éxito.")
             return True
         else:
-            stderr_summary = result.stderr[-400:] if result.stderr else "Sin detalles."
+            stderr_summary = result.stderr[-400:] if result.stderr else "Sin detalles de error en stderr."
             logger.error(f"❌ {script_name} devolvió código de error {result.returncode}.\nDetalle:\n{stderr_summary}")
             return False
     except subprocess.TimeoutExpired:
@@ -85,29 +86,6 @@ def ejecutar_script_pipeline(folder: str, script_name: str, fecha: str, timeout:
     except Exception as e:
         logger.error(f"❌ Error inesperado ejecutando {script_name}: {e}")
         return False
-
-def enviar_resumen_telegram(fecha: str, results: dict, elapsed: float):
-    allow_count = 0
-    try:
-        import json
-        contract_file = raiz_proyecto / "06_DECISION_WORKSPACE" / "contracts" / f"decision_contracts_{fecha}.json"
-        if contract_file.exists():
-            with open(contract_file, "r", encoding="utf-8") as f: data = json.load(f)
-            allow_count = sum(1 for c in data.get("contracts", []) if c.get("decision") == "ALLOW")
-    except Exception: pass
-    
-    passed = sum(1 for v in results.values() if "PASS" in str(v))
-    total = len(results)
-    
-    msg_lines = [
-        f"🎯 *FASE 4 — DECISION ENGINE COMPLETADA*",
-        f"📅 Fecha: `{fecha}`",
-        f"📊 *Resumen de ejecución:*",
-        f"   • Módulos completados: {passed}/{total}",
-        f"   • Contratos ALLOW generados: *{allow_count}*",
-        f"   • Tiempo total: {elapsed:.1f}s",
-    ]
-    send_telegram_alert("\n".join(msg_lines))
 
 def main():
     parser = argparse.ArgumentParser(description="Decision Pipeline Orchestrator")
@@ -121,7 +99,6 @@ def main():
     results = {}
     abort_pipeline = False
     
-    # Obtener el timeout dinámico en función del volumen de la fecha actual
     timeout = get_adaptive_timeout(fecha)
     
     for step in DECISION_PIPELINE:
@@ -135,7 +112,8 @@ def main():
         success = ejecutar_script_pipeline(folder, name, fecha, timeout)
         step_elapsed = time.time() - step_start
         
-        if success: results[name] = f"PASS ({step_elapsed:.1f}s)"
+        if success: 
+            results[name] = f"PASS ({step_elapsed:.1f}s)"
         else:
             results[name] = f"FAIL ({step_elapsed:.1f}s)"
             if is_critical:
@@ -153,8 +131,8 @@ def main():
     logger.info(f"⏱️ Tiempo total: {elapsed_total:.1f}s | Pasos: {passed_steps}/{total_steps}")
     logger.info("=" * 80)
     
-    try: enviar_resumen_telegram(fecha, results, elapsed_total)
-    except Exception as e: logger.warning(f"⚠️ No se pudo enviar resumen: {e}")
+    # CIERRE SEGURO DE LOS HILOS DE LOGS
+    stop_logger_listener()
 
 if __name__ == "__main__":
     main()

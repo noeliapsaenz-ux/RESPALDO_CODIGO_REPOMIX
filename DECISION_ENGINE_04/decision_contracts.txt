@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 DECISION_CONTRACTS - Puente de contratos canónicos de decisión

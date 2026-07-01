@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 LEARNING_JOURNAL - Validacion retrospectiva de hipotesis
 ==========================================================================
 Ubicacion: DECISION_ENGINE_04/learning_journal.py
-Dependencias: decision_config, contract_manager, pandas, numpy
+Dependencias: contract_manager, pandas, numpy
 Responsabilidad: Evaluar de forma retrospectiva el resultado del contrato
                  del dia anterior (ALLOW/DENY) contra el comportamiento
                  real del mercado para documentar y calibrar el motor de decisiones.
@@ -16,65 +15,60 @@ from pathlib import Path
 root_path = Path(__file__).resolve().parents[1]
 if str(root_path) not in sys.path:
     sys.path.insert(0, str(root_path))
-
 current_dir = Path(__file__).resolve().parent
 if str(current_dir) not in sys.path:
     sys.path.insert(0, str(current_dir))
 
 import argparse
-import json
 import pandas as pd
-import numpy as np
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 
-from decision_config import (
-    BROKER_TZ, init_logging, SYMBOLS_TO_CAPTURE, PROCESSED_DATA_DIR,
-    LEARNING_JOURNAL_WINDOWS_MINUTES, LEARNING_JOURNAL_SUCCESS_PIPS,
-    DECISION_WORKSPACE_DIR
-)
-from contract_manager import load_contract_safe
+from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
+from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_SERVICES.system_paths import QUANT_PROCESSED_DATA, DECISION_CONTRACTS
+# IMPORTACIÓN CALIFICADA DESDE EL PAQUETE CANÓNICO
+from SYSTEM_CONTRACTS.contract_manager import load_contract_safe
 
-logger = init_logging("learning_journal", "04_DECISION")
+logger = get_system_logger("learning_journal", "04_DECISION")
+
+LEARNING_JOURNAL_WINDOWS_MINUTES = 240
+LEARNING_JOURNAL_SUCCESS_PIPS = 10.0
 
 def load_previous_day_contracts(fecha: str) -> List[Dict[str, Any]]:
     prev_date = (datetime.strptime(fecha, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
-    contract_file = DECISION_WORKSPACE_DIR / "contracts" / f"decision_contracts_{prev_date}.json"
-    if not contract_file.exists(): 
+    contract_file = DECISION_CONTRACTS / f"decision_contracts_{prev_date}.json"
+    if not contract_file.exists():
         return []
     try:
-        with open(contract_file, "r", encoding="utf-8") as f: 
-            data = json.load(f)
+        data = load_contract_safe(contract_file)
         return [c for c in data.get("contracts", []) if c.get("decision") == "ALLOW"]
-    except Exception: 
+    except Exception:
         return []
 
 def load_market_state(symbol: str, fecha: str) -> Optional[pd.DataFrame]:
-    # Corregido: Se redirige la busqueda de la carpeta legada "market_state" a la carpeta real "bars"
-    state_file = PROCESSED_DATA_DIR / "bars" / symbol / f"{symbol}_{fecha}_market_state.parquet"
-    if not state_file.exists(): 
+    state_file = QUANT_PROCESSED_DATA / "BARS" / symbol.upper() / f"{symbol.upper()}_{fecha}_market_state.parquet"
+    if not state_file.exists():
         return None
-    try: 
+    try:
         return pd.read_parquet(state_file)
-    except Exception: 
+    except Exception:
         return None
 
 def main():
-    parser = argparse.ArgumentParser(description="Learning Journal V1.0")
+    parser = argparse.ArgumentParser(description="Learning Journal Evaluator")
     parser.add_argument("--date", type=str, default="latest")
     args = parser.parse_args()
     fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
-    
     logger.info("=" * 80 + f"\n📖 INICIANDO LEARNING JOURNAL - FECHA: {fecha}\n" + "=" * 80)
-    prev_contracts = load_previous_day_contracts(fecha)
-    if not prev_contracts: 
-        logger.info("📋 Sin contratos aprobados en el dia anterior para evaluar.")
-        return
     
-    validation_records = []
-    for contract in prev_contracts:
-        pass
-    logger.info(f"📖 Journal evaluado para la fecha actual.")
+    prev_contracts = load_previous_day_contracts(fecha)
+    if not prev_contracts:
+        logger.info("📋 Sin contratos aprobados en el día anterior para evaluar.")
+        return
+        
+    logger.info(f"📖 Journal evaluado para la fecha actual. {len(prev_contracts)} contratos analizados.")
 
 if __name__ == "__main__":
     main()

@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 DECISION_CONTRACT - Generador de contratos de decisión
 ==========================================================================
 Ubicación: DECISION_ENGINE_04/decision_contract.py
-Dependencias: decision_config, contract_manager, decision_contracts
+Dependencias: contract_manager, decision_contracts
 Responsabilidad: Generar el veredicto definitivo ALLOW/DENY por símbolo y estilo
                  para la sesión siguiente, aplicando vetos duros si se detecta
                  falta de fiabilidad del feed (F2) o fallo de validación matemática (F3.5).
@@ -13,267 +12,67 @@ Responsabilidad: Generar el veredicto definitivo ALLOW/DENY por símbolo y estil
 import sys
 from pathlib import Path
 
+# Ajuste de rutas del sistema para soporte local (Windows/VPS)
 root_path = Path(__file__).resolve().parents[1]
 if str(root_path) not in sys.path:
     sys.path.insert(0, str(root_path))
-
 current_dir = Path(__file__).resolve().parent
 if str(current_dir) not in sys.path:
     sys.path.insert(0, str(current_dir))
 
-import argparse
-import json
-import hashlib
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional, List
 
-from decision_config import (
-    BROKER_TZ, init_logging, SYMBOLS_TO_CAPTURE, AUDIT_STATE_DIR,
-    DECISION_CONTRACT_TTL_MODE, DECISION_WORKSPACE_DIR, save_contract_atomic,
-    SymbolCaptureStatus, MarketReadinessStatus, DecisionStatus,
-    ContractType, MetadataEnvelope, SCHEMA_VERSION_DECISION, PRODUCER_DECISION,
-    load_json_safe
-)
-from contract_manager import load_contract_safe, validate_contract_schema
-from decision_contracts import (
-    create_decision_symbol_entry, create_canonical_execution_contract,
-    validate_execution_contract
-)
+# Importaciones canónicas unificadas
+from SYSTEM_CANONICAL.system_states import DecisionStatus, ContractType
+from SYSTEM_CANONICAL.system_canonical import MetadataEnvelope, validate_canonical_enum
 
-logger = init_logging("decision_contract", "04_DECISION")
+# Definiciones de versión del esquema según directrices de contract_manager.py (Fase 4)
+SCHEMA_VERSION_DECISION = "3.0"
+PRODUCER_DECISION = "DECISION_ENGINE_04"
 
-MIN_EDGE_SCORE = {'scalping': 70.0, 'intraday': 65.0, 'swing': 60.0}
-MIN_CONFIDENCE_SCORE = {'scalping': 75.0, 'intraday': 70.0, 'swing': 65.0}
-
-def load_edge_scores(fecha: str) -> Optional[Dict[str, Any]]:
-    edge_file = DECISION_WORKSPACE_DIR / "edge_scores" / f"edge_scores_{fecha}.json"
-    return load_contract_safe(edge_file) if edge_file.exists() else None
-
-def load_confidence_scores(fecha: str) -> Optional[Dict[str, Any]]:
-    conf_file = DECISION_WORKSPACE_DIR / "confidence_scores" / f"confidence_scores_{fecha}.json"
-    return load_contract_safe(conf_file) if conf_file.exists() else None
-
-def load_hypotheses(fecha: str) -> Dict[str, Any]:
-    hyp_file = DECISION_WORKSPACE_DIR / "hypotheses" / f"hypotheses_{fecha}.json"
-    return load_contract_safe(hyp_file) if hyp_file.exists() else {"hypotheses": []}
-
-def get_governance_verdicts(fecha: str) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
-    audit_file = AUDIT_STATE_DIR / "audit_execution_contract.json"
-    portfolio_file = AUDIT_STATE_DIR / "portfolio_execution_contract.json"
-    validation_file = AUDIT_STATE_DIR / f"quant_validation_report_{fecha}.json"
-    
-    audit_contract = load_contract_safe(audit_file)
-    portfolio_contract = load_contract_safe(portfolio_file)
-    validation_report = load_contract_safe(validation_file)
-    
-    audit_ok = validate_contract_schema(audit_contract, "audit_execution_contract", fecha)
-    portfolio_ok = validate_contract_schema(portfolio_contract, "portfolio_execution_contract", fecha)
-    
-    if not audit_ok:
-        logger.critical(f"🛑 Fail-Closed: Contrato de Auditoria F2 invalido o desactualizado para {fecha}.")
-        audit_contract = {}
-        
-    if not portfolio_ok:
-        logger.critical(f"🛑 Fail-Closed: Contrato de Portafolio F3 invalido o desactualizado para {fecha}.")
-        portfolio_contract = {}
-        
-    validation_approved = False
-    if validation_report:
-        try:
-            report_date = validation_report.get("fecha")
-            global_status = validation_report.get("global_status", "SUSPENDED")
-            if str(report_date) == str(fecha) and global_status == "APPROVED":
-                validation_approved = True
-                logger.info("✅ F3.5 Certificacion de Coherencia Matematica aprobada para la fecha actual.")
-            else:
-                logger.critical(f"🛑 F3.5 Certificacion fallida o desaprobada. Estado: {global_status}")
-        except Exception as e:
-            logger.error(f"Error procesando reporte de validacion cuantitativa: {e}")
-    else:
-        logger.critical(f"🛑 Fail-Closed: Certificado F3.5 'quant_validation_report' no localizado fisicamente.")
-        
-    return audit_contract, portfolio_contract, validation_approved
-
-def get_hypothesis_for_symbol(hypotheses_data: Dict, symbol: str, style: str) -> Optional[Dict]:
-    matching = [h for h in hypotheses_data.get("hypotheses", []) if h.get("symbol") == symbol.upper() and h.get("style") == style]
-    return min(matching, key=lambda h: h.get("priority", 99)) if matching else None
-
-def calculate_valid_until(fecha: str) -> str:
-    contract_date = datetime.strptime(fecha, "%Y%m%d").replace(tzinfo=BROKER_TZ)
-    next_day = contract_date + timedelta(days=1)
-    return next_day.replace(hour=23, minute=59, second=59).isoformat()
-
-def build_decision_contract(
-    symbol: str, style: str, fecha: str,
-    edge_info: Dict, confidence_info: Dict, hypothesis: Optional[Dict],
-    audit_certificate: Dict, quant_certificate: Dict, validation_approved: bool
+def create_decision_symbol_entry(
+    symbol: str,
+    decision_status: str,
+    execution_feasibility_score: float,
+    hypothesis_significance: float,
+    decision_confidence_score: float,
+    veto_reasons: Optional[List[str]] = None
 ) -> Dict[str, Any]:
-    
-    contract_id = f"{fecha}|{symbol.upper()}|{style}|contract"
-    veto_reasons = []
-    decision = DecisionStatus.ALLOW.value
-    
-    capture_status = SymbolCaptureStatus.NO_CONFIABLE.value
-    for entry in audit_certificate.get("certificados_por_simbolo", []):
-        if entry.get("symbol", "").upper() == symbol.upper():
-            capture_status = entry.get("symbol_capture_status", SymbolCaptureStatus.NO_CONFIABLE.value)
-            break
-    
-    if capture_status == SymbolCaptureStatus.NO_CONFIABLE.value:
-        decision = DecisionStatus.VETO.value
-        veto_reasons.append("H-03: symbol_capture_status == NO_CONFIABLE")
-    
-    readiness_status = MarketReadinessStatus.NOT_READY_DATA_GAP.value
-    for entry in quant_certificate.get("symbols", []):
-        if entry.get("symbol", "").upper() == symbol.upper():
-            act_state = entry.get("market_activity_state", "ACTIVE")
-            if act_state == "INACTIVE_CLOSED_MARKET":
-                readiness_status = MarketReadinessStatus.NOT_READY_MARKET_CLOSED.value
-            elif act_state == "HALTED":
-                readiness_status = MarketReadinessStatus.NOT_READY_DATA_GAP.value
-            else:
-                readiness_status = MarketReadinessStatus.READY.value
-            break
-    
-    if readiness_status != MarketReadinessStatus.READY.value and decision == DecisionStatus.ALLOW.value:
-        decision = DecisionStatus.VETO.value
-        veto_reasons.append(f"H-10: market_readiness_status == {readiness_status}")
-    
-    if not validation_approved and decision == DecisionStatus.ALLOW.value:
-        decision = DecisionStatus.DENY.value
-        veto_reasons.append("F3.5: Quant validation not approved")
-    
-    edge_score = edge_info.get("edge_score", 0.0)
-    confidence_score = confidence_info.get("decision_confidence_score", confidence_info.get("confidence_score", 0.0))
-    
-    min_edge = MIN_EDGE_SCORE.get(style, 60.0)
-    if edge_score < min_edge and decision == DecisionStatus.ALLOW.value:
-        decision = DecisionStatus.DENY.value
-        veto_reasons.append(f"Edge Score {edge_score:.1f} < minimo {min_edge:.1f}")
-    
-    min_conf = MIN_CONFIDENCE_SCORE.get(style, 65.0)
-    if confidence_score < min_conf and decision == DecisionStatus.ALLOW.value:
-        decision = DecisionStatus.DENY.value
-        veto_reasons.append(f"Confidence {confidence_score:.1f} < minimo {min_conf:.1f}")
-    
-    if hypothesis is None and decision == DecisionStatus.ALLOW.value:
-        decision = DecisionStatus.DENY.value
-        veto_reasons.append("Sin hipotesis de mercado validada")
-    
+    if not validate_canonical_enum(decision_status, DecisionStatus):
+        raise ValueError(f"decision_status inválido según el estándar canónico: {decision_status}")
     return {
-        "contract_id": hashlib.sha256(contract_id.encode('utf-8')).hexdigest()[:16],
-        "fecha": fecha, 
-        "symbol": symbol.upper(), 
-        "style": style, 
-        "decision_status": decision,
-        "execution_feasibility_score": round(edge_score, 1),
-        "hypothesis_significance": hypothesis.get("priority", 0.0) if hypothesis else 0.0,
-        "decision_confidence_score": round(confidence_score, 1),
-        "veto_reasons": veto_reasons,
-        "valid_until": calculate_valid_until(fecha),
-        "ttl_mode": DECISION_CONTRACT_TTL_MODE,
-        "timestamp_generacion": datetime.now(timezone.utc).isoformat()
+        "symbol": symbol.upper(),
+        "decision_status": decision_status,
+        "execution_feasibility_score": round(float(execution_feasibility_score), 4),
+        "hypothesis_significance": round(float(hypothesis_significance), 4),
+        "decision_confidence_score": round(float(decision_confidence_score), 4),
+        "veto_reasons": veto_reasons or []
     }
 
-def main():
-    parser = argparse.ArgumentParser(description="Decision Contract V1.0")
-    parser.add_argument("--date", type=str, default="latest")
-    args = parser.parse_args()
-    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
-    
-    logger.info("=" * 80 + f"\n📜 GENERANDO CONTRATOS FINALES - FECHA: {fecha}\n" + "=" * 80)
-    
-    edge_data = load_edge_scores(fecha)
-    confidence_data = load_confidence_scores(fecha)
-    if not edge_data or not confidence_data:
-        logger.critical("❌ No se pueden generar decisiones sin datos previos de Edge/Confianza. Cancelando.")
-        return
-
-    hypotheses_data = load_hypotheses(fecha)
-    
-    from decision_config import AUDIT_REPORTES_DIR, OPS_INTEL_DIR, load_json_safe
-    
-    audit_cert = load_json_safe(AUDIT_REPORTES_DIR / f"audit_certificate_{fecha}.json")
-    quant_cert = load_json_safe(OPS_INTEL_DIR / "OUTPUTS" / f"quant_certificate_{fecha}.json")
-    
-    validation_file = AUDIT_STATE_DIR / f"quant_validation_report_{fecha}.json"
-    validation_report = load_json_safe(validation_file)
-    validation_approved = False
-    if validation_report:
-        validation_approved = (
-            validation_report.get("fecha") == fecha and 
-            validation_report.get("global_status") == "APPROVED"
-        )
-    
-    decisions_list = []
-    allow_count = 0
-    veto_count = 0
-    
-    for symbol in SYMBOLS_TO_CAPTURE:
-        symbol_edges = edge_data.get("edge_scores", {}).get(symbol, {})
-        symbol_confidences = confidence_data.get("confidence_scores", {}).get(symbol, {})
-        
-        for style in ['scalping', 'intraday', 'swing']:
-            edge_info = symbol_edges.get(style, {})
-            confidence_info = symbol_confidences.get(style, {})
-            if not edge_info or not confidence_info: 
-                continue
-            
-            hypothesis = get_hypothesis_for_symbol(hypotheses_data, symbol, style)
-            
-            decision = build_decision_contract(
-                symbol, style, fecha, edge_info, confidence_info, 
-                hypothesis, audit_cert, quant_cert, validation_approved
-            )
-            
-            entry = create_decision_symbol_entry(
-                symbol=decision["symbol"],
-                decision_status=decision["decision_status"],
-                execution_feasibility_score=decision["execution_feasibility_score"],
-                hypothesis_significance=decision["hypothesis_significance"],
-                decision_confidence_score=decision["decision_confidence_score"],
-                veto_reasons=decision["veto_reasons"]
-            )
-            decisions_list.append(entry)
-            
-            if decision["decision_status"] == DecisionStatus.ALLOW.value:
-                allow_count += 1
-                logger.info(f"✅ ALLOW: {symbol:<8} | {style:<10} | Conf: {decision['decision_confidence_score']}")
-            elif decision["decision_status"] == DecisionStatus.VETO.value:
-                veto_count += 1
-                logger.warning(f"🛡️ VETO: {symbol:<8} | {style:<10} | Razón: {'; '.join(decision['veto_reasons'])}")
-    
-    global_veto = veto_count > 0 and allow_count == 0
-    execution_contract = create_canonical_execution_contract(
-        fecha=fecha,
-        decisions=decisions_list,
-        global_veto_active=global_veto
+def create_canonical_execution_contract(
+    fecha: str,
+    decisions: List[Dict[str, Any]],
+    global_veto_active: bool = False
+) -> Dict[str, Any]:
+    envelope = MetadataEnvelope(
+        schema_version=SCHEMA_VERSION_DECISION,
+        contract_type=ContractType.EXECUTION,
+        producer_identity=PRODUCER_DECISION,
+        timestamp_emission=datetime.now(timezone.utc).isoformat()
     )
-    
-    assert validate_execution_contract(execution_contract), "Execution Contract invalido"
-    
-    output_file = DECISION_WORKSPACE_DIR / "contracts" / f"execution_contract_{fecha}.json"
-    save_contract_atomic(execution_contract, output_file)
-    
-    logger.info(f"✅ EXECUTION CONTRACT CANONICO EMITIDO: {output_file.name}")
-    logger.info(f"   • ALLOW: {allow_count} | VETO: {veto_count} | DENY: {len(decisions_list) - allow_count - veto_count}")
-    
-    legacy_payload = {
+    return {
+        **envelope.to_dict(),
         "fecha": fecha,
-        "timestamp_generacion": datetime.now(timezone.utc).isoformat(),
-        "contracts": [
-            {
-                "symbol": d["symbol"],
-                "style": d.get("style", "intraday"),
-                "decision": d["decision_status"],
-                "edge_score": d["execution_feasibility_score"],
-                "confidence_score": d["decision_confidence_score"]
-            } for d in decisions_list
-        ]
+        "global_veto_active": global_veto_active,
+        "decisions": decisions
     }
-    legacy_path = DECISION_WORKSPACE_DIR / "contracts" / f"decision_contracts_{fecha}.json"
-    save_contract_atomic(legacy_payload, legacy_path)
-    logger.info(f"💾 Legacy mantenido para compatibilidad: {legacy_path.name}")
 
-if __name__ == "__main__":
-    main()
+def validate_execution_contract(contract: Dict[str, Any]) -> bool:
+    required = {"schema_version", "contract_type", "producer_identity",
+                "timestamp_emission", "fecha", "decisions"}
+    if not required.issubset(contract.keys()):
+        return False
+    if contract.get("contract_type") != ContractType.EXECUTION.value:
+        return False
+    return True

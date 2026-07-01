@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 SYSTEM_SERVICES - SYSTEM_LOGGER (LOG ASÍNCRONO SEGURO CON MULTI-LISTENER)

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 CANONICAL SCORES - LIBRERIA DE ESTADOS CANONICOS DE MERCADO

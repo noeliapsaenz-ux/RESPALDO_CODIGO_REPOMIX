@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 WEEKLY SSD COMPRESSOR V1.0 - SCRIPT DE MANTENIMIENTO ASÍNCRONO

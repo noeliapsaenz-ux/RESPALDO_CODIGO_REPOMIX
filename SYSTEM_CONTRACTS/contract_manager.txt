@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 ==========================================================================
 SYSTEM_CONTRACTS - CONTRACT_MANAGER (GESTOR DE ESQUEMAS UNIFICADO)
