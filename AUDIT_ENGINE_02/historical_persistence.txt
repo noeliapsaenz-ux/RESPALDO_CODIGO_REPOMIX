@@ -147,7 +147,7 @@ def update_history(fecha: str):
         events_rows.extend(extract_events_for_symbol(sym_upper, fecha, c_item, l_item, con_item))
 
     df_new = pd.DataFrame(history_rows)
-    history_file_path = AUDIT_STATE / "confidence_history.parquet"
+    history_file_path = AUDIT_REPORTS / "confidence_history.parquet"
 
     if history_file_path.exists():
         try:
@@ -162,7 +162,7 @@ def update_history(fecha: str):
     df_combined = df_combined.sort_values(by=["symbol", "fecha"]).reset_index(drop=True)
     df_combined.to_parquet(history_file_path, index=False)
 
-    events_file_path = AUDIT_STATE / "audit_events.jsonl"
+    events_file_path = AUDIT_REPORTS / "audit_events.jsonl"
     existing_event_ids = set()
     if events_file_path.exists():
         try:

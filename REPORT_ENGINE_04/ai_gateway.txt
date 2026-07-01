@@ -111,8 +111,6 @@ _PROVIDERS_CONFIG: Dict[str, Dict[str, Any]] = {
     },
     "QWEN": {
         "api_key": QWEN_API_KEY,
-        # Modo compatible OpenAI de DashScope. Si tu cuenta es internacional,
-        # verifica si tu endpoint es dashscope-intl.aliyuncs.com en vez de .com
         "url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
         "model": "qwen-plus",
         "build_request": _build_openai_compatible,
@@ -128,8 +126,6 @@ _PROVIDERS_CONFIG: Dict[str, Dict[str, Any]] = {
     "CLAUDE": {
         "api_key": ANTHROPIC_API_KEY,
         "url": "https://api.anthropic.com/v1/messages",
-        # ⚠️ Verifica el model string vigente en docs.claude.com antes de activar
-        # este proveedor — los identificadores de modelo cambian con el tiempo.
         "model": "claude-sonnet-4-6",
         "build_request": _build_anthropic,
         "parse_response": _parse_anthropic,

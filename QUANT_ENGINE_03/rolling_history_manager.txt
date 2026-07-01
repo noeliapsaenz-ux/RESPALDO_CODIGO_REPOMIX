@@ -3,7 +3,7 @@
 ROLLING HISTORY MANAGER - ADMINISTRADOR DE PERSISTENCIA HISTÓRICA
 ==========================================================================
 Ubicación: QUANT_ENGINE_03
-Dependencias: quant_config (paths, logging, symbols, settings)
+Dependencias:(paths, logging, symbols, settings)
 Responsabilidad: Tomar las barras de 1 minuto generadas diariamente en bars,
                  agruparlas en un registro diario (D1), añadirlo al historial
                  acumulativo de 30 días, deduplicar y truncar de forma atómica.
@@ -83,6 +83,7 @@ def agregar_dia_al_historial(symbol: str, fecha: str) -> bool:
 
     temp_file = history_file.with_suffix(".tmp.parquet")
     try:
+        history_file.parent.mkdir(parents=True, exist_ok=True)
         df_truncated.to_parquet(temp_file, index=False)
         import os
         if temp_file.exists():

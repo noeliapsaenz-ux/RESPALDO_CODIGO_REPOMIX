@@ -3,7 +3,7 @@
 QUANT CONTRACTS - PUENTE DE CONTRATOS CANÓNICOS (FASE 3)
 ==========================================================================
 Ubicación: QUANT_ENGINE_03
-Dependencias: quant_config (system_canonical, settings)
+Dependencias:(system_canonical, settings)
 Responsabilidad: Proveer utilidades para la construcción estricta de
                  certificados Quant y Readiness alineados al SYSTEM_CANONICAL.
 REGLA: Todo concepto F3 debe pasar por estas funciones constructoras.

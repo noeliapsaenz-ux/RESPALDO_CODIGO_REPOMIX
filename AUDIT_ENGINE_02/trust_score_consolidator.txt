@@ -213,7 +213,7 @@ def main():
         "certificados_por_simbolo": certificados_canonicos
     }
 
-    report_path = AUDIT_STATE / f"audit_certificate_{fecha}.json"
+    report_path = AUDIT_REPORTS / f"audit_certificate_{fecha}.json"
     save_contract_atomic(payload_final, report_path)
 
     logger.info(f"✅ CERTIFICADO CANÓNICO EMITIDO EXITOSAMENTE: {report_path.name}")

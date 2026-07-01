@@ -32,6 +32,7 @@ from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_paths import DECISION_FEATURE_VECTORS, DECISION_EDGE_SCORES, DECISION_WORKSPACE
 # IMPORTACIÓN CALIFICADA DESDE EL PAQUETE CANÓNICO
 from SYSTEM_CONTRACTS.contract_manager import load_contract_safe, save_contract_atomic
+from SYSTEM_SERVICES.system_paths import DECISION_FEATURE_VECTORS, DECISION_EDGE_SCORES, DECISION_WORKSPACE
 
 logger = get_system_logger("hypothesis_engine", "04_DECISION")
 
@@ -141,7 +142,7 @@ def generate_hypotheses_for_symbol(
     return hypotheses
 
 def save_hypotheses(hypotheses: List[Dict[str, Any]], fecha: str) -> bool:
-    output_dir = DECISION_WORKSPACE / "hypotheses"
+    output_dir = DECISION_WORKSPACE / "HYPOTHESES"   # ← MAYÚSCULAS
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"hypotheses_{fecha}.json"
     payload = {

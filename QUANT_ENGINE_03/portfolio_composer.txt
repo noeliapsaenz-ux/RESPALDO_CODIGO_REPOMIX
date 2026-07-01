@@ -3,7 +3,7 @@
 PORTFOLIO COMPOSER - CONSTRUCTOR QUANT MULTIDIMENSIONAL
 ==========================================================================
 Ubicación: QUANT_ENGINE_03
-Dependencias: quant_config (paths, logging, symbols, settings, contracts)
+Dependencias: (paths, logging, symbols, settings, contracts)
 Responsabilidad: Optimizar la selección de portafolios mediante desempates
                  deterministas, filtros de exposición cambiaria y telemetría.
 ==========================================================================

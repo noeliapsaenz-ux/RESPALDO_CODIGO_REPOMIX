@@ -3,7 +3,7 @@
 MASTER STATE CONSOLIDATOR - REGIMEN GLOBAL & DECISIÓN DE GOBIERNO
 ==========================================================================
 Ubicación: QUANT_ENGINE_03
-Dependencias: quant_config (system_canonical, paths, settings, logging, contracts)
+Dependencias (system_canonical, paths, settings, logging, contracts)
 Responsabilidad: Unificar los snapshots de los pares de bars/, calcular las
                  dimensiones sistémicas y emitir los permisos de ejecución global.
 ==========================================================================

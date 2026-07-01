@@ -3,7 +3,7 @@
 QUANT VALIDATOR - CERTIFICADOR DE COHERENCIA DE MODELOS (FASE 3.5)
 ==========================================================================
 Ubicación: QUANT_ENGINE_03
-Dependencias: quant_config (paths, logging, symbols, settings, contracts)
+Dependencias:(paths, logging, symbols, settings, contracts)
 Responsabilidad: Analizar pasivamente los outputs numéricos de la Fase 3,
                  verificar que no contengan anomalías matemáticas (NaN, Inf)
                  ni contradicciones lógicas entre modelos (Cross-Check), y
@@ -36,7 +36,7 @@ class QuantValidator:
         self.fecha = fecha
         self.readiness_path = QUANT_PROCESSED_DATA / "readiness" / f"readiness_report_{fecha}.json"
         self.anomaly_path = QUANT_ANOMALIES / f"anomaly_report_{fecha}.json"
-        self.output_path = AUDIT_STATE / f"quant_validation_report_{fecha}.json"
+        self.output_path = QUANT_OUTPUTS / f"quant_validation_report_{fecha}.json"
         
         self.reporte_final = {
             "fecha": fecha,

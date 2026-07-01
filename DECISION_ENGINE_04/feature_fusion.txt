@@ -35,26 +35,34 @@ from SYSTEM_SERVICES.system_paths import (
     QUANT_PROCESSED_DATA,
     AUDIT_STATE,
     AUDIT_REPORTS,
-    DECISION_FEATURE_VECTORS
+    DECISION_FEATURE_VECTORS,
+    QUANT_BARS,
+    QUANT_ANOMALIES,
+    QUANT_READINESS,
+    QUANT_HISTORY,
+    QUANT_CONFIGURACION
 )
+
 # IMPORTACIÓN CALIFICADA DESDE EL PAQUETE CANÓNICO
 from SYSTEM_CONTRACTS.contract_manager import load_contract_safe, save_contract_atomic
 
 logger = get_system_logger("feature_fusion", "04_DECISION")
 
 def load_market_state(symbol: str, fecha: str) -> Optional[pd.DataFrame]:
-    state_file = QUANT_PROCESSED_DATA / "BARS" / symbol.upper() / f"{symbol.upper()}_{fecha}_market_state.parquet"
+    state_file = QUANT_BARS / symbol.upper() / f"{symbol.upper()}_{fecha}_market_state.parquet"
     if not state_file.exists():
         return None
     try:
         df = pd.read_parquet(state_file)
+
+
         return df if not df.empty else None
     except Exception as e:
         logger.error(f"❌ {symbol}: Error leyendo market_state: {e}")
         return None
 
 def load_anomaly_report(symbol: str, fecha: str) -> Dict[str, Any]:
-    anomaly_file = QUANT_PROCESSED_DATA / "ANOMALIES" / f"anomaly_report_{fecha}.json"
+    anomaly_file = QUANT_ANOMALIES / f"anomaly_report_{fecha}.json"
     if not anomaly_file.exists():
         return {"anomaly_score": 0.0, "classification_level": "NORMAL"}
     try:
@@ -72,11 +80,11 @@ def load_anomaly_report(symbol: str, fecha: str) -> Dict[str, Any]:
         return {"anomaly_score": 0.0, "classification_level": "NORMAL"}
 
 def load_portfolio_contract(fecha: str) -> Dict[str, Any]:
-    contract_file = AUDIT_STATE / "portfolio_execution_contract.json"
+    contract_file = QUANT_CONFIGURACION / "portfolio_execution_contract.json"
     return load_contract_safe(contract_file) if contract_file.exists() else {}
 
 def load_readiness_report(symbol: str, fecha: str) -> Dict[str, Any]:
-    readiness_file = QUANT_PROCESSED_DATA / "READINESS" / f"readiness_report_{fecha}.json"
+    readiness_file = QUANT_READINESS / f"readiness_report_{fecha}.json"
     if not readiness_file.exists():
         return {}
     try:
@@ -104,7 +112,7 @@ def load_fci(symbol: str, fecha: str) -> tuple:
     return 0.0, SymbolCaptureStatus.NO_CONFIABLE.value
 
 def load_trend_persistence(symbol: str) -> float:
-    history_file = QUANT_PROCESSED_DATA / "HISTORY" / "daily_history_30d.parquet"
+    history_file = QUANT_HISTORY / "daily_history_30d.parquet"
     if not history_file.exists():
         return 0.0
     try:
@@ -145,7 +153,7 @@ def build_feature_vector(symbol: str, fecha: str) -> Optional[Dict[str, Any]]:
     last_bar = df_state.iloc[-1]
     fci, capture_status = load_fci(symbol, fecha)
     
-    readiness_cert_path = QUANT_PROCESSED_DATA / "READINESS" / f"readiness_certificate_{fecha}.json"
+    readiness_cert_path = QUANT_READINESS / f"readiness_certificate_{fecha}.json"
     readiness_cert = load_contract_safe(readiness_cert_path)
     
     readiness_status = MarketReadinessStatus.INSUFFICIENT_DATA.value

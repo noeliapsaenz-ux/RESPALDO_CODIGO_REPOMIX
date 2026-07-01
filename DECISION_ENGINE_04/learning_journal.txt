@@ -30,6 +30,7 @@ from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_paths import QUANT_PROCESSED_DATA, DECISION_CONTRACTS
 # IMPORTACIÓN CALIFICADA DESDE EL PAQUETE CANÓNICO
 from SYSTEM_CONTRACTS.contract_manager import load_contract_safe
+from SYSTEM_SERVICES.system_paths import QUANT_PROCESSED_DATA, DECISION_CONTRACTS, QUANT_BARS
 
 logger = get_system_logger("learning_journal", "04_DECISION")
 
@@ -48,7 +49,7 @@ def load_previous_day_contracts(fecha: str) -> List[Dict[str, Any]]:
         return []
 
 def load_market_state(symbol: str, fecha: str) -> Optional[pd.DataFrame]:
-    state_file = QUANT_PROCESSED_DATA / "BARS" / symbol.upper() / f"{symbol.upper()}_{fecha}_market_state.parquet"
+    state_file = QUANT_BARS / symbol.upper() / f"{symbol.upper()}_{fecha}_market_state.parquet"
     if not state_file.exists():
         return None
     try:

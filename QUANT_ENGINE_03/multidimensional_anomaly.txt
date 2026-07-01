@@ -1,10 +1,11 @@
+
 """
 ==========================================================================
 MULTIDIMENSIONAL ANOMALY - DETECTOR MULTIDIMENSIONAL DE ANOMALÍAS
 ==========================================================================
 Ubicación: QUANT_ENGINE_03
-Dependencias: quant_config (paths, logging, symbols, settings)
-Responsabilidad: Detectar anomalías multidimensionales en el mercado
+Dependencias:(paths, logging, symbols, settings)
+Responsabilidad: Detecar anomalías multidimensionales en el mercado
                  utilizando MAD (Median Absolute Deviation) y EWMA.
 ==========================================================================
 """
@@ -27,7 +28,13 @@ if str(root_path) not in sys.path:
 from SYSTEM_CANONICAL.system_symbols import get_symbols
 from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
 from SYSTEM_CANONICAL.system_states import ANOMALY_CONFIG
-from SYSTEM_SERVICES.system_paths import AUDIT_STATE, AUDIT_REPORTS, QUANT_PROCESSED_DATA, QUANT_ANOMALIES
+from SYSTEM_SERVICES.system_paths import (
+    AUDIT_STATE,
+    AUDIT_REPORTS,
+    QUANT_PROCESSED_DATA,
+    QUANT_ANOMALIES,
+    QUANT_HISTORY   # <--- AÑADIDO
+)
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic, load_contract_safe, NumpySafeEncoder
 
@@ -36,7 +43,7 @@ logger = get_system_logger("multidimensional_anomaly", "03_QUANT")
 class AnomalyDetectorV2:
     def __init__(self, fecha: str):
         self.fecha = fecha
-        self.historical_metrics_path = AUDIT_STATE / "anomaly_historical_metrics.parquet"
+        self.historical_metrics_path = QUANT_HISTORY / "anomaly_historical_metrics.parquet"
         
         # 🟢 PARAMETRIZACIÓN DIRECTAMENTE EXTRAÍDA DESDE SYSTEM_CANONICAL (H-02)
         self.cold_start_score = ANOMALY_CONFIG["cold_start_score"]
@@ -155,6 +162,59 @@ class AnomalyDetectorV2:
         return final_portfolio_outputs
 
 
+# ==========================================================================
+# NUEVA FUNCIÓN PARA GUARDAR EL HISTÓRICO DE ANOMALÍAS
+# ==========================================================================
+def guardar_historico_anomalias(fecha: str, resultados_individuales: List[Dict[str, Any]]) -> None:
+    """
+    Guarda las métricas diarias de cada símbolo en el histórico de anomalías.
+    """
+    if not resultados_individuales:
+        return
+
+    history_path = QUANT_HISTORY / "anomaly_historical_metrics.parquet"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Construir DataFrame con las métricas del día
+    df_nuevo = pd.DataFrame([{
+        "symbol": item["symbol"].upper(),
+        "fecha": fecha,
+        "spread": item["current_metrics"].get("spread", 0.0),
+        "volatility": item["current_metrics"].get("volatility", 0.0),
+        "stalls": item["current_metrics"].get("stalls", 0.0),
+        "tps": item["current_metrics"].get("tps", 0.0)
+    } for item in resultados_individuales])
+
+    if df_nuevo.empty:
+        return
+
+    # Cargar histórico existente (si existe)
+    df_hist = pd.DataFrame()
+    if history_path.exists():
+        try:
+            df_hist = pd.read_parquet(history_path)
+        except Exception as e:
+            logger.warning(f"No se pudo leer histórico existente: {e}")
+
+    # Concatenar y deduplicar por (symbol, fecha)
+    df_combinado = pd.concat([df_hist, df_nuevo], ignore_index=True)
+    df_combinado = df_combinado.drop_duplicates(subset=["symbol", "fecha"], keep="last")
+
+    # Guardar (solo los últimos 90 días, por ejemplo)
+    if not df_combinado.empty:
+        df_combinado["fecha"] = pd.to_datetime(df_combinado["fecha"], format="%Y%m%d")
+        # Mantener solo últimos 90 días
+        cutoff = pd.Timestamp.now() - pd.Timedelta(days=90)
+        df_combinado = df_combinado[df_combinado["fecha"] >= cutoff]
+        # Ordenar y guardar
+        df_combinado = df_combinado.sort_values(["symbol", "fecha"]).reset_index(drop=True)
+        try:
+            df_combinado.to_parquet(history_path, index=False)
+            logger.info(f"💾 Histórico de anomalías actualizado con {len(df_nuevo)} símbolos.")
+        except Exception as e:
+            logger.error(f"❌ Error guardando histórico de anomalías: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Anomaly Detector V2")
     parser.add_argument("--date", type=str, default="latest")
@@ -177,11 +237,12 @@ def main():
             logger.warning(f"No se pudo leer el reporte de Fase 2. Usando FCI por defecto.")
 
     simulated_portfolio_input = []
+    individual_metrics = []  # <--- NUEVO: para guardar métricas de cada símbolo
     detector = AnomalyDetectorV2(fecha)
 
     for symbol in get_symbols():
         symbol = symbol.upper()
-        state_file = QUANT_PROCESSED_DATA / "bars" / symbol / f"{symbol}_{fecha}_market_state.parquet"
+        state_file = QUANT_PROCESSED_DATA / "BARS" / symbol / f"{symbol}_{fecha}_market_state.parquet"
         
         if state_file.exists():
             try:
@@ -203,14 +264,25 @@ def main():
         
         fci_real = fci_map.get(symbol, 98.0)
         ind_eval = detector.evaluate_symbol_individual(symbol, current_metrics, fci_real)
+        
+        # Guardar métricas individuales para el histórico
+        individual_metrics.append({
+            "symbol": symbol,
+            "current_metrics": current_metrics
+        })
+        
         simulated_portfolio_input.append(ind_eval)
 
+    # Procesar batch
     portfolio_outputs = detector.process_batch_portfolio(simulated_portfolio_input)
+    
+    # --- GUARDAR HISTÓRICO DE ANOMALÍAS ---
+    guardar_historico_anomalias(fecha, individual_metrics)
+
     output_report_file = QUANT_ANOMALIES / f"anomaly_report_{fecha}.json"
     
     stress_applied = portfolio_outputs[0]["systemic_stress_applied"] if portfolio_outputs else False
 
-    # 🟢 RESOLVIENDO IMPORTS DE GOBERNANZA FÍSICOS DE FORMA SEGURA CONTRA "FAIL_CLOSED"
     payload = {
         "fecha": fecha,
         "systemic_stress_detected": stress_applied,

@@ -3,7 +3,7 @@
 MARKET READINESS ENGINE - MOTOR DE PREPARACIÓN OPERACIONAL (FASE 3)
 ==========================================================================
 Ubicación: QUANT_ENGINE_03
-Dependencias: quant_config, canonical_scores, quant_contracts
+Dependencias: canonical_scores, quant_contracts
 Responsabilidad: Evaluar la preparación operacional de cada símbolo para
                  diferentes estilos de trading (scalping, intraday, swing)
                  basado en métricas multidimensionales.

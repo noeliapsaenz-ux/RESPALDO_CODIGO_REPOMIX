@@ -3,7 +3,7 @@
 MARKET STATE BUILDER - SNAPSHOT DE ESTADO MULTIDIMENSIONAL (AUDIT V2)
 ==========================================================================
 Ubicación: QUANT_ENGINE_03
-Dependencias: quant_config (paths, logging, symbols, settings)
+Dependencias: paths, logging, symbols, settings)
 Responsabilidad: Tomar el Parquet GOLD V2, procesar y agrupar los ticks en
                  intervalos de 1 minuto, y estructurar el estado del mercado
                  en 10 capas unificadas (market_state.parquet) dentro de bars.

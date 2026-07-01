@@ -12,67 +12,90 @@ Responsabilidad: Generar el veredicto definitivo ALLOW/DENY por símbolo y estil
 import sys
 from pathlib import Path
 
-# Ajuste de rutas del sistema para soporte local (Windows/VPS)
 root_path = Path(__file__).resolve().parents[1]
 if str(root_path) not in sys.path:
     sys.path.insert(0, str(root_path))
-current_dir = Path(__file__).resolve().parent
-if str(current_dir) not in sys.path:
-    sys.path.insert(0, str(current_dir))
 
+import argparse
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
-
-# Importaciones canónicas unificadas
+from typing import Dict, Any, List
 from SYSTEM_CANONICAL.system_states import DecisionStatus, ContractType
-from SYSTEM_CANONICAL.system_canonical import MetadataEnvelope, validate_canonical_enum
+from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
+from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_SERVICES.system_paths import (
+    DECISION_CONFIDENCE_SCORES,
+    DECISION_CONTRACTS,
+    DECISION_HYPOTHESES
+)
+from SYSTEM_CONTRACTS.contract_manager import load_contract_safe, save_contract_atomic
+from decision_contracts import create_canonical_execution_contract, create_decision_symbol_entry
 
-# Definiciones de versión del esquema según directrices de contract_manager.py (Fase 4)
-SCHEMA_VERSION_DECISION = "3.0"
-PRODUCER_DECISION = "DECISION_ENGINE_04"
+logger = get_system_logger("decision_contract", "04_DECISION")
 
-def create_decision_symbol_entry(
-    symbol: str,
-    decision_status: str,
-    execution_feasibility_score: float,
-    hypothesis_significance: float,
-    decision_confidence_score: float,
-    veto_reasons: Optional[List[str]] = None
-) -> Dict[str, Any]:
-    if not validate_canonical_enum(decision_status, DecisionStatus):
-        raise ValueError(f"decision_status inválido según el estándar canónico: {decision_status}")
-    return {
-        "symbol": symbol.upper(),
-        "decision_status": decision_status,
-        "execution_feasibility_score": round(float(execution_feasibility_score), 4),
-        "hypothesis_significance": round(float(hypothesis_significance), 4),
-        "decision_confidence_score": round(float(decision_confidence_score), 4),
-        "veto_reasons": veto_reasons or []
-    }
+def load_confidence_scores(fecha: str) -> Dict[str, Any]:
+    path = DECISION_CONFIDENCE_SCORES / f"confidence_scores_{fecha}.json"
+    return load_contract_safe(path) if path.exists() else {}
 
-def create_canonical_execution_contract(
-    fecha: str,
-    decisions: List[Dict[str, Any]],
-    global_veto_active: bool = False
-) -> Dict[str, Any]:
-    envelope = MetadataEnvelope(
-        schema_version=SCHEMA_VERSION_DECISION,
-        contract_type=ContractType.EXECUTION,
-        producer_identity=PRODUCER_DECISION,
-        timestamp_emission=datetime.now(timezone.utc).isoformat()
-    )
-    return {
-        **envelope.to_dict(),
-        "fecha": fecha,
-        "global_veto_active": global_veto_active,
-        "decisions": decisions
-    }
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", default="latest")
+    args = parser.parse_args()
+    fecha = args.date if args.date != "latest" else datetime.now(BROKER_TZ).strftime("%Y%m%d")
 
-def validate_execution_contract(contract: Dict[str, Any]) -> bool:
-    required = {"schema_version", "contract_type", "producer_identity",
-                "timestamp_emission", "fecha", "decisions"}
-    if not required.issubset(contract.keys()):
-        return False
-    if contract.get("contract_type") != ContractType.EXECUTION.value:
-        return False
-    return True
+    logger.info(f"📋 Generando contrato de ejecución para {fecha}...")
+
+    confidence_data = load_confidence_scores(fecha)
+    if not confidence_data:
+        logger.critical("❌ No se encontraron confidence_scores. Contrato con todos los símbolos en PASS.")
+        from SYSTEM_CANONICAL.system_symbols import get_symbols
+        decisions = []
+        for symbol in get_symbols():
+            decisions.append(
+                create_decision_symbol_entry(
+                    symbol=symbol,
+                    decision_status=DecisionStatus.PASS.value,
+                    execution_feasibility_score=0.0,
+                    hypothesis_significance=0.0,
+                    decision_confidence_score=0.0,
+                    veto_reasons=["Falta confidence_scores"]
+                )
+            )
+        contract = create_canonical_execution_contract(fecha, decisions, global_veto_active=True)
+        save_contract_atomic(contract, DECISION_CONTRACTS / f"decision_contracts_{fecha}.json")
+        logger.info("✅ Contrato de emergencia guardado (todos PASS).")
+        return
+
+    decisions = []
+    for symbol, styles in confidence_data.get("confidence_scores", {}).items():
+        for style, data in styles.items():
+            score = data.get("decision_confidence_score", 0.0)
+            # Determinar estado usando los enums correctos
+            if data.get("veto_applied", False):
+                status = DecisionStatus.PASS.value
+                reason = data.get("veto_reason", "Veto activo")
+            elif score >= 50.0:
+                status = DecisionStatus.EXECUTE.value
+                reason = None
+            else:
+                status = DecisionStatus.PASS.value
+                reason = f"Confianza insuficiente: {score:.1f}"
+
+            decisions.append(
+                create_decision_symbol_entry(
+                    symbol=symbol,
+                    decision_status=status,
+                    execution_feasibility_score=data.get("inputs", {}).get("execution_feasibility_score", 0.0),
+                    hypothesis_significance=0.0,  # Podrías extraer de hypotheses si quieres
+                    decision_confidence_score=score,
+                    veto_reasons=[reason] if reason else []
+                )
+            )
+
+    global_veto = any(d["decision_status"] == DecisionStatus.PASS.value for d in decisions)
+    contract = create_canonical_execution_contract(fecha, decisions, global_veto_active=global_veto)
+    output_file = DECISION_CONTRACTS / f"decision_contracts_{fecha}.json"
+    save_contract_atomic(contract, output_file)
+    logger.info(f"✅ Contrato de ejecución guardado: {output_file.name}")
+
+if __name__ == "__main__":
+    main()

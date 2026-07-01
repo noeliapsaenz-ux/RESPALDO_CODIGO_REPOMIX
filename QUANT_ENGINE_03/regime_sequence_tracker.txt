@@ -3,7 +3,7 @@
 REGIME SEQUENCE TRACKER - ENRIQUECIMIENTO SECUENCIAL DEL RÉGIMEN
 ==========================================================================
 Ubicación: QUANT_ENGINE_03
-Dependencias: quant_config (paths, logging, symbols, settings)
+Dependencias:(paths, logging, symbols, settings)
 Responsabilidad: Enriquecer el market_state.parquet dentro de bars con
                  métricas secuenciales que describen la evolución.
 ==========================================================================
