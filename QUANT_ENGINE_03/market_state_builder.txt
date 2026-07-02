@@ -15,30 +15,22 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-# Inyección dinámica de la raíz del proyecto para resolver dependencias
 root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
+if str(root_path) not in sys.path: sys.path.insert(0, str(root_path))
 
-# Imports directos desde las capas unificadas del sistema
 from SYSTEM_CANONICAL.system_symbols import get_symbols, get_spread_limit
-from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str, BROKER_TZ
+# 🟢 AÑADIDO: Importación de la función canónica de sesión
+from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str, BROKER_TZ, get_minutes_since_london_open
 from SYSTEM_CANONICAL.system_states import STATE_BUILDER_THRESHOLDS, STATE_BUILDER_PENALTIES, MARKET_STATE_THRESHOLDS
 from SYSTEM_SERVICES.system_paths import AUDIT_GOLD, QUANT_BARS
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_CONTRACTS.contract_manager import (
-    BIT_REVERSED_SPREAD,
-    BIT_WIDE_SPREAD,
-    BIT_STALE_TICK,
-    BIT_CLOCK_SYNC,
-    BIT_ZERO_SPREAD,
-    BIT_DUPLICATE_SEQ
+    BIT_REVERSED_SPREAD, BIT_WIDE_SPREAD, BIT_STALE_TICK, BIT_CLOCK_SYNC, BIT_ZERO_SPREAD, BIT_DUPLICATE_SEQ
 )
 
 logger = get_system_logger("market_state_builder", "03_QUANT")
 
 def clasificar_estado_minuto(tps: float, spread_mean: float, realized_vol: float, limit: float) -> str:
-    """🟢 CAPA 10: Clasificación del Estado Operacional del Minuto"""
     t = MARKET_STATE_THRESHOLDS
     if tps < t["low_activity_tps"]: return "LOW_ACTIVITY"
     if realized_vol > t["news_like_volatility"] and tps > t["news_like_tps"]: return "NEWS_LIKE"
@@ -56,8 +48,7 @@ def construir_market_state(symbol: str, fecha: str) -> bool:
         return False
 
     logger.info(f"📊 {symbol}: Cargando Parquet GOLD V2...")
-    try:
-        df_gold = pd.read_parquet(gold_path)
+    try: df_gold = pd.read_parquet(gold_path)
     except Exception as e:
         logger.error(f"❌ Error leyendo Parquet GOLD para {symbol}: {e}")
         return False
@@ -98,7 +89,6 @@ def construir_market_state(symbol: str, fecha: str) -> bool:
     max_time = resampler['time_msc'].max()
     min_time = resampler['time_msc'].min()
     effective_duration_seconds = ((max_time - min_time) / 1000.0).fillna(60.0)
-    
     duration_clean = np.where(effective_duration_seconds < 1.0, 1.0, effective_duration_seconds)
     tps_abs = (tick_count / 60.0).round(3)
     tps_effective = (tick_count / duration_clean).round(3)
@@ -107,7 +97,6 @@ def construir_market_state(symbol: str, fecha: str) -> bool:
     ask_only_updates = resampler['is_ask_only'].sum()
     both_updates = resampler['is_both'].sum()
     total_upd = bid_only_updates + ask_only_updates + both_updates
-    
     bid_pressure = (bid_only_updates / (total_upd + 1e-9)).round(3)
     ask_pressure = (ask_only_updates / (total_upd + 1e-9)).round(3)
     quote_balance = ((bid_only_updates - ask_only_updates) / (total_upd + 1e-9)).round(3)
@@ -159,29 +148,17 @@ def construir_market_state(symbol: str, fecha: str) -> bool:
     
     for _, group in resampler:
         if len(group) < STATE_BUILDER_THRESHOLDS["min_ticks_volatility"]:
-            realized_volatility.append(0.0)
-            median_return.append(0.0)
-            mad_return.append(0.0)
+            realized_volatility.append(0.0); median_return.append(0.0); mad_return.append(0.0)
             continue
-        
         quality_ticks = group[group['quality_score'] >= STATE_BUILDER_THRESHOLDS["min_quality_score_for_vol"]]
         if len(quality_ticks) < STATE_BUILDER_THRESHOLDS["min_ticks_volatility"]:
-            realized_volatility.append(0.0)
-            median_return.append(0.0)
-            mad_return.append(0.0)
+            realized_volatility.append(0.0); median_return.append(0.0); mad_return.append(0.0)
             continue
-            
         mid_prices = quality_ticks['mid_price'].values
         log_returns = np.log(mid_prices[1:] / mid_prices[:-1])
-        
-        vol = float(np.std(log_returns) * 1000)
-        realized_volatility.append(round(vol, 6))
-
-        med = float(np.median(log_returns))
-        median_return.append(round(med * 1000, 6))
-
-        mad = float(np.median(np.abs(log_returns - med)) * 1.4826)
-        mad_return.append(round(mad * 1000, 6))
+        vol = float(np.std(log_returns) * 1000); realized_volatility.append(round(vol, 6))
+        med = float(np.median(log_returns)); median_return.append(round(med * 1000, 6))
+        mad = float(np.median(np.abs(log_returns - med)) * 1.4826); mad_return.append(round(mad * 1000, 6))
 
     df_bars = pd.DataFrame(index=df_ohlc.index)
     df_bars['open'] = df_ohlc['open']
@@ -193,7 +170,13 @@ def construir_market_state(symbol: str, fecha: str) -> bool:
     dt_utc = pd.to_datetime(df_bars['timestamp'], unit='s', utc=True)
     
     df_bars['session'] = resampler['session'].apply(lambda x: x.mode()[0] if not x.empty else "UNKNOWN")
-    df_bars['minutes_since_session_open'] = np.where(df_bars['session'] == "CLOSED", 0, (dt_utc.dt.hour - 6) * 60 + dt_utc.dt.minute).astype(int)
+    
+    # 🟢 CORREGIDO: Cálculo canónico de minutos desde apertura de Londres eliminando hour-6
+    df_bars['minutes_since_session_open'] = np.where(
+        df_bars['session'] == "CLOSED", 
+        0, 
+        dt_utc.map(get_minutes_since_london_open)
+    ).astype(int)
 
     df_bars['tick_count'] = tick_count
     df_bars['volume'] = resampler['volume'].sum()
@@ -235,7 +218,8 @@ def construir_market_state(symbol: str, fecha: str) -> bool:
     
     df_bars['duplicate_ticks'] = duplicate_ticks
     df_bars['stale_ticks'] = stale_ticks
-    df_bars['integrity_score'] = integrity_score
+    # OJO: integrity_score no estaba definido en el original, se asume derivado de penalties
+    df_bars['integrity_score'] = np.clip(100.0 - penalties, 0.0, 100.0)
     
     df_bars['spread_acceleration'] = df_bars['spread_mean'].diff().diff().fillna(0.0).round(2)
     df_bars['price_acceleration'] = df_bars['close'].diff().diff().fillna(0.0).round(6)
@@ -271,13 +255,12 @@ def construir_market_state(symbol: str, fecha: str) -> bool:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"{symbol}_{fecha}_market_state.parquet"
 
-    # Persistencia atómica de datos en Windows
+    # 🟢 CAMBIO: Escritura atómica estandarizada para Parquet en Windows
     temp_file = output_file.with_suffix(".tmp.parquet")
     try:
         df_bars.to_parquet(temp_file, index=False)
         import os
-        if temp_file.exists():
-            os.replace(temp_file, output_file)
+        if temp_file.exists(): os.replace(temp_file, output_file)
         logger.info(f"✅ {symbol}: Snapshot de estado guardado en bars.")
         return True
     except Exception as e:
@@ -291,12 +274,10 @@ def main():
     parser = argparse.ArgumentParser(description="Market State Builder V2.2")
     parser.add_argument("--date", type=str, default="latest")
     args = parser.parse_args()
-
     fecha = args.date if args.date != "latest" else get_fecha_broker_str()
     logger.info(f"🚀 Iniciando construcción de snapshot de estado para: {fecha}")
-
     procesados = sum(1 for s in get_symbols() if construir_market_state(s, fecha))
     logger.info(f"📋 Cierre diario finalizado: {procesados}/{len(get_symbols())} snapshots unificados en bars.")
     
-if __name__ == "__main__":
+if __name__ == "__main__": 
     main()

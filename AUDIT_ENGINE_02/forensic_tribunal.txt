@@ -17,32 +17,18 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Tuple, Optional, Any, List
 
-# Inyección de ruta raíz
 ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+if str(ROOT_DIR) not in sys.path: sys.path.insert(0, str(ROOT_DIR))
 
-# Importaciones oficiales del sistema
 from SYSTEM_SERVICES.system_paths import SAFE_DIR, SSD_EVIDENCE_DIR
 from SYSTEM_SERVICES.system_settings import DELETE_SSD_ON_PASS
 from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
 from SYSTEM_SERVICES.system_logger import get_system_logger
 
 class ArchiveValidator:
-    """Tribunal de validación física de archivos históricos y purga controlada."""
-
     def __init__(self):
         self.logger = get_system_logger("archive_validator", "02_AUDIT")
-
-        self.stats = {
-            "total_evaluated": 0,
-            "pass_count": 0,
-            "fail_count": 0,
-            "pending_count": 0,
-            "bytes_purged": 0,
-            "errors": 0
-        }
-
+        self.stats = {"total_evaluated": 0, "pass_count": 0, "fail_count": 0, "pending_count": 0, "bytes_purged": 0, "errors": 0}
         self.logger.info("=" * 70)
         self.logger.info("⚖️ FORENSIC TRIBUNAL INICIALIZADO (SIN TELEGRAM / CONFIABLE)")
         self.logger.info(f"   Evidencia (SSD) : {SSD_EVIDENCE_DIR}")
@@ -51,61 +37,52 @@ class ArchiveValidator:
         self.logger.info("=" * 70)
 
     def _calculate_file_hash(self, file_path: Path) -> str:
-        """Calcula el hash del archivo de evidencia original."""
         sha = hashlib.sha256()
         with open(file_path, "rb") as f:
-            while chunk := f.read(65536):
-                sha.update(chunk)
+            while chunk := f.read(65536): sha.update(chunk)
         return sha.hexdigest()
 
     def _calculate_gzip_inner_hash(self, gz_path: Path) -> str:
-        """Calcula el hash del contenido descomprimido dentro de su archivo gzip de respaldo."""
         sha = hashlib.sha256()
         try:
             with gzip.open(gz_path, "rb") as f:
-                while chunk := f.read(65536):
-                    sha.update(chunk)
+                while chunk := f.read(65536): sha.update(chunk)
             return sha.hexdigest()
         except Exception as e:
             self.logger.error(f"❌ Error leyendo archivo gzip de custodia {gz_path.name}: {e}")
             return ""
 
+    # 🟢 CAMBIO: Unificación de política de reintentos y delays con contract_manager
     def _safe_unlink_with_retry(self, file_path: Path, max_retries: int = 3, delay: float = 0.05):
-        """Intenta remover archivos retenidos por bloqueos del SO (Política unificada con contract_manager)."""
         for i in range(max_retries):
             try:
-                if file_path.exists():
-                    file_path.unlink()
+                if file_path.exists(): file_path.unlink()
                 return True
             except PermissionError:
                 if i == max_retries - 1:
                     self.logger.error(f"❌ Bloqueo permanente de permisos NTFS para remover: {file_path.name}")
                     return False
                 time.sleep(delay)
+                delay *= 2  # Backoff exponencial
             except Exception as e:
                 self.logger.error(f"Fallo de E/S removiendo archivo {file_path.name}: {e}")
                 return False
         return False
 
     def _find_matching_gz(self, ssd_jsonl_path: Path) -> Optional[Path]:
-        """Localiza la ruta equivalente del archivo gzip en la bóveda SAFE."""
         try:
             rel_path = ssd_jsonl_path.relative_to(SSD_EVIDENCE_DIR)
             gz_path = SAFE_DIR / rel_path.parent / (rel_path.name + ".gz")
             return gz_path if gz_path.exists() else None
-        except ValueError:
-            return None
+        except ValueError: return None
 
     def run_forensic_audit(self) -> Dict[str, Any]:
-        """Ejecuta el análisis cruzado de hashes en toda la evidencia física."""
         self.logger.info("🔍 Escaneando buffer de ticks en disco SSD...")
-
         if not SSD_EVIDENCE_DIR.exists():
             self.logger.info("✅ Buffer de evidencia SSD limpio o sin registrar.")
             return self.stats
 
         ssd_files = list(SSD_EVIDENCE_DIR.rglob("*.jsonl"))
-
         if not ssd_files:
             self.logger.info("✅ Ningún archivo JSONL pendiente de validación física.")
             return self.stats
@@ -114,14 +91,9 @@ class ArchiveValidator:
 
         for ssd_file in ssd_files:
             self.stats["total_evaluated"] += 1
-            symbol = ssd_file.parent.parent.name
-            date_dir = ssd_file.parent.name
-
             gz_file = self._find_matching_gz(ssd_file)
-
             if not gz_file:
                 self.stats["pending_count"] += 1
-                self.logger.debug(f"⏳ Pendiente de compresión: {ssd_file.name} sin contraparte en SAFE.")
                 continue
 
             ssd_hash = self._calculate_file_hash(ssd_file)
@@ -129,52 +101,29 @@ class ArchiveValidator:
 
             if not gz_inner_hash:
                 self.stats["errors"] += 1
-                self.logger.error(f"❌ Error de lectura en respaldo de búnker {gz_file.name}. Evidencia preservada.")
                 continue
 
             if ssd_hash == gz_inner_hash:
                 self.stats["pass_count"] += 1
-                self.logger.info(f"✅ Coincidencia: {ssd_file.name} == {gz_file.name} ({ssd_hash[:16]})")
-
                 if DELETE_SSD_ON_PASS:
                     file_size = ssd_file.stat().st_size
-                    if self._safe_unlink_with_retry(ssd_file):
-                        self.stats["bytes_purged"] += file_size
-                        self.logger.info(f"🧹 Purga completada para: {ssd_file.name} ({file_size / 1024:.1f} KB liberados).")
-                    else:
-                        self.logger.error(f"❌ No se pudo purgar {ssd_file.name} (recurso ocupado).")
-                else:
-                    self.logger.debug(f"💾 Evidencia preservada (Política inactiva).")
+                    if self._safe_unlink_with_retry(ssd_file): self.stats["bytes_purged"] += file_size
             else:
                 self.stats["fail_count"] += 1
-                self.logger.critical(
-                    f"🚨 DISCREPANCIA CRIPTOGRÁFICA DETECTADA en {symbol} ({date_dir}).\n"
-                    f"Archivo: {ssd_file.name}\n"
-                    f"Hash SSD: {ssd_hash[:16]} != Hash SAFE: {gz_inner_hash[:16]}\n"
-                    f"ATENCIÓN: Evidencia física preservada para análisis forense humano."
-                )
+                self.logger.critical(f"🚨 DISCREPANCIA CRIPTOGRÁFICA DETECTADA. Archivo: {ssd_file.name}")
 
         return self.stats
         
     def print_executive_summary(self):
-        """Muestra el resumen de auditoría del tribunal de archivo."""
         self.logger.info("=" * 70)
         self.logger.info("⚖️ RESUMEN EJECUTIVO DE ARBITRAJE DE ARCHIVO")
         self.logger.info("=" * 70)
         self.logger.info(f"  Archivos totales evaluados : {self.stats['total_evaluated']}")
         self.logger.info(f"  Integridad perfecta (PASS) : {self.stats['pass_count']}")
         self.logger.info(f"  Discrepancias (FAIL)       : {self.stats['fail_count']}")
-        self.logger.info(f"  Pendientes de procesar     : {self.stats['pending_count']}")
-        self.logger.info(f"  Fallas de descompresión    : {self.stats['errors']}")
-
         mb_purged = self.stats['bytes_purged'] / (1024 * 1024)
         self.logger.info(f"  Espacio purgado del SSD    : {mb_purged:.3f} MB")
-        self.logger.info("=" * 70)
-
-        if self.stats['fail_count'] > 0:
-            self.logger.error("🚨 ATENCIÓN: Se encontraron discrepancias criptográficas físicas.")
-        else:
-            self.logger.info("💡 Validación concluida de forma íntegra. No hay discrepancias en disco.")
+        if self.stats['fail_count'] > 0: self.logger.error("🚨 ATENCIÓN: Se encontraron discrepancias criptográficas físicas.")
 
 def main():
     validator = ArchiveValidator()
@@ -182,7 +131,5 @@ def main():
     validator.print_executive_summary()
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n🛑 Cancelado voluntariamente por el usuario.")
+    try: main()
+    except KeyboardInterrupt: print("\n🛑 Cancelado voluntariamente por el usuario.")

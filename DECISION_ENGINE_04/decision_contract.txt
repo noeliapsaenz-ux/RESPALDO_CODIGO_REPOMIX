@@ -24,11 +24,7 @@ from SYSTEM_CANONICAL.system_states import DecisionStatus, ContractType, DECISIO
 from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
 from SYSTEM_CANONICAL.system_symbols import get_symbols
 from SYSTEM_SERVICES.system_logger import get_system_logger
-from SYSTEM_SERVICES.system_paths import (
-    DECISION_CONFIDENCE_SCORES,
-    DECISION_CONTRACTS,
-    DECISION_HYPOTHESES
-)
+from SYSTEM_SERVICES.system_paths import DECISION_CONFIDENCE_SCORES, DECISION_CONTRACTS, DECISION_HYPOTHESES
 from SYSTEM_CONTRACTS.contract_manager import load_contract_safe, save_contract_atomic
 from decision_contracts import create_canonical_execution_contract, create_decision_symbol_entry
 
@@ -53,12 +49,9 @@ def main():
         for symbol in get_symbols():
             decisions.append(
                 create_decision_symbol_entry(
-                    symbol=symbol,
-                    decision_status=DecisionStatus.PASS.value,
-                    execution_feasibility_score=0.0,
-                    hypothesis_significance=0.0,
-                    decision_confidence_score=0.0,
-                    veto_reasons=["Falta confidence_scores"]
+                    symbol=symbol, decision_status=DecisionStatus.PASS.value,
+                    execution_feasibility_score=0.0, hypothesis_significance=0.0,
+                    decision_confidence_score=0.0, veto_reasons=["Falta confidence_scores"]
                 )
             )
         contract = create_canonical_execution_contract(fecha, decisions, global_veto_active=True)
@@ -70,7 +63,6 @@ def main():
     for symbol, styles in confidence_data.get("confidence_scores", {}).items():
         for style, data in styles.items():
             score = data.get("decision_confidence_score", 0.0)
-            # Determinar estado usando los enums correctos
             if data.get("veto_applied", False):
                 status = DecisionStatus.PASS.value
                 reason = data.get("veto_reason", "Veto activo")
@@ -83,11 +75,9 @@ def main():
 
             decisions.append(
                 create_decision_symbol_entry(
-                    symbol=symbol,
-                    decision_status=status,
+                    symbol=symbol, decision_status=status,
                     execution_feasibility_score=data.get("inputs", {}).get("execution_feasibility_score", 0.0),
-                    hypothesis_significance=0.0,  # Podrías extraer de hypotheses si quieres
-                    decision_confidence_score=score,
+                    hypothesis_significance=0.0, decision_confidence_score=score,
                     veto_reasons=[reason] if reason else []
                 )
             )

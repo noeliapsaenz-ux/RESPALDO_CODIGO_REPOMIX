@@ -16,11 +16,10 @@ Responsabilidad:
 """
 import time
 from typing import Dict, Any, Optional
-
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_settings import send_telegram_alert
 from SYSTEM_CANONICAL.system_sessions import get_current_broker_time
-from SYSTEM_CANONICAL.system_states import AUDIT_THRESHOLDS, CAPTURE_THRESHOLDS, SystemState,VERIFY_RAMDISK_SSD_MATCH, QUARANTINE_SUFFIX 
+from SYSTEM_CANONICAL.system_states import AUDIT_THRESHOLDS, CAPTURE_THRESHOLDS, SystemState, SLOPE_THRESHOLDS
 
 class AlertEngine:
     def __init__(self, symbol: str):
@@ -39,42 +38,36 @@ class AlertEngine:
         self.logger.info(f"✅ AlertEngine iniciado para {self.symbol}")
 
     def check_stall(self, last_tick_time: float, now: float = None) -> Optional[str]:
-        if now is None:
-            now = time.time()
+        if now is None: now = time.time()
         elapsed = now - last_tick_time
-        if elapsed >= self.STALL_THRESHOLD:
-            return f"STALL - {elapsed:.1f}s sin ticks"
+        if elapsed >= self.STALL_THRESHOLD: return f"STALL - {elapsed:.1f}s sin ticks"
         return None
 
     def check_overflow(self, overflow_rate: float) -> Optional[str]:
-        if overflow_rate >= self.OVERFLOW_THRESHOLD:
-            return f"OVERFLOW - {overflow_rate:.1f} eventos/segundo"
+        if overflow_rate >= self.OVERFLOW_THRESHOLD: return f"OVERFLOW - {overflow_rate:.1f} eventos/segundo"
         return None
 
     def check_loss(self, loss_rate: float) -> Optional[str]:
-        if loss_rate >= self.LOSS_THRESHOLD:
-            return f"LOSS - {loss_rate*100:.2f}% de ticks perdidos"
+        if loss_rate >= self.LOSS_THRESHOLD: return f"LOSS - {loss_rate*100:.2f}% de ticks perdidos"
         return None
 
     def check_state(self, state: SystemState) -> Optional[str]:
-        if state == SystemState.RED:
-            return f"STATE_RED - Sistema en estado crítico"
-        elif state == SystemState.ORANGE:
-            return f"STATE_ORANGE - Presión sostenida"
+        if state == SystemState.RED: return f"STATE_RED - Sistema en estado crítico"
+        elif state == SystemState.ORANGE: return f"STATE_ORANGE - Presión sostenida"
         return None
 
     def check_slope(self, slope: float, acceleration: float) -> Optional[str]:
-        if slope > 20 and acceleration > 0:
+        # 🟢 Uso de umbrales canónicos en lugar de mágicos 10/20
+        if slope > SLOPE_THRESHOLDS["critical"] and acceleration > 0:
             return f"PREDICTIVE - Slope {slope:.1f} ticks/seg, acelerando"
-        elif slope > 10:
+        elif slope > SLOPE_THRESHOLDS["warning"]:
             return f"PREDICTIVE - Slope {slope:.1f} ticks/seg"
         return None
 
     def evaluate(self, state: SystemState, last_tick_time: float, overflow_rate: float, 
                  loss_rate: float, slope: float, acceleration: float, buffer_pct: float) -> Optional[str]:
         now = time.time()
-        if now - self._last_alert_time < self._alert_cooldown:
-            return None
+        if now - self._last_alert_time < self._alert_cooldown: return None
             
         checks = [
             ('STATE', self.check_state(state)),
@@ -89,37 +82,24 @@ class AlertEngine:
                 self._last_alert_time = now
                 self._alert_count += 1
                 self._last_alert_type = alert_type
-                
                 context = {
-                    'symbol': self.symbol,
-                    'state': state.value if hasattr(state, 'value') else state,
-                    'buffer': f"{buffer_pct:.1f}%",
-                    'overflow': f"{overflow_rate:.1f}/s",
-                    'loss': f"{loss_rate*100:.2f}%",
-                    'slope': f"{slope:.1f} ticks/s",
+                    'symbol': self.symbol, 'state': state.value if hasattr(state, 'value') else state,
+                    'buffer': f"{buffer_pct:.1f}%", 'overflow': f"{overflow_rate:.1f}/s",
+                    'loss': f"{loss_rate*100:.2f}%", 'slope': f"{slope:.1f} ticks/s",
                     'time': get_current_broker_time().strftime('%H:%M:%S')
                 }
-                
                 full_msg = (f"{alert_msg} | {context['symbol']} @ {context['time']} | "
                             f"Buffer: {context['buffer']} | Overflow: {context['overflow']} | "
                             f"Loss: {context['loss']} | Slope: {context['slope']}")
-                
                 self.logger.warning(f"🔔 {full_msg}")
-                
-                try:
-                    send_telegram_alert(f"⚠️ {full_msg}")
-                except Exception as e:
-                    self.logger.error(f"Error enviando alerta Telegram: {e}")
-                    
+                try: send_telegram_alert(f"⚠️ {full_msg}")
+                except Exception as e: self.logger.error(f"Error enviando alerta Telegram: {e}")
                 return full_msg
-                
         return None
 
     def get_stats(self) -> Dict[str, Any]:
         return {
-            'symbol': self.symbol,
-            'alert_count': self._alert_count,
-            'last_alert_type': self._last_alert_type,
-            'last_alert_time': self._last_alert_time,
+            'symbol': self.symbol, 'alert_count': self._alert_count,
+            'last_alert_type': self._last_alert_type, 'last_alert_time': self._last_alert_time,
             'cooldown_remaining': max(0.0, self._alert_cooldown - (time.time() - self._last_alert_time))
         }

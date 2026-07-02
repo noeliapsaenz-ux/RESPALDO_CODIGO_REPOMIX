@@ -28,7 +28,6 @@ import time
 import os
 import signal
 import json
-# Se incorpora psutil para evitar NameError en la verificación de procesos vivos
 import psutil
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
@@ -43,7 +42,6 @@ except ImportError:
     class Style:
         RESET=''
 
-# Cambiar el directorio de trabajo a la raíz del proyecto
 os.chdir(raiz_proyecto)
 
 # ==============================================================================
@@ -56,16 +54,16 @@ from SYSTEM_SERVICES.system_paths import (
     LOGS_MASTER_DIR,
     ensure_directories_exist as create_directories
 )
-from SYSTEM_SERVICES.system_settings import OPERATIONAL_MODE, send_telegram_alert
+# 🟢 CORREGIDO: Importar USAR_RAMDISK desde system_settings, no del difunto capture_config
+from SYSTEM_SERVICES.system_settings import OPERATIONAL_MODE, send_telegram_alert, USAR_RAMDISK
 from SYSTEM_CANONICAL.system_sessions import BROKER_TZ, classify_session, is_market_open
+# 🟢 AÑADIDO: Importar fuente canónica de símbolos y estados
+from SYSTEM_CANONICAL.system_symbols import get_symbols
+from SYSTEM_CANONICAL.system_states import SystemState
 from SYSTEM_SERVICES.system_logger import get_system_logger
 
-# Importación del universo de captura local
-# NOTA DE INTEGRACIÓN: El módulo capture_config actualmente opera de forma 100% estática 
-# debido a que QUANT_ENGINE_03 aún no genera dynamic_symbol_config.json en el entorno de producción.
-# Por lo tanto, el supervisor de orquestación supervisa parámetros fijos y consistentes con los 
-# catálogos de SYSTEM_CANONICAL.system_symbols.
-from CAPTURE_ENGINE_01.capture_config import SYMBOLS_TO_CAPTURE, USAR_RAMDISK
+# 🟢 CORREGIDO: Obtener la lista de símbolos desde el canon, no desde un config local
+SYMBOLS_TO_CAPTURE = list(get_symbols())
 
 def init_logging(component: str = "launcher", category: str = "00_ORCHESTRATOR"):
     create_directories()
@@ -80,7 +78,6 @@ TIEMPO_VIDA_MINIMO_SEG = 30
 DELAY_BETWEEN_STARTS = 2.0
 STABILIZATION_TIMEOUT = 15
 
-# Detectar optimizaciones de latencia basadas en el entorno
 OPTIMIZACION = os.getenv("OPTIMIZACION", "local").lower()
 if OPTIMIZACION == 'aws':
     ZOMBIE_TIMEOUT_SEG = 900
@@ -91,24 +88,15 @@ else:
 
 SHUTDOWN_GRACEFUL_WAIT = 15.0
 
-
 def get_session_umbral_normal(session: str) -> int:
-    if session in ["LONDON", "OVERLAP", "NEW_YORK"]:
-        return 60
-    elif session == "ASIA":
-        return 180
-    else:
-        return 600
-
+    if session in ["LONDON", "OVERLAP", "NEW_YORK"]: return 60
+    elif session == "ASIA": return 180
+    else: return 600
 
 def get_session_umbral_critico(session: str) -> int:
-    if session in ["LONDON", "OVERLAP", "NEW_YORK"]:
-        return 300
-    elif session == "ASIA":
-        return 600
-    else:
-        return 1800
-
+    if session in ["LONDON", "OVERLAP", "NEW_YORK"]: return 300
+    elif session == "ASIA": return 600
+    else: return 1800
 
 class SmartLauncher:
     def __init__(self):
@@ -127,8 +115,7 @@ class SmartLauncher:
         try:
             signal.signal(signal.SIGINT, self.signal_handler)
             signal.signal(signal.SIGTERM, self.signal_handler)
-        except ValueError:
-            pass
+        except ValueError: pass
             
         self.clear_screen()
         self.print_header()
@@ -143,11 +130,9 @@ class SmartLauncher:
                 self.logger.info("🧹 Eliminada señal de shutdown residual en directorio de estados.")
             for symbol in SYMBOLS_TO_CAPTURE:
                 ok_file = STATE_DIR / f"{symbol}.shutdown_ok"
-                if ok_file.exists():
-                    ok_file.unlink()
+                if ok_file.exists(): ok_file.unlink()
                 symbol_signal_file = STATE_DIR / f"{symbol}.shutdown_signal"
-                if symbol_signal_file.exists():
-                    symbol_signal_file.unlink()
+                if symbol_signal_file.exists(): symbol_signal_file.unlink()
         except Exception as e:
             self.logger.error(f"No se pudo limpiar los archivos de señal residuales: {e}")
 
@@ -164,10 +149,8 @@ class SmartLauncher:
         self._current_session[symbol] = self._get_current_session()
 
     def clear_screen(self):
-        try:
-            os.system('cls' if os.name == 'nt' else 'clear')
-        except Exception:
-            pass
+        try: os.system('cls' if os.name == 'nt' else 'clear')
+        except Exception: pass
 
     def print_header(self):
         print(f"{Fore.CYAN}{'='*100}")
@@ -203,19 +186,14 @@ class SmartLauncher:
                 try:
                     cmdline = ' '.join(proc.info['cmdline'] or [])
                     if ('mt5_tick_engine.py' in cmdline) and symbol.upper() in cmdline:
-                        if proc.is_running():
-                            return True, f"PID {proc.info['pid']}"
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
+                        if proc.is_running(): return True, f"PID {proc.info['pid']}"
+                except (psutil.NoSuchProcess, psutil.AccessDenied): continue
             return False, "No encontrado"
-        except Exception:
-            return False, "Error"
+        except Exception: return False, "Error"
 
     def _check_heartbeat(self, symbol: str) -> Tuple[bool, float]:
         heartbeat_file = STATE_DIR / f"{symbol}.heartbeat"
-        if not heartbeat_file.exists():
-            return False, 0.0
-        
+        if not heartbeat_file.exists(): return False, 0.0
         try:
             with open(heartbeat_file, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
@@ -224,63 +202,44 @@ class SmartLauncher:
                     timestamp = float(lines[0].strip())
                     age = time.time() - timestamp
                     return True, age
-        except Exception:
-            pass
+        except Exception: pass
         return False, 0.0
 
     def _determine_real_state(self, symbol: str, data: Dict[str, Any]) -> Tuple[str, str, str]:
         process_alive, pid_info = self._check_process_alive(symbol)
         heartbeat_exists, heartbeat_age = self._check_heartbeat(symbol)
         system_timestamp = data.get('system_timestamp', 0)
-        
         if system_timestamp > 0:
             data_age = time.time() - system_timestamp
-            if data_age < 0:
-                data_age = 0.0
+            if data_age < 0: data_age = 0.0
         else:
             state_file = STATE_DIR / f"{symbol}_state.json"
-            if state_file.exists():
-                data_age = time.time() - state_file.stat().st_mtime
-            else:
-                data_age = float('inf')
+            if state_file.exists(): data_age = time.time() - state_file.stat().st_mtime
+            else: data_age = float('inf')
         
         data_fresh = data_age < 30.0
         data_critical = data_age > 120.0
         
-        if process_alive:
-            process_status = "RUNNING"
-        else:
-            process_status = "STOPPED"
+        if process_alive: process_status = "RUNNING"
+        else: process_status = "STOPPED"
         
         if process_status == "RUNNING" and data_fresh:
-            real_status = "LIVE"
-            real_color = "GREEN"
-            detail = f"PID activo | Heartbeat: {heartbeat_age:.0f}s"
+            real_status, real_color, detail = "LIVE", "GREEN", f"PID activo | Heartbeat: {heartbeat_age:.0f}s"
         elif process_status == "RUNNING" and not data_fresh and not data_critical:
-            real_status = "STALE"
-            real_color = "YELLOW"
-            detail = f"Proceso vivo | Sin datos {data_age:.0f}s"
+            real_status, real_color, detail = "STALE", "YELLOW", f"Proceso vivo | Sin datos {data_age:.0f}s"
         elif process_status == "RUNNING" and data_critical:
-            real_status = "STALLED"
-            real_color = "ORANGE"
-            detail = f"Proceso atascado | Sin datos {data_age:.0f}s"
+            real_status, real_color, detail = "STALLED", "ORANGE", f"Proceso atascado | Sin datos {data_age:.0f}s"
         elif process_status == "STOPPED" and data_age > 60:
-            real_status = "DEAD"
-            real_color = "RED"
-            detail = f"Proceso detenido | Último dato {data_age:.0f}s"
+            real_status, real_color, detail = "DEAD", "RED", f"Proceso detenido | Último dato {data_age:.0f}s"
         else:
-            real_status = "OFFLINE"
-            real_color = "GRAY"
-            detail = "Sistema inactivo"
-        
+            real_status, real_color, detail = "OFFLINE", "GRAY", "Sistema inactivo"
         return real_status, real_color, detail
 
     def check_dead_processes(self) -> List[Tuple[str, int]]:
         dead_symbols = []
         for symbol, info in list(self.processes.items()):
             process = info.get('process')
-            if process and process.poll() is not None:
-                dead_symbols.append((symbol, process.poll()))
+            if process and process.poll() is not None: dead_symbols.append((symbol, process.poll()))
         return dead_symbols
 
     def check_zombie_processes(self) -> List[Tuple[str, float, Dict]]:
@@ -288,10 +247,8 @@ class SmartLauncher:
         ahora = time.time()
         for symbol, info in list(self.processes.items()):
             process = info.get('process')
-            if not process or process.poll() is not None:
-                continue
-            if not is_market_open():
-                continue
+            if not process or process.poll() is not None: continue
+            if not is_market_open(): continue
             is_zombie = False
             zombie_age = 0
             session = self._current_session.get(symbol, self._get_current_session())
@@ -306,53 +263,34 @@ class SmartLauncher:
                         if heartbeat_age > umbral_critico:
                             is_zombie = True
                             zombie_age = heartbeat_age
-                except Exception:
-                    pass
-            if is_zombie:
-                zombies.append((symbol, zombie_age, info))
+                except Exception: pass
+            if is_zombie: zombies.append((symbol, zombie_age, info))
         return zombies
 
     def start_capturer_smart(self, symbol: str) -> bool:
         print(f"{Fore.WHITE}▶️ Iniciando {symbol}... ", end=' ', flush=True)
-        
         try:
             fecha_str = datetime.now(BROKER_TZ).strftime('%Y%m%d')
             log_dir = LOGS_MASTER_DIR / fecha_str / "01_CAPTURE"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / f"{symbol}_stderr.log"
-            
             capturer_path = raiz_proyecto / "CAPTURE_ENGINE_01" / "mt5_tick_engine.py"
             cmd = [sys.executable, "-u", str(capturer_path), symbol]
-            
             log_file = open(log_path, "a", encoding='utf-8', buffering=1)
-            
             env_utf8 = os.environ.copy()
             env_utf8["PYTHONIOENCODING"] = "utf-8"
             env_utf8["PYTHONPATH"] = str(raiz_proyecto) + os.pathsep + env_utf8.get("PYTHONPATH", "")
             
-            p = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=log_file,
-                cwd=str(raiz_proyecto),
-                env=env_utf8
-            )
-            
+            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=log_file, cwd=str(raiz_proyecto), env=env_utf8)
             self.processes[symbol] = {
-                'process': p,
-                'pid': p.pid,
-                'start_time': time.time(),
-                'last_restart': datetime.now(),
-                'restart_count': self.restart_count.get(symbol, 0),
-                'status': 'running',
-                'log_path': str(log_path),
-                'log_file': log_file
+                'process': p, 'pid': p.pid, 'start_time': time.time(),
+                'last_restart': datetime.now(), 'restart_count': self.restart_count.get(symbol, 0),
+                'status': 'running', 'log_path': str(log_path), 'log_file': log_file
             }
             self._update_session_for_symbol(symbol)
             print(f"{Fore.GREEN}✅ PID: {p.pid}")
             self.logger.info(f"✅ {symbol} iniciado de forma asíncrona en CAPTURE_ENGINE_01 (PID: {p.pid})")
             return True
-            
         except Exception as e:
             print(f"{Fore.RED}❌ Falló: {e}")
             self.problems_detected.append(f"{symbol}: {str(e)[:50]}")
@@ -360,24 +298,20 @@ class SmartLauncher:
             return False
 
     def restart_dead_process(self, symbol: str, exit_code: int) -> bool:
-        if symbol not in self.processes:
-            return False
+        if symbol not in self.processes: return False
         tiempo_vivo = time.time() - self.processes[symbol]['start_time']
         old_log = self.processes[symbol].get('log_file')
         if old_log:
-            try:
-                old_log.close()
-            except Exception:
-                pass
+            try: old_log.close()
+            except Exception: pass
         ahora = time.time()
-        if symbol in self.pausado_hasta and ahora < self.pausado_hasta[symbol]:
-            return False
+        if symbol in self.pausado_hasta and ahora < self.pausado_hasta[symbol]: return False
+        
         if exit_code == 0 and tiempo_vivo >= TIEMPO_VIDA_MINIMO_SEG:
             self.restart_count[symbol] = 0
             print(f"\n{Fore.CYAN}🔄 {symbol} finalizó de forma controlada — Re-iniciando...")
             return self.start_capturer_smart(symbol)
-        
-        # Corrección tipográfica unificando "reicios" a "reinicios" para evitar confusiones
+            
         reinicios = self.restart_count.get(symbol, 0) + 1
         self.restart_count[symbol] = reinicios
         if reinicios > MAX_REINICIOS:
@@ -431,13 +365,19 @@ class SmartLauncher:
                     status_icon = f"{Fore.RED}💀"
                     status_text = "DETENIDO"
                 
-                state = state_info.get('state', 'UNKNOWN')
+                # 🟢 CORRECCIÓN ARQUITECTÓNICA: Si el proceso está ACTIVO pero aún no escribió el JSON, 
+                # inferimos el estado por defecto de la StateMachine que es GREEN, eliminando el UNKNOWN.
+                default_sm_state = SystemState.GREEN.value if status_text == "ACTIVO" else "OFFLINE"
+                state = state_info.get('state', default_sm_state)
+                
                 speed = state_info.get('speed', 1.0) * 100
                 buffer_pct = state_info.get('buffer_pct', 0.0)
                 overflow = state_info.get('overflow_rate', 0.0)
                 slope = state_info.get('slope', 0.0)
                 
-                state_col = Fore.GREEN if state == 'GREEN' else (Fore.YELLOW if state in ['YELLOW', 'ORANGE'] else Fore.RED)
+                # 🟢 Evaluación de color basada estrictamente en el Enum Canonico
+                state_col = Fore.GREEN if state == SystemState.GREEN.value else (Fore.YELLOW if state in [SystemState.YELLOW.value, SystemState.ORANGE.value] else Fore.RED)
+                
                 bar_filled = int(buffer_pct / 10)
                 buffer_bar = '█' * bar_filled + '░' * (10 - bar_filled)
                 buf_col = Fore.GREEN if buffer_pct < 60 else (Fore.YELLOW if buffer_pct < 85 else Fore.RED)
@@ -463,14 +403,12 @@ class SmartLauncher:
             real_problems = [p for p in self.problems_detected if "lento" not in p.lower()]
             if real_problems:
                 print(f"\n{Fore.RED}⚠️ ALERTAS OPERATIVAS:")
-                for problem in real_problems[-3:]:
-                    print(f" {Fore.YELLOW}• {problem}")
+                for problem in real_problems[-3:]: print(f" {Fore.YELLOW}• {problem}")
             else:
                 print(f"\n{Fore.GREEN}✅ Estado Consistente — Captura de alta frecuencia sin cuellos de botella")
             print(f"\n{Fore.YELLOW}[Q] Salir de Supervisor | [R] Re-lanzar todo el pipeline | [L] Mostrar ruta de logs")
             print(f"{Fore.CYAN}{'='*100}")
-        except Exception:
-            pass
+        except Exception: pass
 
     def restart_all(self):
         print(f"\n{Fore.YELLOW}🔄 Forzando apagado y re-inicialización del pipeline...")
@@ -482,8 +420,7 @@ class SmartLauncher:
         self.pausado_hasta.clear()
         for i, symbol in enumerate(SYMBOLS_TO_CAPTURE):
             self.start_capturer_smart(symbol)
-            if i < len(SYMBOLS_TO_CAPTURE) - 1:
-                time.sleep(DELAY_BETWEEN_STARTS)
+            if i < len(SYMBOLS_TO_CAPTURE) - 1: time.sleep(DELAY_BETWEEN_STARTS)
         print(f"\n{Fore.GREEN}✅ Pipeline completo re-lanzado")
         self.logger.info("✅ Re-arranque del pipeline completado.")
 
@@ -491,13 +428,11 @@ class SmartLauncher:
         print(f"\n{Fore.GREEN}🚀 LANZANDO CAPTURADORES INDEPENDIENTES...")
         for i, symbol in enumerate(SYMBOLS_TO_CAPTURE):
             self.start_capturer_smart(symbol)
-            if i < len(SYMBOLS_TO_CAPTURE) - 1:
-                time.sleep(DELAY_BETWEEN_STARTS)
+            if i < len(SYMBOLS_TO_CAPTURE) - 1: time.sleep(DELAY_BETWEEN_STARTS)
         print(f"\n{Fore.GREEN}✅ {len(SYMBOLS_TO_CAPTURE)} capturadores inicializados.")
         print(f"{Fore.YELLOW}⏳ Esperando {STABILIZATION_TIMEOUT}s para que los capturadores escriban su primer estado...")
         time.sleep(STABILIZATION_TIMEOUT)
-        for symbol in SYMBOLS_TO_CAPTURE:
-            self._get_state_info(symbol)
+        for symbol in SYMBOLS_TO_CAPTURE: self._get_state_info(symbol)
 
     def _wait_for_market(self) -> bool:
         print(f"\n{Fore.YELLOW}⏸️ En espera de la apertura del mercado...")
@@ -557,8 +492,7 @@ class SmartLauncher:
                         print(f"  {Fore.RED}⚡ Forzando terminación de {symbol} (PID: {proc.pid})...")
                         proc.terminate()
                         proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
+                    except subprocess.TimeoutExpired: proc.kill()
                         
         self._clean_stale_signals()
         self.processes.clear()
@@ -568,10 +502,8 @@ class SmartLauncher:
         for symbol, info in self.processes.items():
             proc = info.get("process")
             if proc and proc.poll() is None:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+                try: proc.kill()
+                except Exception: pass
 
     def _capture_loop(self):
         last_health_check = time.time()
@@ -592,8 +524,7 @@ class SmartLauncher:
                     return
                     
                 dead_processes = self.check_dead_processes()
-                for symbol, exit_code in dead_processes:
-                    self.restart_dead_process(symbol, exit_code)
+                for symbol, exit_code in dead_processes: self.restart_dead_process(symbol, exit_code)
                     
                 if ahora - last_health_check > 120:
                     zombies = self.check_zombie_processes()
@@ -608,37 +539,28 @@ class SmartLauncher:
                             try:
                                 with open(symbol_signal_file, "w", encoding="utf-8") as f:
                                     f.write(f"zombie_shutdown_initiated_at={time.time()}\n")
-                            except Exception as e:
-                                self.logger.error(f"Fallo al escribir señal individual para {symbol}: {e}")
+                            except Exception as e: self.logger.error(f"Fallo al escribir señal individual para {symbol}: {e}")
                                 
                             confirmed = False
                             start_wait = time.time()
                             ok_file = STATE_DIR / f"{symbol}.shutdown_ok"
                             while time.time() - start_wait < 5.0:
-                                if ok_file.exists():
-                                    confirmed = True
-                                    break
+                                if ok_file.exists(): confirmed = True; break
                                 time.sleep(0.1)
                                 
                             if not confirmed:
                                 self.logger.warning(f"⚠️ Zombie {symbol} no respondió a la señal en disco. Aplicando fuerza de detención...")
                                 if info.get('process'):
                                     info['process'].terminate()
-                                    try:
-                                        info['process'].wait(timeout=3)
-                                    except subprocess.TimeoutExpired:
-                                        info['process'].kill()
+                                    try: info['process'].wait(timeout=3)
+                                    except subprocess.TimeoutExpired: info['process'].kill()
                                         
                             if symbol_signal_file.exists():
-                                try:
-                                    symbol_signal_file.unlink()
-                                except Exception:
-                                    pass
+                                try: symbol_signal_file.unlink()
+                                except Exception: pass
                             if ok_file.exists():
-                                try:
-                                    ok_file.unlink()
-                                except Exception:
-                                    pass
+                                try: ok_file.unlink()
+                                except Exception: pass
                             self.start_capturer_smart(symbol)
                     last_health_check = ahora
                     
@@ -646,15 +568,9 @@ class SmartLauncher:
                     import msvcrt
                     if msvcrt.kbhit():
                         key = msvcrt.getch().decode('utf-8', errors='ignore').upper()
-                        if key == 'Q':
-                            self.running = False
-                            break
-                        elif key == 'R':
-                            self.restart_all()
-                            time.sleep(3)
-                        elif key == 'L':
-                            print(f"\n{Fore.CYAN}📂 Directorio centralizado de logs: {LOGS_UNIFIED_DIR}{Fore.RESET}")
-                            time.sleep(2)
+                        if key == 'Q': self.running = False; break
+                        elif key == 'R': self.restart_all(); time.sleep(3)
+                        elif key == 'L': print(f"\n{Fore.CYAN}📂 Directorio centralizado de logs: {LOGS_UNIFIED_DIR}{Fore.RESET}"); time.sleep(2)
             except KeyboardInterrupt:
                 self.running = False
                 break
@@ -669,8 +585,7 @@ class SmartLauncher:
         self.check_market_before_start()
         while self.running:
             if not self.market_open:
-                if not self._wait_for_market():
-                    break
+                if not self._wait_for_market(): break
             if self.running and self.market_open:
                 self.start_all_capturers()
                 self._capture_loop()

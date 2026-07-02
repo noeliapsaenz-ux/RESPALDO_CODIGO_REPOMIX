@@ -15,40 +15,21 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-# Inyección dinámica de la raíz del proyecto para resolver dependencias
 root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
+if str(root_path) not in sys.path: sys.path.insert(0, str(root_path))
 
-# Imports directos desde las capas unificadas del sistema
 from SYSTEM_CANONICAL.system_symbols import get_symbols, get_spread_limit, get_symbol_specification
 from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
-from SYSTEM_CANONICAL.system_canonical import (
-    SymbolCaptureStatus,
-    MetadataEnvelope
-)
+from SYSTEM_CANONICAL.system_canonical import SymbolCaptureStatus, MetadataEnvelope
+# 🟢 AÑADIDO: Importación de COLD_START_VOLATILITY
 from SYSTEM_CANONICAL.system_states import (
-    MarketReadinessStatus,
-    ContractType,
-    READINESS_THRESHOLDS,
-    READINESS_STYLE_WEIGHTS,
-    STYLE_VETO_RULES
+    MarketReadinessStatus, ContractType, READINESS_THRESHOLDS, READINESS_STYLE_WEIGHTS, 
+    STYLE_VETO_RULES, COLD_START_VOLATILITY
 )
-
-from SYSTEM_SERVICES.system_paths import (
-    AUDIT_STATE, 
-    QUANT_PROCESSED_DATA, 
-    QUANT_READINESS, 
-    QUANT_BARS, 
-    QUANT_HISTORY
-)
+from SYSTEM_SERVICES.system_paths import AUDIT_STATE, QUANT_PROCESSED_DATA, QUANT_READINESS, QUANT_BARS, QUANT_HISTORY
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_settings import send_telegram_alert
-from SYSTEM_CONTRACTS.contract_manager import (
-    load_contract_safe,
-    save_contract_atomic,
-    validate_contract_schema
-)
+from SYSTEM_CONTRACTS.contract_manager import load_contract_safe, save_contract_atomic, validate_contract_schema
 
 import canonical_scores as cs
 from quant_contracts import create_readiness_entry, create_canonical_readiness_certificate
@@ -56,56 +37,44 @@ from quant_contracts import create_readiness_entry, create_canonical_readiness_c
 logger = get_system_logger("market_readiness_engine", "03_QUANT")
 
 def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vol: float) -> dict[str, any]:
-    """Evalúa las métricas y calcula el readiness score por estilo de trading."""
     symbol = symbol.upper()
     state_file = QUANT_BARS / symbol / f"{symbol}_{fecha}_market_state.parquet"
+    default_metrics = {"spread_mean": 99.0, "jitter_mean_ms": 99.0, "tps_mean": 0.0, "quality_mean": 0.0}
     
-    default_metrics = {
-        "spread_mean": 99.0, "jitter_mean_ms": 99.0, "tps_mean": 0.0, "quality_mean": 0.0
-    }
-    
-    # 🟢 VETO FAIL-CLOSED H-03: Bloqueo duro por fallo de confiabilidad técnica
     if audit_status != SymbolCaptureStatus.CONFIABLE.value:
         logger.warning(f"❌ {symbol}: VETO DURO H-03 aplicado. No confiable para operar.")
         return {
-            "symbol": symbol,
-            "market_readiness_status": MarketReadinessStatus.VETOED.value,
+            "symbol": symbol, "market_readiness_status": MarketReadinessStatus.VETOED.value,
             "readiness_by_style": {
                 "scalping": {"status": "FAIL", "readiness_score": 0.0, "reason": "Capture Veto"},
                 "intraday": {"status": "FAIL", "readiness_score": 0.0, "reason": "Capture Veto"},
                 "swing": {"status": "FAIL", "readiness_score": 0.0, "reason": "Capture Veto"}
-            },
-            "metadata": {"evaluated_metrics": default_metrics, "fci_captura": 0.0}
+            }, "metadata": {"evaluated_metrics": default_metrics, "fci_captura": 0.0}
         }
 
     if not state_file.exists():
         logger.warning(f"❌ {symbol}: No se encuentra el parquet de estado para {fecha}.")
         return {
-            "symbol": symbol,
-            "market_readiness_status": MarketReadinessStatus.INSUFFICIENT_DATA.value,
+            "symbol": symbol, "market_readiness_status": MarketReadinessStatus.INSUFFICIENT_DATA.value,
             "readiness_by_style": {
                 "scalping": {"status": "FAIL", "readiness_score": 0.0, "reason": "No State Data"},
                 "intraday": {"status": "FAIL", "readiness_score": 0.0, "reason": "No State Data"},
                 "swing": {"status": "FAIL", "readiness_score": 0.0, "reason": "No State Data"}
-            },
-            "metadata": {"evaluated_metrics": default_metrics, "fci_captura": 100.0}
+            }, "metadata": {"evaluated_metrics": default_metrics, "fci_captura": 100.0}
         }
 
     try:
         df = pd.read_parquet(state_file)
-        if df.empty:
-            raise ValueError("Empty state parquet")
+        if df.empty: raise ValueError("Empty state parquet")
     except Exception as e:
         logger.error(f"❌ {symbol}: Error leyendo el snapshot de estado: {e}")
         return {
-            "symbol": symbol,
-            "market_readiness_status": MarketReadinessStatus.INSUFFICIENT_DATA.value,
+            "symbol": symbol, "market_readiness_status": MarketReadinessStatus.INSUFFICIENT_DATA.value,
             "readiness_by_style": {
                 "scalping": {"status": "FAIL", "readiness_score": 0.0, "reason": f"Read Error: {e}"},
                 "intraday": {"status": "FAIL", "readiness_score": 0.0, "reason": f"Read Error: {e}"},
                 "swing": {"status": "FAIL", "readiness_score": 0.0, "reason": f"Read Error: {e}"}
-            },
-            "metadata": {"evaluated_metrics": default_metrics, "fci_captura": 100.0}
+            }, "metadata": {"evaluated_metrics": default_metrics, "fci_captura": 100.0}
         }
 
     limit = get_spread_limit(symbol)
@@ -130,19 +99,12 @@ def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vo
     if "regime_duration_bars" in df.columns:
         persistence_val = float(df["regime_duration_bars"].mean())
 
-    evaluated_metrics = {
-        "spread_mean": round(spread_mean, 2),
-        "jitter_mean_ms": round(jitter, 2),
-        "tps_mean": round(tps_abs, 2),
-        "quality_mean": round(quality_mean, 1)
-    }
-
+    evaluated_metrics = {"spread_mean": round(spread_mean, 2), "jitter_mean_ms": round(jitter, 2), "tps_mean": round(tps_abs, 2), "quality_mean": round(quality_mean, 1)}
     readiness_by_style = {}
     any_pass = False
 
     for style in ["scalping", "intraday", "swing"]:
         weights = READINESS_STYLE_WEIGHTS[style]
-        
         score = 0.0
         if "spread" in weights: score += s_spread * weights["spread"]
         if "execution" in weights: score += s_liq * weights["execution"]
@@ -153,47 +115,23 @@ def evaluar_readiness_simbolo(symbol: str, fecha: str, audit_status: str, ref_vo
         veto_rules = STYLE_VETO_RULES[style]
         fci_min = veto_rules.get("fci_min", 70.0)
         spread_min = veto_rules.get("spread_score_min", 40.0)
-        
         status = "PASS"
         reason = "Aprobado"
         
-        if quality_mean < fci_min:
-            status = "FAIL"
-            reason = f"FCI por debajo de {fci_min}%"
-        elif s_spread < spread_min:
-            status = "FAIL"
-            reason = f"Spread Score por debajo de {spread_min}"
+        if quality_mean < fci_min: status = "FAIL"; reason = f"FCI por debajo de {fci_min}%"
+        elif s_spread < spread_min: status = "FAIL"; reason = f"Spread Score por debajo de {spread_min}"
             
-        if style == "swing":
-            min_threshold = READINESS_THRESHOLDS["min_score_swing"]
-        elif style == "intraday":
-            min_threshold = READINESS_THRESHOLDS["min_score_intraday"]
-        else:
-            min_threshold = READINESS_THRESHOLDS["min_score_scalping"]
-        if status == "PASS" and score < min_threshold:
-            status = "FAIL"
-            reason = f"Readiness Score {score:.1f} por debajo de {min_threshold}"
-            
-        if status == "PASS":
-            any_pass = True
+        if style == "swing": min_threshold = READINESS_THRESHOLDS["min_score_swing"]
+        elif style == "intraday": min_threshold = READINESS_THRESHOLDS["min_score_intraday"]
+        else: min_threshold = READINESS_THRESHOLDS["min_score_scalping"]
+        
+        if status == "PASS" and score < min_threshold: status = "FAIL"; reason = f"Readiness Score {score:.1f} por debajo de {min_threshold}"
+        if status == "PASS": any_pass = True
 
-        readiness_by_style[style] = {
-            "status": status,
-            "readiness_score": round(score, 2),
-            "reason": reason
-        }
+        readiness_by_style[style] = {"status": status, "readiness_score": round(score, 2), "reason": reason}
 
     market_status = MarketReadinessStatus.OPERABLE.value if any_pass else MarketReadinessStatus.VETOED.value
-
-    return {
-        "symbol": symbol,
-        "market_readiness_status": market_status,
-        "readiness_by_style": readiness_by_style,
-        "metadata": {
-            "evaluated_metrics": evaluated_metrics,
-            "fci_captura": round(quality_mean, 2)
-        }
-    }
+    return {"symbol": symbol, "market_readiness_status": market_status, "readiness_by_style": readiness_by_style, "metadata": {"evaluated_metrics": evaluated_metrics, "fci_captura": round(quality_mean, 2)}}
 
 def main():
     parser = argparse.ArgumentParser(description="Market Readiness Engine V2.2")
@@ -205,78 +143,54 @@ def main():
     logger.info(f"🧠 INICIANDO EVALUACIÓN DE PREPARACIÓN OPERACIONAL: {fecha}")
     logger.info("=" * 80)
 
-    # 🟢 CARGA COMPATIBLE CON EL CONTRATO UNIFICADO DE FASE 2 (AUDITORÍA FORENSE)
     audit_contract_path = AUDIT_STATE / "audit_execution_contract.json"
     audit_status_map = {}
     
     if audit_contract_path.exists():
         try:
             audit_data = load_contract_safe(audit_contract_path)
-            # Validación estricta H-03 de versión de esquema y fecha unificada de sesión
             if validate_contract_schema(audit_data, ContractType.AUDIT.value, fecha):
                 for sym_key, sym_val in audit_data.get("contracts", {}).items():
                     audit_status_map[sym_key.upper()] = sym_val.get("symbol_capture_status", SymbolCaptureStatus.NO_CONFIABLE.value)
                 logger.info(f"✅ Contrato auditado verificado de forma alineada para {fecha}.")
             else:
-                logger.critical(f"🛑 Error de validación de contrato de auditoría (Desalineación temporal o esquema H-03).")
-                for s in get_symbols():
-                    audit_status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
+                logger.critical(f"🛑 Error de validación de contrato de auditoría.")
+                for s in get_symbols(): audit_status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
         except Exception as e:
             logger.error(f"❌ Error al evaluar contrato unificado de auditoría: {e}")
-            for s in get_symbols():
-                audit_status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
+            for s in get_symbols(): audit_status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
     else:
         logger.warning("⚠️ No se encontró el contrato de auditoría en disco. Todos los símbolos vetados en cascada.")
-        for s in get_symbols():
-            audit_status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
+        for s in get_symbols(): audit_status_map[s.upper()] = SymbolCaptureStatus.NO_CONFIABLE.value
 
-    # Cargar base de datos histórica para normalización de volatilidad
     history_file = QUANT_HISTORY / "daily_history_30d.parquet"
-    default_vols = {sym: 0.0015 for sym in get_symbols()}
+    # 🟢 CORREGIDO: Uso de la constante canónica en lugar de 0.0015硬codeado
+    default_vols = {sym: COLD_START_VOLATILITY for sym in get_symbols()}
     if history_file.exists():
         try:
             df_hist = pd.read_parquet(history_file)
-            if not df_hist.empty:
-                default_vols = df_hist.groupby("symbol")["realized_vol_mean"].mean().to_dict()
-        except Exception as e:
-            logger.debug(f"Error procesando volatilidad de referencia: {e}")
+            if not df_hist.empty: default_vols = df_hist.groupby("symbol")["realized_vol_mean"].mean().to_dict()
+        except Exception as e: logger.debug(f"Error procesando volatilidad de referencia: {e}")
 
     readiness_results = []
-    
     for symbol in get_symbols():
         sym_upper = symbol.upper()
         audit_status = audit_status_map.get(sym_upper, SymbolCaptureStatus.NO_CONFIABLE.value)
-        ref_vol = default_vols.get(sym_upper, 0.0015)
-        
+        ref_vol = default_vols.get(sym_upper, COLD_START_VOLATILITY)
         eval_data = evaluar_readiness_simbolo(sym_upper, fecha, audit_status, ref_vol)
         readiness_results.append(eval_data)
-        
-        logger.info(f"   • {sym_upper:6}: "
-                    f"Scalping: {eval_data['readiness_by_style']['scalping']['status']} "
-                    f"| Intraday: {eval_data['readiness_by_style']['intraday']['status']} "
-                    f"| Swing: {eval_data['readiness_by_style']['swing']['status']} "
-                    f"--> Estado: {eval_data['market_readiness_status']}")
+        logger.info(f"   • {sym_upper:6}: Scalping: {eval_data['readiness_by_style']['scalping']['status']} | Intraday: {eval_data['readiness_by_style']['intraday']['status']} | Swing: {eval_data['readiness_by_style']['swing']['status']} --> Estado: {eval_data['market_readiness_status']}")
 
-    # Formular y serializar el reporte de gobernanza unificado
     readiness_entries = []
     for item in readiness_results:
         scores = {k: v["readiness_score"] for k, v in item["readiness_by_style"].items()}
-        readiness_entries.append(
-            create_readiness_entry(
-                item["symbol"],
-                item["market_readiness_status"],
-                scores,
-                item["metadata"]["fci_captura"]
-            )
-        )
+        readiness_entries.append(create_readiness_entry(item["symbol"], item["market_readiness_status"], scores, item["metadata"]["fci_captura"]))
     
     readiness_cert = create_canonical_readiness_certificate(fecha, readiness_entries)
-    # Reestructuramos el reporte de preparación interna de la sesión
     readiness_cert["resultados_readiness"] = readiness_results
     readiness_cert["contract_type"] = ContractType.READINESS.value
 
     output_file = QUANT_READINESS / f"readiness_report_{fecha}.json"
-
     try:
         save_contract_atomic(readiness_cert, output_file)
         logger.info(f"✅ Certificado de Readiness guardado con éxito en: {output_file.name}")
@@ -284,6 +198,5 @@ def main():
         logger.error(f"❌ Error guardando el certificado de Readiness: {e}")
         sys.exit(1)
 
-
-if __name__ == "__main__":
+if __name__ == "__main__": 
     main()

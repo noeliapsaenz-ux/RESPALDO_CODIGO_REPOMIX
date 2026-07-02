@@ -194,7 +194,12 @@ CAPTURE_THRESHOLDS = {
     "loss_divisor": 5.0,
     "min_free_gb": 0.5,
     "flush_interval_ms": 100,
-    "batch_size": 1000
+    "batch_size": 1000,
+    "inactive_threshold_sec": 120.0,
+    "compress_level": 3,
+    "min_state_duration_sec": 5.0,
+    "state_history_max": 60,
+    "low_liquidity_spread_multiplier": 1.5, # Antes hardcodeado como 1.5 en mt5_gateway
 }
 
 # ==========================================================================
@@ -315,6 +320,15 @@ ANOMALY_SEVERITY_CUTOFFS = {
     "anomalous_max": 85
 }
 
+ANOMALY_SCORE_WEIGHTS = {
+    "max_weight": 0.60,
+    "top3_weight": 0.40,
+    "z_score_multiplier": 25.0,
+    "simultaneity_bonus": 10.0,
+    "tension_count_threshold": 2,
+    "z_tension_limit": 1.5
+}
+
 SYSTEMIC_THRESHOLDS = {
     "volatility_svi_quiet": 70.0,
     "volatility_svi_normal": 130.0,
@@ -335,6 +349,8 @@ BACKPRESSURE_THRESHOLDS = {
     'ORANGE': {'buffer_pct': 85, 'overflow_rate': 5, 'slope': 20},
     'RED': {'buffer_pct': 95, 'overflow_rate': 10, 'slope': 50}
 }
+
+COLD_START_VOLATILITY = 0.0015
 
 BACKPRESSURE_SPEEDS = {
     'GREEN': 1.0,

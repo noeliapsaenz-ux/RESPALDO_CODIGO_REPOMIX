@@ -16,66 +16,50 @@ import pandas as pd
 from datetime import datetime, timezone
 from typing import Dict, Any
 
-# Inyección de ruta raíz
 ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+if str(ROOT_DIR) not in sys.path: sys.path.insert(0, str(ROOT_DIR))
 
-# Importaciones oficiales del sistema
 from SYSTEM_SERVICES.system_paths import AUDIT_REPORTS, AUDIT_STATE
 from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
+from SYSTEM_CANONICAL.system_states import AUDIT_THRESHOLDS
 from SYSTEM_SERVICES.system_logger import get_system_logger
+from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic
 from AUDIT_ENGINE_02.audit_contracts import resolve_target_date
 
-# Inicializar logger exclusivo
 logger = get_system_logger("audit_quality_trend_analyzer", "02_AUDIT")
 
 def analizar_tendencias_calidad(ventana_dias: int = 5) -> Dict[str, Any]:
-    """Analiza la pendiente de la calidad unificada de datos a lo largo de un período."""
     history_file = AUDIT_STATE / "confidence_history.parquet"
     if not history_file.exists():
         return {"error": "Base de datos de estabilidad unificada 'confidence_history.parquet' ausente."}
+    try: df = pd.read_parquet(history_file)
+    except Exception as e: return {"error": f"Error accediendo al archivo histórico de auditoría: {e}"}
 
-    try:
-        df = pd.read_parquet(history_file)
-    except Exception as e:
-        return {"error": f"Error accediendo al archivo histórico de auditoría: {e}"}
-
-    if df.empty or len(df) < 2:
-        return {"error": "Registros históricos insuficientes para cálculo de pendiente."}
+    if df.empty or len(df) < 2: return {"error": "Registros históricos insuficientes para cálculo de pendiente."}
 
     df = df.sort_values(by=["symbol", "fecha"])
     diagnosticos = {}
-
-    # 🟢 UMBRAL CANÓNICO DE TENDENCIA (SYSTEM_CANONICAL)
     slope_threshold = AUDIT_THRESHOLDS["trend_slope_threshold"]
 
     for symbol in df["symbol"].unique():
         df_sym = df[df["symbol"] == symbol].tail(ventana_dias)
-        if len(df_sym) < 3:
-            continue
-
-        ingestion_scores = df_sym["capture_conf"].values
+        if len(df_sym) < 3: continue
         overall_scores = df_sym["overall_conf"].values
-
         x = np.arange(len(overall_scores))
         slope, _ = np.polyfit(x, overall_scores, 1)
         slope = float(slope)
-
         direccion = "MEJORANDO" if slope > slope_threshold else ("DETERIORANDO" if slope < -slope_threshold else "ESTABLE")
         caida_consecutiva = bool(overall_scores[-1] < overall_scores[-2] < overall_scores[-3]) if len(overall_scores) >= 3 else False
+        ingestion_scores = df_sym["capture_conf"].values if "capture_conf" in df_sym.columns else overall_scores
 
         diagnosticos[symbol] = {
-            "symbol": symbol,
-            "ultima_fecha": str(df_sym["fecha"].values[-1]),
+            "symbol": symbol, "ultima_fecha": str(df_sym["fecha"].values[-1]),
             "ultima_confianza_ingesta": float(ingestion_scores[-1]),
             "ultima_confianza_consolidada": float(overall_scores[-1]),
             "historico_consolidado": [float(c) for c in overall_scores],
-            "slope_calidad": round(slope, 3),
-            "estado_tendencia": direccion,
+            "slope_calidad": round(slope, 3), "estado_tendencia": direccion,
             "alerta_degradacion_consecutiva": caida_consecutiva
         }
-
     return diagnosticos
 
 def main():
@@ -86,16 +70,15 @@ def main():
 
     fecha = resolve_target_date(args.date, AUDIT_STATE, get_fecha_broker_str)
     logger.info(f"📊 EJECUTANDO ANÁLISIS HISTÓRICO DE ESTABILIDAD - FECHA: {fecha}")
-
     tendencias = analizar_tendencias_calidad(ventana_dias=max(3, args.window))
-
     output_path = AUDIT_REPORTS / f"memoria_tendencias_{fecha}.json"
+    
+    # 🟢 CAMBIO: Escritura atómica unificada para prevenir truncado en Windows
     try:
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump({"fecha": fecha, "tendencias": tendencias}, f, indent=2, ensure_ascii=False)
+        save_contract_atomic({"fecha": fecha, "tendencias": tendencias}, output_path)
         logger.info(f"💾 Memoria de estabilidad guardada de forma atómica: {output_path.name}")
     except Exception as e:
         logger.error(f"Fallo escribiendo memoria de tendencias: {e}")
 
-if __name__ == "__main__":
+if __name__ == "__main__": 
     main()

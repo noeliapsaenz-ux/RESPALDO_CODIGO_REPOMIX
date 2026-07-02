@@ -17,7 +17,7 @@ import time
 from typing import Dict, Any
 
 from SYSTEM_SERVICES.system_logger import get_system_logger
-from SYSTEM_CANONICAL.system_states import SystemState, BACKPRESSURE_THRESHOLDS, BACKPRESSURE_SPEEDS
+from SYSTEM_CANONICAL.system_states import SystemState, BACKPRESSURE_THRESHOLDS, BACKPRESSURE_SPEEDS, AUDIT_THRESHOLDS, CAPTURE_THRESHOLDS
 from SYSTEM_CANONICAL.system_symbols import get_symbol_specification
 
 class StateMachine:
@@ -38,9 +38,12 @@ class StateMachine:
         self._overflow_rate = 0.0
         self._slope = 0.0
         self._loss_rate = 0.0
-        self._min_state_duration = 5.0
+        
+        # 🟢 Consumo desde capa canon
+        self._min_state_duration = CAPTURE_THRESHOLDS["min_state_duration_sec"]
         self._state_history_window = []
-        self._history_max = 60
+        self._history_max = CAPTURE_THRESHOLDS["state_history_max"]
+        
         self.logger.info(f"✅ StateMachine iniciado para {self.symbol} (multiplier: {self.multiplier:.2f}, min_buffer: {self.min_buffer})")
 
     def _calculate_dynamic_thresholds(self) -> Dict[str, Dict[str, float]]:
@@ -85,11 +88,14 @@ class StateMachine:
             slope_threshold = thresholds['RED']['slope'] * 1.5
         else:
             slope_threshold = thresholds['RED']['slope']
+        
+        # 🟢 Umbral de pérdida alineado con la gobernanza del canon (0.5% por defecto)
+        max_loss_rate = AUDIT_THRESHOLDS["max_loss_rate_pct"] / 100.0
             
         if (self._buffer_pct >= thresholds['RED']['buffer_pct'] or 
             self._overflow_rate >= thresholds['RED']['overflow_rate'] or 
             self._slope >= slope_threshold or 
-            self._loss_rate > 0.001):
+            self._loss_rate > max_loss_rate):
             return SystemState.RED
             
         if (self._buffer_pct >= thresholds['ORANGE']['buffer_pct'] or 

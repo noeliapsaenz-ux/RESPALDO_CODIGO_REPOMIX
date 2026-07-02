@@ -17,37 +17,25 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
 
 root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
+if str(root_path) not in sys.path: sys.path.insert(0, str(root_path))
 
 from SYSTEM_CANONICAL.system_symbols import get_symbols, get_spread_limit, get_symbol_specification
 from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str, is_market_open
 from SYSTEM_CANONICAL.system_canonical import SymbolCaptureStatus, MetadataEnvelope
+# 🟢 AÑADIDO: Importación de COLD_START_VOLATILITY
 from SYSTEM_CANONICAL.system_states import (
-    MarketRegime, MarketActivityState, ContractType, 
-    VOLATILITY_THRESHOLDS, SYSTEMIC_THRESHOLDS
+    MarketRegime, MarketActivityState, ContractType, VOLATILITY_THRESHOLDS, SYSTEMIC_THRESHOLDS, COLD_START_VOLATILITY
 )
-from SYSTEM_SERVICES.system_paths import (
-    QUANT_PROCESSED_DATA, 
-    AUDIT_STATE, 
-    QUANT_OUTPUTS, 
-    QUANT_BARS, 
-    QUANT_HISTORY
-)
+from SYSTEM_SERVICES.system_paths import QUANT_PROCESSED_DATA, AUDIT_STATE, QUANT_OUTPUTS, QUANT_BARS, QUANT_HISTORY
 from SYSTEM_SERVICES.system_logger import get_system_logger
-from SYSTEM_CONTRACTS.contract_manager import (
-    save_contract_atomic, load_contract_safe, validate_contract_schema
-)
-from quant_contracts import (
-    create_quant_symbol_entry,
-    create_canonical_quant_certificate,
-    validate_quant_certificate
-)
+from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic, load_contract_safe, validate_contract_schema
+from quant_contracts import create_quant_symbol_entry, create_canonical_quant_certificate, validate_quant_certificate
 
 logger = get_system_logger("master_state_consolidator", "03_QUANT")
 
 def cargar_historial_volatilidad(history_file: Path) -> Dict[str, float]:
-    default_vol = {sym: 0.0015 for sym in get_symbols()}
+    # 🟢 CORREGIDO: Uso de la constante canónica en lugar de 0.0015硬codeado
+    default_vol = {sym: COLD_START_VOLATILITY for sym in get_symbols()}
     if not history_file.exists(): return default_vol
     try:
         df = pd.read_parquet(history_file)
@@ -71,8 +59,7 @@ def sincronizar_e_intersecar_estados(fecha: str) -> Tuple[pd.DataFrame, Dict[str
                     df_cleaned = df.drop_duplicates(subset=["timestamp"], keep="first").copy()
                     series_map[symbol] = df_cleaned.set_index("timestamp").sort_index()
                     closes_map[symbol] = series_map[symbol]["close"]
-            except Exception as e:
-                logger.error(f"❌ {symbol}: Error de alineación: {e}")
+            except Exception as e: logger.error(f"❌ {symbol}: Error de alineación: {e}")
     if not series_map: return pd.DataFrame(), {}
     df_closes = pd.DataFrame(closes_map).ffill().bfill()
     df_returns = np.log(df_closes / df_closes.shift(1)).fillna(0.0)
@@ -80,7 +67,7 @@ def sincronizar_e_intersecar_estados(fecha: str) -> Tuple[pd.DataFrame, Dict[str
 
 def calcular_volatilidad_sistémica(series_map: Dict[str, pd.DataFrame], vol_hist: Dict[str, float]) -> Dict[str, Any]:
     t = SYSTEMIC_THRESHOLDS
-    vol_ratios = [float(df["realized_volatility"].iloc[-1]) / (vol_hist.get(sym, 0.0015) + 1e-9) 
+    vol_ratios = [float(df["realized_volatility"].iloc[-1]) / (vol_hist.get(sym, COLD_START_VOLATILITY) + 1e-9) 
                   for sym, df in series_map.items() if "realized_volatility" in df.columns]
     if not vol_ratios: return {"score": 50.0, "regime": "NORMAL", "confidence": 0.0}
     svi = float(np.mean(vol_ratios)) * 100.0
@@ -132,7 +119,6 @@ def generar_contrato_estado_global(fecha: str) -> bool:
     risk_sys = evaluar_sentimiento_riesgo(df_returns)
     act_sys = evaluar_actividad_global(series_map)
 
-    # Permitir ejecución basada en estados
     allow_scalping = (vol_sys["regime"] != "EXPLOSIVE" and liq_sys["regime"] != "CRITICAL")
     allow_swing = (vol_sys["regime"] != "QUIET" and coh_sys["regime"] != "COHESIVE / SYSTEMIC")
     
@@ -144,7 +130,6 @@ def generar_contrato_estado_global(fecha: str) -> bool:
     
     try:
         save_contract_atomic(payload, output_file)
-        # (Continuar con la emisión del Quant Certificate...)
         return True
     except Exception as e:
         logger.error(f"Error: {e}")

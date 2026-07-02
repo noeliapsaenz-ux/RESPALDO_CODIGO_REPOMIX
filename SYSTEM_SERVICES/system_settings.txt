@@ -47,8 +47,6 @@ def load_env_file(env_path: Path) -> None:
 ENV_FILE_PATH = CODE_DIR / ".env"
 load_env_file(ENV_FILE_PATH)
 
-# --- CARGA Y CONFIGURACIÓN DE PARÁMETROS OPERATIVOS ---
-
 # 1. Modo operativo (Por defecto en SHADOW por razones de seguridad de cuenta)
 OPERATIONAL_MODE: str = os.getenv("OPERATIONAL_MODE", "SHADOW").upper()
 
@@ -59,6 +57,7 @@ DELETE_SSD_ON_PASS: bool = os.getenv("DELETE_SSD_ON_PASS", "True").upper() == "T
 MT5_LOGIN: int = int(os.getenv("MT5_LOGIN", "0"))
 MT5_PASSWORD: str = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER: str = os.getenv("MT5_SERVER", "")
+USAR_RAMDISK = os.getenv("USAR_RAMDISK", "TRUE").upper() == "TRUE"
 
 # 3. Credenciales de Telegram (Soporta TELEGRAM_BOT_TOKEN y TELEGRAM_TOKEN)
 TELEGRAM_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", ""))

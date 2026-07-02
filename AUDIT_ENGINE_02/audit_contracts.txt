@@ -15,158 +15,80 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 
-# Inyección de ruta raíz
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# Importaciones canónicas y de servicios
 from SYSTEM_CANONICAL.system_canonical import (
-    SymbolCaptureStatus,
-    DataIntegrity,
-    MetadataEnvelope,
-    validate_canonical_enum
+    SymbolCaptureStatus, DataIntegrity, MetadataEnvelope, validate_canonical_enum
 )
-
 from SYSTEM_CANONICAL.system_states import ContractType, AUDIT_PENALTIES
-
 from SYSTEM_CONTRACTS.contract_manager import (
-    SCHEMA_VERSION_AUDIT,
-    PRODUCER_AUDIT,
-    load_contract_safe,
-    save_contract_atomic
+    SCHEMA_VERSION_AUDIT, PRODUCER_AUDIT, load_contract_safe, save_contract_atomic
 )
 
-# Constantes de penalización para cálculo de estabilidad
-CRITICAL_ERRORS = {
-    "state_red_alert": {"message": "Estado crítico detectado en post-cierre", "penalty": AUDIT_PENALTIES["state_red_alert"]},
-    "loss_rate_exceeded": {"message": "Tasa de pérdida física superior al límite", "penalty": AUDIT_PENALTIES["loss_rate_exceeded"]},
-    "overflow_rate_exceeded": {"message": "Saturación física de buffers con descartes de memoria", "penalty": AUDIT_PENALTIES["overflow_rate_exceeded"]},
-    "seq_inversion": {"message": "Inversión de secuencia física en base de datos", "penalty": AUDIT_PENALTIES["seq_inversion"]}
-}
-
-WARNING_CONDITIONS = {
-    "state_yellow_warning": {"message": "Semáforo del capturador en observación (YELLOW)", "penalty": AUDIT_PENALTIES["state_yellow_warning"]},
-    "moderate_loss": {"message": "Tasa de pérdida moderada de ticks detectada", "penalty": AUDIT_PENALTIES["moderate_loss"]},
-    "moderate_overflow": {"message": "Desborde menor de buffers en RAM detectado", "penalty": AUDIT_PENALTIES["moderate_overflow"]},
-    "high_buffer_pct": {"message": "Ocupación de colas en memoria excesiva (>80%)", "penalty": AUDIT_PENALTIES["high_buffer_pct"]},
-    "no_shutdown_ok": {"message": "Falta la firma de apagado limpio en el SSD", "penalty": AUDIT_PENALTIES["no_shutdown_ok"]}
-}
+# 🟢 ELIMINADOS: CRITICAL_ERRORS y WARNING_CONDITIONS.
+# Ahora se consume directamente AUDIT_PENALTIES desde el canon para evitar dobles fuentes de verdad.
+# Si se requiere un mensaje de texto asociado, se puede inferir de la clave o manejar en la vista.
 
 def load_json_safe(filepath: Path) -> Dict[str, Any]:
-    """Carga un JSON de forma segura previniendo corrupciones físicas en disco."""
     return load_contract_safe(filepath)
 
 def calculate_file_hash(filepath: Path) -> str:
-    """Calcula el hash SHA-256 inmutable de un archivo físico para linaje."""
     sha = hashlib.sha256()
     try:
-        if not filepath.exists():
-            return ""
+        if not filepath.exists(): return ""
         with open(filepath, "rb") as f:
-            while chunk := f.read(65536):
-                sha.update(chunk)
+            while chunk := f.read(65536): sha.update(chunk)
         return sha.hexdigest()
-    except Exception:
-        return ""
+    except Exception: return ""
 
 def resolve_target_date(date_arg: str, state_dir: Path, fallback_func) -> str:
-    """Resuelve dinámicamente la fecha objetivo de análisis."""
     if date_arg == "latest":
         sync_file = state_dir / "last_audited_date.txt"
         if sync_file.exists():
-            try:
-                return sync_file.read_text(encoding="utf-8").strip()
-            except Exception:
-                pass
+            try: return sync_file.read_text(encoding="utf-8").strip()
+            except Exception: pass
         return fallback_func()
     return date_arg
 
 def create_canonical_audit_certificate(
-    symbol: str,
-    fci_score: float,
-    data_integrity: str,
-    capture_status: str,
-    anomaly_list: Optional[List[Dict]] = None,
-    metadata_extra: Optional[Dict] = None
+    symbol: str, fci_score: float, data_integrity: str, capture_status: str,
+    anomaly_list: Optional[List[Dict]] = None, metadata_extra: Optional[Dict] = None
 ) -> Dict[str, Any]:
-    """Construye el certificado canónico estructurado y alineado con la Ontología."""
     if not validate_canonical_enum(data_integrity, DataIntegrity):
         raise ValueError(f"Atributo data_integrity canónico inválido: {data_integrity}")
     if not validate_canonical_enum(capture_status, SymbolCaptureStatus):
         raise ValueError(f"Atributo symbol_capture_status canónico inválido: {capture_status}")
 
     envelope = MetadataEnvelope(
-        schema_version=SCHEMA_VERSION_AUDIT,
-        contract_type=ContractType.AUDIT,
-        producer_identity=PRODUCER_AUDIT,
-        timestamp_emission=datetime.now(timezone.utc).isoformat()
+        schema_version=SCHEMA_VERSION_AUDIT, contract_type=ContractType.AUDIT,
+        producer_identity=PRODUCER_AUDIT, timestamp_emission=datetime.now(timezone.utc).isoformat()
     )
-
     certificate = {
-        **envelope.to_dict(),
-        "symbol": symbol.upper(),
-        "fci_score": round(float(fci_score), 4),
-        "data_integrity": data_integrity,
-        "symbol_capture_status": capture_status,
-        "data_anomaly": anomaly_list or [],
-        "metadata": metadata_extra or {}
+        **envelope.to_dict(), "symbol": symbol.upper(), "fci_score": round(float(fci_score), 4),
+        "data_integrity": data_integrity, "symbol_capture_status": capture_status,
+        "data_anomaly": anomaly_list or [], "metadata": metadata_extra or {}
     }
     return certificate
 
 def validate_audit_certificate(cert: Dict[str, Any]) -> bool:
-    """Valida la integridad de un certificado de auditoría contra el esquema v2.0."""
-    required = {
-        "schema_version", "contract_type", "producer_identity",
-        "timestamp_emission", "symbol", "fci_score",
-        "data_integrity", "symbol_capture_status"
-    }
-    if not required.issubset(cert.keys()):
-        return False
-    if cert.get("contract_type") != ContractType.AUDIT.value:
-        return False
-    if cert.get("schema_version") != SCHEMA_VERSION_AUDIT:
-        return False
-    if not validate_canonical_enum(cert.get("data_integrity", ""), DataIntegrity):
-        return False
-    if not validate_canonical_enum(cert.get("symbol_capture_status", ""), SymbolCaptureStatus):
-        return False
+    required = {"schema_version", "contract_type", "producer_identity", "timestamp_emission", "symbol", "fci_score", "data_integrity", "symbol_capture_status"}
+    if not required.issubset(cert.keys()): return False
+    if cert.get("contract_type") != ContractType.AUDIT.value: return False
+    if cert.get("schema_version") != SCHEMA_VERSION_AUDIT: return False
+    if not validate_canonical_enum(cert.get("data_integrity", ""), DataIntegrity): return False
+    if not validate_canonical_enum(cert.get("symbol_capture_status", ""), SymbolCaptureStatus): return False
     return True
 
 def create_audit_result_template(symbol: str, stage: str = "audit") -> Dict[str, Any]:
-    """Estructura de resultado de auditoría para preservación de compatibilidad."""
     return {
-        "symbol": symbol.upper(),
-        "stage": stage,
-        "status": "PASS",
-        "confidence": 100.0,
-        "critical_errors": [],
-        "warnings": [],
-        "metadata": {},
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "symbol": symbol.upper(), "stage": stage, "status": "PASS", "confidence": 100.0,
+        "critical_errors": [], "warnings": [], "metadata": {}, "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 def validate_audit_result(result: Dict[str, Any]) -> bool:
-    """Valida estructuralmente una plantilla legacy de auditoría."""
     required = {"symbol", "stage", "status", "confidence"}
-    if not required.issubset(result.keys()):
-        return False
-    if result.get("confidence", 0.0) < 0.0 or result.get("confidence", 0.0) > 100.0:
-        return False
+    if not required.issubset(result.keys()): return False
+    if result.get("confidence", 0.0) < 0.0 or result.get("confidence", 0.0) > 100.0: return False
     return True
-
-if __name__ == "__main__":
-    print("=" * 80)
-    print("AUDIT_ENGINE_02 - VERIFICACIÓN DE AUDIT_CONTRACTS")
-    print("=" * 80)
-    dummy_cert = create_canonical_audit_certificate(
-        symbol="EURUSD",
-        fci_score=98.5,
-        data_integrity=DataIntegrity.INTEGRO.value,
-        capture_status=SymbolCaptureStatus.CONFIABLE.value,
-        anomaly_list=[]
-    )
-    is_valid = validate_audit_certificate(dummy_cert)
-    print(f"Certificado dummy generado de forma correcta: {is_valid}")
-    print(json.dumps(dummy_cert, indent=2))
-    print("=" * 80)

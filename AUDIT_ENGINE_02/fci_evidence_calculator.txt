@@ -16,112 +16,78 @@ import argparse
 from pathlib import Path
 from datetime import datetime, timezone
 
-# Inyección de ruta raíz
 ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+if str(ROOT_DIR) not in sys.path: sys.path.insert(0, str(ROOT_DIR))
 
-# Importaciones oficiales del sistema
 from SYSTEM_SERVICES.system_paths import SSD_EVIDENCE_DIR, SAFE_DIR, AUDIT_REPORTS, AUDIT_STATE
 from SYSTEM_CANONICAL.system_symbols import get_symbols
 from SYSTEM_CANONICAL.system_sessions import get_broker_timezone, get_fecha_broker_str, is_market_open_at
-from SYSTEM_CANONICAL.system_states import VETO_FCI_THRESHOLD, STALL_THRESHOLD_MS, FCI_WEIGHTS, FCI_PENALTY_MULTIPLIERS
-from SYSTEM_CONTRACTS.contract_manager import SCHEMA_VERSIONS
-from SYSTEM_CANONICAL.system_states import ContractType
+from SYSTEM_CANONICAL.system_states import VETO_FCI_THRESHOLD, FCI_WEIGHTS, FCI_PENALTY_MULTIPLIERS, AUDIT_THRESHOLDS, ContractType
+from SYSTEM_CONTRACTS.contract_manager import SCHEMA_VERSIONS, save_contract_atomic
 from SYSTEM_SERVICES.system_logger import get_system_logger
-from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic
 
 logger = get_system_logger("fci_evidence_calculator", "02_AUDIT")
-
 BROKER_TZ = get_broker_timezone()
 
 def is_in_session(tm_ms: int) -> bool:
-    """Evalúa si el tick ocurrió dentro del horario activo usando la zona y reglas canónicas del broker."""
     try:
         dt_utc = datetime.fromtimestamp(tm_ms / 1000, tz=timezone.utc)
         dt_broker = dt_utc.astimezone(BROKER_TZ)
         return is_market_open_at(dt_broker)
-    except Exception:
-        return False
+    except Exception: return False
 
 def normalize_to_ms(val) -> float:
-    """Normaliza marcas de tiempo de diversas resoluciones a milisegundos."""
-    if val is None:
-        return 0.0
+    if val is None: return 0.0
     try:
         val_f = float(val)
-        if val_f < 1e11:
-            return val_f * 1000.0
-        elif val_f < 1e14:
-            return val_f
-        else:
-            return val_f / 1000.0
-    except (ValueError, TypeError):
-        return 0.0
+        if val_f < 1e11: return val_f * 1000.0
+        elif val_f < 1e14: return val_f
+        else: return val_f / 1000.0
+    except (ValueError, TypeError): return 0.0
 
 def calculate_fci(ticks: int, missing_files: int, seq_loss_rate: float,
                   seq_duplicates: int, seq_inversions: int, seq_resets: int,
                   negative_gaps: int, bid_ask_inversions: int, stale_ticks_pct: float,
                   infrastructure_silence_count: int) -> float:
-    """Algoritmo determinista de asignación de puntuación FCI por estabilidad de feed."""
-    if ticks == 0:
-        return 0.0
-
+    if ticks == 0: return 0.0
     m = FCI_PENALTY_MULTIPLIERS
     s_continuity = max(0.0, 100.0 - (missing_files * m["missing_file"]))
     base_seq = 100.0 * (1.0 - seq_loss_rate)
     s_seq = max(0.0, min(100.0, base_seq - min(m["seq_duplicates_max_penalty"], seq_duplicates * m["seq_duplicates_divisor"]) - (seq_inversions * m["seq_inversions"]) - (seq_resets * m["seq_resets"])))
-
     s_temporal = max(0.0, 100.0 - (infrastructure_silence_count * m["infra_silence"]) - (negative_gaps * m["negative_gap"]))
     s_quality = max(0.0, 100.0 - (bid_ask_inversions * m["bid_ask_inversion"]) - (max(0.0, stale_ticks_pct - m["stale_ticks_baseline"]) * m["stale_ticks_multiplier"]))
-
     w = FCI_WEIGHTS
     return round(max(0.0, min(100.0, (s_continuity * w["continuity"]) + (s_seq * w["sequence"]) + (s_temporal * w["temporal"]) + (s_quality * w["quality"]))), 2)
 
 def find_reconciliation_files(symbol: str, date_str: str) -> list:
-    """Encuentra y valida los archivos fuente físicos del día."""
     raw_paths = []
-
     if SSD_EVIDENCE_DIR.exists():
         for sym_dir in SSD_EVIDENCE_DIR.iterdir():
             if sym_dir.is_dir() and sym_dir.name.lower() == symbol.lower():
                 date_dir = sym_dir / date_str
-                if date_dir.exists():
-                    raw_paths.extend(date_dir.glob("*.jsonl"))
-
+                if date_dir.exists(): raw_paths.extend(date_dir.glob("*.jsonl"))
     if SAFE_DIR.exists():
         all_safe_files = list(SAFE_DIR.rglob("*"))
         for p in all_safe_files:
-            if not p.is_file():
-                continue
-            if symbol.lower() not in p.name.lower():
-                continue
-            if not (p.name.endswith(".jsonl.gz") or p.name.endswith(".gz") or p.name.endswith(".jsonl")):
-                continue
-
+            if not p.is_file(): continue
+            if symbol.lower() not in p.name.lower(): continue
+            if not (p.name.endswith(".jsonl.gz") or p.name.endswith(".gz") or p.name.endswith(".jsonl")): continue
             match = re.search(r"(\d{10})", p.name)
             if match:
                 try:
                     ts = int(match.group(1))
                     dt = datetime.fromtimestamp(ts, tz=BROKER_TZ)
-                    if dt.strftime("%Y%m%d") == date_str:
-                        raw_paths.append(p)
-                except Exception:
-                    pass
+                    if dt.strftime("%Y%m%d") == date_str: raw_paths.append(p)
+                except Exception: pass
             else:
-                if date_str in p.name:
-                    raw_paths.append(p)
-
+                if date_str in p.name: raw_paths.append(p)
     dedup_dict = {}
     for p in raw_paths:
         base_name = p.name.replace(".gz", "").replace(".jsonl", "")
-        if base_name not in dedup_dict or p.suffix == ".jsonl":
-            dedup_dict[base_name] = p
-
+        if base_name not in dedup_dict or p.suffix == ".jsonl": dedup_dict[base_name] = p
     return sorted(list(dedup_dict.values()), key=lambda x: x.name)
 
 def analyze_evidence(date_str: str, symbols: list):
-    """Procesa secuencialmente los datos físicos del día calculando las métricas."""
     logger.info(f"🔍 Iniciando Reconciliación Forense de Colectores - Fecha: {date_str}")
     integrity_summary = []
 
@@ -140,37 +106,33 @@ def analyze_evidence(date_str: str, symbols: list):
         timestamps = []
         for f in all_files:
             nums = re.findall(r"\d+", f.stem)
-            if nums:
-                timestamps.append(int(nums[-1]))
+            if nums: timestamps.append(int(nums[-1]))
         timestamps.sort()
         missing_files = sum(1 for i in range(len(timestamps) - 1) if round((timestamps[i+1] - timestamps[i]) / 3600.0) > 1)
+
+        # 🟢 Carga de umbrales canónicos críticos
+        gap_critical_ms = AUDIT_THRESHOLDS["gap_critical_sec"] * 1000
+        seq_reset_diff = AUDIT_THRESHOLDS.get("seq_reset_diff_threshold", 100000)
 
         for filepath in all_files:
             try:
                 open_func = gzip.open(filepath, "rt", encoding="utf-8", errors="ignore") if filepath.suffix == ".gz" else open(filepath, "r", encoding="utf-8", errors="ignore")
                 with open_func as f:
                     for line in f:
-                        if not line.strip():
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except Exception:
-                            continue
-
+                        if not line.strip(): continue
+                        try: data = json.loads(line)
+                        except Exception: continue
                         tm_raw = data.get("tm")
-                        if tm_raw is None:
-                            continue
+                        if tm_raw is None: continue
                         tm = int(normalize_to_ms(tm_raw))
                         bid = data.get("b") if data.get("b") is not None else data.get("bid")
                         ask = data.get("a") if data.get("a") is not None else data.get("ask")
                         ticks_processed += 1
 
                         if bid is not None and ask is not None:
-                            if bid >= ask:
-                                bid_ask_inversions += 1
+                            if bid >= ask: bid_ask_inversions += 1
                             if prev_bid is not None and prev_ask is not None:
-                                if bid == prev_bid and ask == prev_ask:
-                                    stale_ticks_count += 1
+                                if bid == prev_bid and ask == prev_ask: stale_ticks_count += 1
                             prev_bid, prev_ask = bid, ask
 
                         raw_seq = data.get("seq")
@@ -179,28 +141,22 @@ def analyze_evidence(date_str: str, symbols: list):
                                 seq = int(raw_seq)
                                 if prev_seq is not None:
                                     diff = seq - prev_seq
-                                    if diff == 0:
-                                        seq_duplicates += 1
-                                    elif diff < 0:
-                                        seq_inversions += 1
-                                    elif diff > 100000:
-                                        seq_resets += 1
-                                    elif diff > 1:
-                                        seq_gaps += (diff - 1)
+                                    if diff == 0: seq_duplicates += 1
+                                    elif diff < 0: seq_inversions += 1
+                                    # 🟢 CORREGIDO: Umbral de reset canónico vs 100000 hardcodeado
+                                    elif diff > seq_reset_diff: seq_resets += 1
+                                    elif diff > 1: seq_gaps += (diff - 1)
                                 seq_count += 1
-                                if seq_min is None or seq < seq_min:
-                                    seq_min = seq
-                                if seq_max is None or seq > seq_max:
-                                    seq_max = seq
+                                if seq_min is None or seq < seq_min: seq_min = seq
+                                if seq_max is None or seq > seq_max: seq_max = seq
                                 prev_seq = seq
-                            except Exception:
-                                continue
+                            except Exception: continue
 
                         if prev_tm is not None:
                             gap = tm - prev_tm
-                            if gap < 0:
-                                negative_ts_gaps += 1
-                            elif gap >= 300000:  # 5 Minutos de silencio absoluto
+                            if gap < 0: negative_ts_gaps += 1
+                            # 🟢 CORREGIDO: Umbral de silencio canónico vs 300000 hardcodeado
+                            elif gap >= gap_critical_ms:
                                 if is_in_session(tm):
                                     infrastructure_silence_count += 1
                                     logger.warning(f"⚠️ {symbol}: Silencio inusual de {gap/1000:.1f}s detectado en horario activo.")
@@ -208,52 +164,34 @@ def analyze_evidence(date_str: str, symbols: list):
             except Exception as e:
                 logger.error(f"Fallo de lectura procesando {filepath.name}: {e}")
 
-        if ticks_processed == 0:
-            continue
-
+        if ticks_processed == 0: continue
         stale_pct = round(stale_ticks_count / ticks_processed * 100, 2)
         loss_rate_fci = seq_gaps / (seq_max - seq_min + 1) if (seq_max and seq_min and (seq_max - seq_min) > 0) else 0.0
 
         fci_score = calculate_fci(
-            ticks=ticks_processed,
-            missing_files=missing_files,
-            seq_loss_rate=loss_rate_fci,
-            seq_duplicates=seq_duplicates,
-            seq_inversions=seq_inversions,
-            seq_resets=seq_resets,
-            negative_gaps=negative_ts_gaps,
-            bid_ask_inversions=bid_ask_inversions,
-            stale_ticks_pct=stale_pct,
-            infrastructure_silence_count=infrastructure_silence_count
+            ticks=ticks_processed, missing_files=missing_files, seq_loss_rate=loss_rate_fci,
+            seq_duplicates=seq_duplicates, seq_inversions=seq_inversions, seq_resets=seq_resets,
+            negative_gaps=negative_ts_gaps, bid_ask_inversions=bid_ask_inversions,
+            stale_ticks_pct=stale_pct, infrastructure_silence_count=infrastructure_silence_count
         )
 
         logger.info(f"📊 {symbol:7} | Ticks: {ticks_processed:9,} | Silencios: {infrastructure_silence_count} | FCI: {fci_score}%")
 
         integrity_summary.append({
-            "symbol": symbol,
-            "ticks": ticks_processed,
+            "symbol": symbol, "ticks": ticks_processed,
             "status_operativo": "ADMITIDO" if fci_score >= VETO_FCI_THRESHOLD else "NO_CONFIABLE",
             "integrity_metrics": {
-                "feed_confidence_index": fci_score,
-                "infrastructure_silence_count": infrastructure_silence_count,
-                "stale_ticks_pct": stale_pct,
-                "bid_ask_inversions": bid_ask_inversions,
-                "negative_timestamp_gaps": negative_ts_gaps,
-                "missing_files_estimated": missing_files,
-                "seq_gaps_canonical": seq_gaps,
-                "seq_loss_rate": round(loss_rate_fci, 6) if seq_count > 0 else 0.0
+                "feed_confidence_index": fci_score, "infrastructure_silence_count": infrastructure_silence_count,
+                "stale_ticks_pct": stale_pct, "bid_ask_inversions": bid_ask_inversions,
+                "negative_timestamp_gaps": negative_ts_gaps, "missing_files_estimated": missing_files,
+                "seq_gaps_canonical": seq_gaps, "seq_loss_rate": round(loss_rate_fci, 6) if seq_count > 0 else 0.0
             }
         })
 
     AUDIT_REPORTS.mkdir(parents=True, exist_ok=True)
     report_file = AUDIT_REPORTS / f"capture_audit_report_{date_str}.json"
-
     save_contract_atomic({
-        "metadata": {
-            "date": date_str,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "schema_version": SCHEMA_VERSIONS[ContractType.AUDIT.value]
-        },
+        "metadata": {"date": date_str, "generated_at": datetime.now(timezone.utc).isoformat(), "schema_version": SCHEMA_VERSIONS[ContractType.AUDIT.value]},
         "integrity_summary": integrity_summary
     }, report_file)
     logger.info(f"✅ Reporte de estabilidad del feed guardado: {report_file.name}")
@@ -265,5 +203,5 @@ def main():
     fecha = args.date if args.date != "latest" else get_fecha_broker_str()
     analyze_evidence(fecha, get_symbols())
 
-if __name__ == "__main__":
+if __name__ == "__main__": 
     main()

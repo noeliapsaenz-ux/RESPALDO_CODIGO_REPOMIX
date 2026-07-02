@@ -15,9 +15,6 @@ from pathlib import Path
 root_path = Path(__file__).resolve().parents[1]
 if str(root_path) not in sys.path:
     sys.path.insert(0, str(root_path))
-current_dir = Path(__file__).resolve().parent
-if str(current_dir) not in sys.path:
-    sys.path.insert(0, str(current_dir))
 
 import argparse
 import pandas as pd
@@ -26,16 +23,13 @@ from typing import Dict, Any, List, Optional
 
 from SYSTEM_CANONICAL.system_sessions import BROKER_TZ
 from SYSTEM_CANONICAL.system_symbols import get_symbols
+# 🟢 CAMBIO: Importación directa, sin alias redundantes
 from SYSTEM_CANONICAL.system_states import LEARNING_THRESHOLDS
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_paths import QUANT_PROCESSED_DATA, DECISION_CONTRACTS, QUANT_BARS
 from SYSTEM_CONTRACTS.contract_manager import load_contract_safe
 
 logger = get_system_logger("learning_journal", "04_DECISION")
-
-# Umbrales de evaluación retrospectiva heredados del canon (SYSTEM_CANONICAL)
-LEARNING_JOURNAL_WINDOWS_MINUTES = LEARNING_THRESHOLDS["evaluation_window_minutes"]
-LEARNING_JOURNAL_SUCCESS_PIPS = LEARNING_THRESHOLDS["success_pips"]
 
 def load_previous_day_contracts(fecha: str) -> List[Dict[str, Any]]:
     prev_date = (datetime.strptime(fecha, "%Y%m%d") - timedelta(days=1)).strftime("%Y%m%d")
@@ -69,7 +63,8 @@ def main():
         logger.info("📋 Sin contratos aprobados en el día anterior para evaluar.")
         return
         
-    logger.info(f"📖 Journal evaluado para la fecha actual. {len(prev_contracts)} contratos analizados.")
+    # 🟢 CAMBIO: Uso directo de LEARNING_THRESHOLDS
+    logger.info(f"📖 Journal evaluado con ventana de {LEARNING_THRESHOLDS['evaluation_window_minutes']} min y pips de éxito {LEARNING_THRESHOLDS['success_pips']}. {len(prev_contracts)} contratos analizados.")
 
 if __name__ == "__main__":
     main()

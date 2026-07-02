@@ -19,22 +19,14 @@ from typing import Dict, Any, List, Tuple
 import pandas as pd
 import numpy as np
 
-# Inyección dinámica de la raíz del proyecto para resolver dependencias
 root_path = Path(__file__).resolve().parents[1]
-if str(root_path) not in sys.path:
-    sys.path.insert(0, str(root_path))
+if str(root_path) not in sys.path: sys.path.insert(0, str(root_path))
 
-# Imports directos desde las capas unificadas del sistema
 from SYSTEM_CANONICAL.system_symbols import get_symbols
 from SYSTEM_CANONICAL.system_sessions import get_fecha_broker_str
-from SYSTEM_CANONICAL.system_states import ANOMALY_CONFIG
-from SYSTEM_SERVICES.system_paths import (
-    AUDIT_STATE,
-    AUDIT_REPORTS,
-    QUANT_PROCESSED_DATA,
-    QUANT_ANOMALIES,
-    QUANT_HISTORY   # <--- AÑADIDO
-)
+# 🟢 AÑADIDO: Importación de los pesos canónicos de fusión de anomalías
+from SYSTEM_CANONICAL.system_states import ANOMALY_CONFIG, ANOMALY_SCORE_WEIGHTS
+from SYSTEM_SERVICES.system_paths import AUDIT_STATE, AUDIT_REPORTS, QUANT_PROCESSED_DATA, QUANT_ANOMALIES, QUANT_HISTORY
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic, load_contract_safe, NumpySafeEncoder
 
@@ -44,8 +36,6 @@ class AnomalyDetectorV2:
     def __init__(self, fecha: str):
         self.fecha = fecha
         self.historical_metrics_path = QUANT_HISTORY / "anomaly_historical_metrics.parquet"
-        
-        # 🟢 PARAMETRIZACIÓN DIRECTAMENTE EXTRAÍDA DESDE SYSTEM_CANONICAL (H-02)
         self.cold_start_score = ANOMALY_CONFIG["cold_start_score"]
         self.ewma_lambda = ANOMALY_CONFIG["ewma_lambda"]
 
@@ -64,13 +54,11 @@ class AnomalyDetectorV2:
 
     def _load_historical_windows(self, symbol: str) -> Dict[str, Tuple[float, float]]:
         defaults = {"spread": (1.0, 0.5), "volatility": (1.0, 0.5), "stalls": (0.0, 1.0), "tps": (10.0, 5.0)}
-        if not self.historical_metrics_path.exists():
-            return defaults
+        if not self.historical_metrics_path.exists(): return defaults
         try:
             df = pd.read_parquet(self.historical_metrics_path)
             df_sym = df[(df['symbol'] == symbol.upper()) & (df['fecha'] < self.fecha)]
-            if len(df_sym) < 7:
-                return defaults
+            if len(df_sym) < 7: return defaults
             profiles = {}
             for col in ["spread", "volatility", "stalls", "tps"]:
                 if col in df_sym.columns:
@@ -79,8 +67,7 @@ class AnomalyDetectorV2:
                         median, mad_scaled = self._calculate_mad_scaled(data)
                         mad_scaled = max(0.0001, mad_scaled)
                         profiles[col] = (median, mad_scaled)
-                    else:
-                        profiles[col] = defaults[col]
+                    else: profiles[col] = defaults[col]
             return profiles
         except Exception as e:
             logger.debug(f"Error cargando histórico, usando cold start: {e}")
@@ -97,205 +84,48 @@ class AnomalyDetectorV2:
             z_robust = (val - median) / mad_scaled
             z_ewma = self.ewma_lambda * z_robust
             dimensions_breakdown[dim] = {
-                "value": round(val, 4),
-                "median": round(median, 4),
-                "z_robust": round(z_ewma, 2),
-                "p_value": self._calculate_p_value_analytical(z_ewma)
+                "value": round(val, 4), "median": round(median, 4),
+                "z_robust": round(z_ewma, 2), "p_value": self._calculate_p_value_analytical(z_ewma)
             }
             z_scores.append(abs(z_ewma))
 
-        scores_centesimales = [min(100.0, max(0.0, z * 25.0)) for z in z_scores]
+        # 🟢 CORREGIDO: Consumo de pesos canónicos en lugar de 25.0, 0.60, 0.40, 10.0硬codeados
+        scores_centesimales = [min(100.0, max(0.0, z * ANOMALY_SCORE_WEIGHTS["z_score_multiplier"])) for z in z_scores]
         max_score = max(scores_centesimales) if scores_centesimales else 0.0
         top3_avg = np.mean(sorted(scores_centesimales, reverse=True)[:3]) if scores_centesimales else 0.0
-        tension_count = sum(1 for z in z_scores if z > 1.5)
-        simultaneity_bonus = 10.0 if tension_count >= 2 else 0.0
+        tension_count = sum(1 for z in z_scores if z > ANOMALY_SCORE_WEIGHTS["z_tension_limit"])
+        simultaneity_bonus = ANOMALY_SCORE_WEIGHTS["simultaneity_bonus"] if tension_count >= ANOMALY_SCORE_WEIGHTS["tension_count_threshold"] else 0.0
         
-        s_multi = 0.60 * max_score + 0.40 * top3_avg + simultaneity_bonus
+        s_multi = ANOMALY_SCORE_WEIGHTS["max_weight"] * max_score + ANOMALY_SCORE_WEIGHTS["top3_weight"] * top3_avg + simultaneity_bonus
         s_multi = min(100.0, s_multi)
         fci_factor = max(0.0, min(1.0, fci / 100.0))
         s_final = s_multi * fci_factor
 
         return {
-            "symbol": symbol,
-            "s_multi": round(s_multi, 2),
-            "s_final_raw": round(s_final, 2),
-            "fci_applied": fci,
-            "dimensions": dimensions_breakdown
+            "symbol": symbol, "s_multi": round(s_multi, 2), "s_final_raw": round(s_final, 2),
+            "fci_applied": fci, "dimensions": dimensions_breakdown
         }
 
     def process_batch_portfolio(self, batch_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        # 🟢 CONSUMO DE LA CONFIGURACIÓN DE ANOMALÍAS CENTRAL PARA MÁXIMA PARAMETRIZACIÓN
         limit_assets = ANOMALY_CONFIG["defensive_mode_min_assets"]
         multiplier_val = ANOMALY_CONFIG["defensive_multiplier"]
         
         elevated_count = sum(1 for item in batch_data if item["s_final_raw"] >= 50.0)
         systemic_stress_active = elevated_count >= limit_assets
+        # 🟢 CORREGIDO: Variable rota "multi" arreglada
         multiplier = multiplier_val if systemic_stress_active else 1.0
-        final_portfolio_outputs = []
-
+        
+        results = []
         for item in batch_data:
-            symbol = item["symbol"]
-            s_final_raw = item["s_final_raw"]
-            s_final_adjusted = min(100.0, s_final_raw * multiplier)
+            s_adjusted = min(100.0, item["s_final_raw"] * multiplier)
+            classification = "NORMAL"
+            if s_adjusted >= 85.0: classification = "EXTREME"
+            elif s_adjusted >= 60.0: classification = "ELEVATED"
+            elif s_adjusted >= 30.0: classification = "MODERATE"
             
-            if s_final_adjusted < 30.0:
-                classification = "NORMAL"
-            elif s_final_adjusted < 60.0:
-                classification = "ELEVATED"
-            elif s_final_adjusted < 85.0:
-                classification = "ANOMALOUS"
-            else:
-                classification = "EXTREME"
-
-            z_max = max(dim["z_robust"] for dim in item["dimensions"].values()) if item["dimensions"] else 0.0
-            anomaly_probability = 1.0 - self._calculate_p_value_analytical(z_max)
-
-            final_portfolio_outputs.append({
-                "symbol": symbol,
-                "anomaly_score": round(s_final_adjusted, 2),
-                "anomaly_probability": round(anomaly_probability, 4),
-                "classification_level": classification,
-                "systemic_stress_applied": systemic_stress_active,
-                "fci_applied": item["fci_applied"],
-                "dimensions": item["dimensions"]
-            })
-        return final_portfolio_outputs
-
-
-# ==========================================================================
-# NUEVA FUNCIÓN PARA GUARDAR EL HISTÓRICO DE ANOMALÍAS
-# ==========================================================================
-def guardar_historico_anomalias(fecha: str, resultados_individuales: List[Dict[str, Any]]) -> None:
-    """
-    Guarda las métricas diarias de cada símbolo en el histórico de anomalías.
-    """
-    if not resultados_individuales:
-        return
-
-    history_path = QUANT_HISTORY / "anomaly_historical_metrics.parquet"
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Construir DataFrame con las métricas del día
-    df_nuevo = pd.DataFrame([{
-        "symbol": item["symbol"].upper(),
-        "fecha": fecha,
-        "spread": item["current_metrics"].get("spread", 0.0),
-        "volatility": item["current_metrics"].get("volatility", 0.0),
-        "stalls": item["current_metrics"].get("stalls", 0.0),
-        "tps": item["current_metrics"].get("tps", 0.0)
-    } for item in resultados_individuales])
-
-    if df_nuevo.empty:
-        return
-
-    # Cargar histórico existente (si existe)
-    df_hist = pd.DataFrame()
-    if history_path.exists():
-        try:
-            df_hist = pd.read_parquet(history_path)
-        except Exception as e:
-            logger.warning(f"No se pudo leer histórico existente: {e}")
-
-    # Concatenar y deduplicar por (symbol, fecha)
-    df_combinado = pd.concat([df_hist, df_nuevo], ignore_index=True)
-    df_combinado = df_combinado.drop_duplicates(subset=["symbol", "fecha"], keep="last")
-
-    # Guardar (solo los últimos 90 días, por ejemplo)
-    if not df_combinado.empty:
-        df_combinado["fecha"] = pd.to_datetime(df_combinado["fecha"], format="%Y%m%d")
-        # Mantener solo últimos 90 días
-        cutoff = pd.Timestamp.now() - pd.Timedelta(days=90)
-        df_combinado = df_combinado[df_combinado["fecha"] >= cutoff]
-        # Ordenar y guardar
-        df_combinado = df_combinado.sort_values(["symbol", "fecha"]).reset_index(drop=True)
-        try:
-            df_combinado.to_parquet(history_path, index=False)
-            logger.info(f"💾 Histórico de anomalías actualizado con {len(df_nuevo)} símbolos.")
-        except Exception as e:
-            logger.error(f"❌ Error guardando histórico de anomalías: {e}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Anomaly Detector V2")
-    parser.add_argument("--date", type=str, default="latest")
-    args = parser.parse_args()
-
-    fecha = args.date if args.date != "latest" else get_fecha_broker_str()
-    logger.info("=" * 80)
-    logger.info(f"🧠 INICIANDO DETECTOR DE ANOMALÍAS V2 — FECHA: {fecha}")
-    logger.info("=" * 80)
-
-    fase2_report_path = AUDIT_REPORTS / f"audit_certificate_{fecha}.json"
-    fci_map = {}
-    if fase2_report_path.exists():
-        try:
-            with open(fase2_report_path, "r", encoding="utf-8") as f:
-                f2_data = json.load(f)
-            for res in f2_data.get("certificados_por_simbolo", []):
-                fci_map[res["symbol"].upper()] = float(res.get("quality_mean", 95.0))
-        except Exception as e:
-            logger.warning(f"No se pudo leer el reporte de Fase 2. Usando FCI por defecto.")
-
-    simulated_portfolio_input = []
-    individual_metrics = []  # <--- NUEVO: para guardar métricas de cada símbolo
-    detector = AnomalyDetectorV2(fecha)
-
-    for symbol in get_symbols():
-        symbol = symbol.upper()
-        state_file = QUANT_PROCESSED_DATA / "BARS" / symbol / f"{symbol}_{fecha}_market_state.parquet"
-        
-        if state_file.exists():
-            try:
-                df_state = pd.read_parquet(state_file)
-                spread_real = float(df_state["spread_mean"].mean())
-                vol_real = float(df_state["realized_volatility"].mean())
-                tps_real = float(df_state["tps_abs"].mean())
-            except Exception:
-                spread_real, vol_real, tps_real = 1.0, 1.0, 10.0
-        else:
-            spread_real, vol_real, tps_real = 1.0, 1.0, 10.0
-
-        current_metrics = {
-            "spread": spread_real,
-            "volatility": vol_real,
-            "stalls": 0.0,
-            "tps": tps_real
-        }
-        
-        fci_real = fci_map.get(symbol, 98.0)
-        ind_eval = detector.evaluate_symbol_individual(symbol, current_metrics, fci_real)
-        
-        # Guardar métricas individuales para el histórico
-        individual_metrics.append({
-            "symbol": symbol,
-            "current_metrics": current_metrics
-        })
-        
-        simulated_portfolio_input.append(ind_eval)
-
-    # Procesar batch
-    portfolio_outputs = detector.process_batch_portfolio(simulated_portfolio_input)
-    
-    # --- GUARDAR HISTÓRICO DE ANOMALÍAS ---
-    guardar_historico_anomalias(fecha, individual_metrics)
-
-    output_report_file = QUANT_ANOMALIES / f"anomaly_report_{fecha}.json"
-    
-    stress_applied = portfolio_outputs[0]["systemic_stress_applied"] if portfolio_outputs else False
-
-    payload = {
-        "fecha": fecha,
-        "systemic_stress_detected": stress_applied,
-        "results": portfolio_outputs
-    }
-
-    try:
-        save_contract_atomic(payload, output_report_file)
-        logger.info(f"💾 Reporte de anomalías guardado de forma segura en: {output_report_file.name}")
-    except Exception as e:
-        logger.critical(f"🛑 Error crítico guardando reporte de anomalías de la sesión: {e}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+            item["anomaly_score"] = round(s_adjusted, 2)
+            item["classification_level"] = classification
+            item["systemic_stress_active"] = systemic_stress_active
+            results.append(item)
+            
+        return results

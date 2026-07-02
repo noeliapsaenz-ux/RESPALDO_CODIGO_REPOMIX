@@ -95,12 +95,21 @@ def is_market_open_at(dt: datetime) -> bool:
     return True
 
 def is_market_open() -> bool:
-    """
-    Función de conveniencia para validar el estado del mercado en tiempo real
-    basándose en la hora actual del broker.
-    """
+    """Función de conveniencia para validar el estado del mercado en tiempo real"""
     now_broker = get_current_broker_time()
     return is_market_open_at(now_broker)
+
+# NUEVO: Cálculo canónico de minutos desde apertura de Londres (Antes hardcodeado hour-6 en market_state_builder)
+def get_minutes_since_london_open(dt: datetime) -> int:
+    """
+    Calcula los minutos transcurridos desde el inicio de la sesión de Londres (06:00).
+    Retorna 0 si el mercado aún no ha abierto (horario ASIA).
+    """
+    london_open_hour = SESSIONS["LONDON"]["hours"][0] # 6
+    if dt.hour < london_open_hour:
+        # Horario de ASIA (ej. 23:00 -> 0 minutos para la sesión del día siguiente)
+        return 0
+    return (dt.hour - london_open_hour) * 60 + dt.minute
 
 if __name__ == "__main__":
     print("=" * 80)

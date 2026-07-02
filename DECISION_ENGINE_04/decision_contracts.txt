@@ -19,12 +19,12 @@ if str(root_path) not in sys.path:
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
-# Importaciones canónicas unificadas (sin decision_config)
 from SYSTEM_CANONICAL.system_states import DecisionStatus, ContractType
 from SYSTEM_CANONICAL.system_canonical import MetadataEnvelope, validate_canonical_enum
+# 🟢 CAMBIO: Importación del diccionario unificado de versiones
+from SYSTEM_CONTRACTS.contract_manager import SCHEMA_VERSIONS
 
-# Definiciones de versión del esquema según contract_manager.py
-SCHEMA_VERSION_DECISION = "3.0"
+# Definición de identidad del productor (local al motor, esto sí es permitido)
 PRODUCER_DECISION = "DECISION_ENGINE_04"
 
 def create_decision_symbol_entry(
@@ -52,8 +52,11 @@ def create_canonical_execution_contract(
     decisions: List[Dict[str, Any]],
     global_veto_active: bool = False
 ) -> Dict[str, Any]:
+    # 🟢 CAMBIO: Consumo de la versión canónica desde el diccionario maestro
+    schema_version = SCHEMA_VERSIONS[ContractType.EXECUTION.value]
+    
     envelope = MetadataEnvelope(
-        schema_version=SCHEMA_VERSION_DECISION,
+        schema_version=schema_version,
         contract_type=ContractType.EXECUTION,
         producer_identity=PRODUCER_DECISION,
         timestamp_emission=datetime.now(timezone.utc).isoformat()

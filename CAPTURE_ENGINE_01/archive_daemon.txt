@@ -16,6 +16,11 @@ Responsabilidad:
     - Aislar en la cuarentena centralizada (`QUARANTINE`) cualquier archivo corrupto o desalineado.
 ==========================================================================
 """
+"""
+==========================================================================
+ARCHIVE_DAEMON - Compresión, Verificación e Integridad de Históricos GZIP
+==========================================================================
+"""
 import sys
 import argparse
 import asyncio
@@ -30,17 +35,14 @@ from typing import Dict, List, Optional
 
 from SYSTEM_SERVICES.system_logger import get_system_logger
 from SYSTEM_SERVICES.system_paths import (
-    PRIMARY_TICK_DIR as HOT_RAM_DIR,
-    SSD_EVIDENCE_DIR,
-    SAFE_DIR as ARCHIVE_SAFE_DIR, 
-    QUARANTINE_DIR as ARCHIVE_QUARANTINE_DIR,
+    PRIMARY_TICK_DIR as HOT_RAM_DIR, SSD_EVIDENCE_DIR,
+    SAFE_DIR as ARCHIVE_SAFE_DIR, QUARANTINE_DIR as ARCHIVE_QUARANTINE_DIR,
     AUDIT_STATE as STATE_DIR
 )
-from SYSTEM_SERVICES.system_settings import send_telegram_alert
+from SYSTEM_SERVICES.system_settings import send_telegram_alert, USAR_RAMDISK
 from SYSTEM_CANONICAL.system_sessions import get_current_broker_time
+from SYSTEM_CANONICAL.system_states import CAPTURE_THRESHOLDS, VERIFY_RAMDISK_SSD_MATCH, QUARANTINE_SUFFIX
 from SYSTEM_CONTRACTS.contract_manager import save_contract_atomic
-from CAPTURE_ENGINE_01.capture_config import VERIFY_RAMDISK_SSD_MATCH, QUARANTINE_SUFFIX, USAR_RAMDISK
-
 
 class ArchiveDaemon:
     def __init__(self, check_interval: float = 60.0, max_concurrent_compressions: int = 2):
@@ -50,8 +52,11 @@ class ArchiveDaemon:
         self.check_interval = check_interval
         self.running = True
         self.executor = ThreadPoolExecutor(max_workers=max_concurrent_compressions)
-        self.inactive_threshold_seconds = 120
-        self.compress_level = 3
+        
+        # 🟢 Consumo de umbrales canónicos
+        self.inactive_threshold_seconds = CAPTURE_THRESHOLDS["inactive_threshold_sec"]
+        self.compress_level = CAPTURE_THRESHOLDS["compress_level"]
+        
         self.stats = {
             "files_archived": 0, "bytes_archived": 0, "bytes_freed": 0,
             "compression_ratio_avg": 0.0, "total_compression_time": 0.0,
@@ -115,12 +120,16 @@ class ArchiveDaemon:
             return sha.hexdigest() == expected_sha256
         except Exception: return False
 
-    def _safe_unlink_with_retry(self, file_path: Path, max_retries: int = 3, delay: float = 0.5):
+    # 🟢 Estandarización de reintento NTFS unificado con contract_manager
+    def _safe_unlink_with_retry(self, file_path: Path, max_retries: int = 3, delay: float = 0.05):
         for i in range(max_retries):
             try:
                 if file_path.exists(): file_path.unlink()
                 return
-            except PermissionError: time.sleep(delay)
+            except PermissionError:
+                if i == max_retries - 1: raise
+                time.sleep(delay)
+                delay *= 2  # Backoff exponencial
             except Exception: break
 
     def _move_to_quarantine(self, ram_file: Path, ssd_file: Optional[Path], reason: str):
@@ -148,6 +157,8 @@ class ArchiveDaemon:
             file_size_original = jsonl_file.stat().st_size
             expected_hash = self._calculate_checksum(jsonl_file)
             ssd_file = SSD_EVIDENCE_DIR / symbol / date_dir / jsonl_file.name
+            
+            # 🟢 Uso de constantes canónicas en vez del difunto capture_config
             if USAR_RAMDISK and VERIFY_RAMDISK_SSD_MATCH:
                 if not ssd_file.exists():
                     self._move_to_quarantine(jsonl_file, None, "SSD_BACKUP_MISSING")
@@ -155,6 +166,7 @@ class ArchiveDaemon:
                 if expected_hash != self._calculate_checksum(ssd_file):
                     self._move_to_quarantine(jsonl_file, ssd_file, "MISMATCH_SHA256")
                     return None
+                    
             dest_dir = ARCHIVE_SAFE_DIR / symbol / date_dir
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest_file, temp_gzip = dest_dir / (jsonl_file.name + ".gz"), dest_dir / (jsonl_file.name + ".tmp.gz")
@@ -164,6 +176,7 @@ class ArchiveDaemon:
             with open(temp_gzip, "r+b") as f_temp: os.fsync(f_temp.fileno())
             if not self._validate_gzip_integrity(temp_gzip, expected_hash): raise RuntimeError("Fallo de validación GZIP")
             temp_gzip.replace(dest_file)
+            
             compression_time = time.time() - start_time
             file_size_compressed = dest_file.stat().st_size
             compression_ratio = (1 - (file_size_compressed / file_size_original)) * 100 if file_size_original > 0 else 0
@@ -234,32 +247,22 @@ class ArchiveDaemon:
                 self._cached_drift = self._get_ntp_drift()
                 self._last_ntp_check = now
             elif not hasattr(self, "_cached_drift"): self._cached_drift = 0.0
-            
             serializable_stats = {
-                **self.stats, 
-                "windows_telemetry": {
-                    "ramdisk_health": ram_health, 
-                    "ntp_drift_ms": getattr(self, "_cached_drift", 0.0)
-                }, 
-                "updated_at": get_current_broker_time().isoformat(), 
-                "pid": os.getpid()
+                **self.stats, "windows_telemetry": {"ramdisk_health": ram_health, "ntp_drift_ms": getattr(self, "_cached_drift", 0.0)}, 
+                "updated_at": get_current_broker_time().isoformat(), "pid": os.getpid()
             }
             save_contract_atomic(serializable_stats, state_file)
         except Exception as e: self.logger.error(f"Error guardando telemetría del daemon: {e}")
 
-    def stop(self):
-        self.running = False
+    def stop(self): self.running = False
 
 async def main():
     parser = argparse.ArgumentParser(description="Archive Daemon V3")
-    parser.add_argument("--single-pass", action='store_true', help="Ejecutar un único ciclo de archivado y salir.")
+    parser.add_argument("--single-pass", action='store_true')
     args = parser.parse_args()
-
     daemon = ArchiveDaemon(check_interval=60.0, max_concurrent_compressions=2)
     await daemon.run(single_pass=args.single_pass)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n🛑 Archive Daemon detenido.")
+    try: asyncio.run(main())
+    except KeyboardInterrupt: print("\n🛑 Archive Daemon detenido.")
